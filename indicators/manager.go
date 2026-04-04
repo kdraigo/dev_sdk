@@ -1,26 +1,38 @@
 package indicators
 
 import (
+	"errors"
+	"sync"
+
 	"github.com/kdraigo/flow_v1/dev_sdk/types"
 )
+
+type IndicatorsCalculator interface {
+	RSI(exchange string, symbol string, period int, pointType string) ([]float64, error)
+}
 
 // IndicatorManager listens to aggregated candles, updates its internal mathematical states,
 // and invokes the user's strategy callback with the fully formulated indicators map.
 type IndicatorManager struct {
-	requested []string
-
-	// Dataframe stores rolling state of candles for mathematical formulas that need history
-	// df *core.Dataframe
-
-	// internal storage for calculated values at the current tick
-	currentValues map[string]float64
+	// The time frame is constant. We only need to store the points for each pair.
+	// exhcange -> pait-> points
+	pairCandlePoints map[string]map[string]*pairCandlePoints
+	guard            sync.RWMutex
 }
 
 // NewIndicatorManager prepares the calculator for requested inputs
-func NewIndicatorManager(requestedIndicators []string) *IndicatorManager {
+func NewIndicatorManager(exchanges []string, pairs []string) *IndicatorManager {
+	exchngePairs := make(map[string]map[string]*pairCandlePoints)
+
+	for _, exchange := range exchanges {
+		exchngePairs[exchange] = make(map[string]*pairCandlePoints)
+		for _, pair := range pairs {
+			exchngePairs[exchange][pair] = &pairCandlePoints{}
+		}
+	}
+
 	return &IndicatorManager{
-		requested:     requestedIndicators,
-		currentValues: make(map[string]float64),
+		pairCandlePoints: exchngePairs,
 	}
 }
 
@@ -30,30 +42,79 @@ func (im *IndicatorManager) Run(
 	aggregatedChan <-chan *types.Candle,
 	onCandleCallback types.OnCandleFunc,
 ) {
-	for candle := range aggregatedChan {
-		im.update(candle)
+	for {
+		select {
+		case <-ctx.Ctx.Done():
+			return
 
-		// Update the Context to pass injected indicator values reliably to strategy logic
-		ctx.SetIndicators(im.currentValues)
+		case candle, ok := <-aggregatedChan:
+			if !ok {
+				return
+			}
 
-		// Trigger the user's strategy algorithm
-		onCandleCallback(ctx, candle)
+			im.update(candle)
+
+			onCandleCallback(ctx, candle)
+		}
 	}
 }
 
 func (im *IndicatorManager) update(candle *types.Candle) {
-	// Internally, push `candle` into the `core.Dataframe`.
-	// Loop over im.requested (e.g. "EMA15", "RSI14")
-	// Calculate and store latest calculation in `im.currentValues`
+	im.guard.Lock()
+	defer im.guard.Unlock()
 
-	// Stub architecture:
-	for _, indName := range im.requested {
-		im.currentValues[indName] = im.calculate(indName, candle)
+	exchange := im.pairCandlePoints[candle.Exchange]
+	if exchange == nil {
+		return
 	}
+
+	pair := exchange[candle.Symbol]
+	if pair == nil {
+		return
+	}
+
+	pair.High = append(pair.High, candle.High)
+	pair.Low = append(pair.Low, candle.Low)
+	pair.Close = append(pair.Close, candle.Close)
+	pair.Open = append(pair.Open, candle.Open)
 }
 
-// calculate extracts the indicator from the `lib/core` standard functions
-func (im *IndicatorManager) calculate(indName string, candle *types.Candle) float64 {
-	// E.g., if indName == "EMA200", extract 200, find standard lib EMA function vs Dataframe Close history
-	return 0.0 // Stub calculation
+func (im *IndicatorManager) RSI(exchange string, symbol string, period int, pointType string) ([]float64, error) {
+	im.guard.RLock()
+	defer im.guard.RUnlock()
+
+	exhangeSymbols, exists := im.pairCandlePoints[exchange]
+	if !exists {
+		return nil, errors.New("invalid exchange")
+	}
+
+	symbolPoints, exists := exhangeSymbols[symbol]
+	if !exists {
+		return nil, errors.New("invalid symbol")
+	}
+
+	if len(symbolPoints.Close) < period {
+		return nil, errors.New("not enough data for RSI calculation")
+	}
+
+	points := symbolPoints.Close
+	if pointType == "high" {
+		points = symbolPoints.High
+	} else if pointType == "low" {
+		points = symbolPoints.Low
+	} else if pointType == "open" {
+		points = symbolPoints.Open
+	}
+	if len(points) <= period {
+		return nil, errors.New("not enough data for RSI calculation")
+	}
+
+	return RSI(points, period), nil
+}
+
+type pairCandlePoints struct {
+	High  []float64
+	Low   []float64
+	Close []float64
+	Open  []float64
 }

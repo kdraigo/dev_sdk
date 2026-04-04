@@ -19,7 +19,7 @@ func main() {
 		Environment: types.EnvBacktest,
 		Timeframe:   types.Timeframe15m,
 		// Example: requesting EMA and RSI calculation injects over our candles automatically
-		Indicators: []string{"EMA50", "RSI14"},
+		// Indicators: []string{"EMA50", "RSI14"},
 		Credentials: types.Credentials{
 			APIKey:    "USER_BACKTEST_OR_REAL_KEY",
 			APISecret: "SECRET",
@@ -46,12 +46,15 @@ func main() {
 		log.Printf("Received %s candle close at %f", candle.Timeframe, candle.Close)
 
 		// Access integrated indicators mathematically evaluated by the inner framework
-		ema50 := ctx.GetIndicator("EMA50")
-		rsi14 := ctx.GetIndicator("RSI14")
+		rsi, err := chatbotSDK.IndicatorManager().RSI("binance", "BTC/USDT", 14, "")
+		if err != nil {
+			log.Printf("Failed to calculate RSI: %v", err)
+			return
+		}
 
-		log.Printf("Current EMA50: %f, RSI14: %f\n", ema50, rsi14)
+		log.Printf("Current RSI14: %f\n", rsi[len(rsi)-1])
 
-		if rsi14 < 70 {
+		if rsi[len(rsi)-1] > 70 {
 			req := &types.OrderRequest{
 				Symbol:   candle.Symbol,
 				Exchange: candle.Exchange,

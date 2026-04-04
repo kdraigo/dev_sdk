@@ -24,6 +24,8 @@ type SDK struct {
 	// Channels for internal piping
 	rawCandleChan chan *types.Candle
 	orderChan     chan *types.Order
+
+	indicatorsManager *indicators.IndicatorManager
 }
 
 var _ types.Trader = (*SDK)(nil)
@@ -91,14 +93,19 @@ func (s *SDK) Start(ctx context.Context) error {
 	go timeframeAgg.Run(s.rawCandleChan)
 
 	// Pipeline B: Indicator Manager applies math state and fires the OnCandle core loop
-	indicatorMgr := indicators.NewIndicatorManager(s.config.Indicators)
-	go indicatorMgr.Run(sdkCtx, aggChan, s.onCandle)
+	s.indicatorsManager = indicators.NewIndicatorManager(s.config.Backtest.RequestedExchanges, s.config.Backtest.Assets)
+	go s.indicatorsManager.Run(sdkCtx, aggChan, s.onCandle)
 
 	// Pipeline C: Order Updates dispatch loop
 	go func() {
-		for order := range s.orderChan {
-			if s.onOrderUpdate != nil {
-				s.onOrderUpdate(sdkCtx, order)
+		for {
+			select {
+			case order := <-s.orderChan:
+				if s.onOrderUpdate != nil {
+					s.onOrderUpdate(sdkCtx, order)
+				}
+			case <-sdkCtx.Ctx.Done():
+				return
 			}
 		}
 	}()
@@ -115,4 +122,8 @@ func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.O
 
 func (s *SDK) CancelOrder(ctx context.Context, id string) error {
 	return s.adapter.CancelOrder(ctx, id)
+}
+
+func (s *SDK) IndicatorManager() indicators.IndicatorsCalculator {
+	return s.indicatorsManager
 }
