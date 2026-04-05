@@ -25,8 +25,9 @@ type EngineClient struct {
 	wsConn    *websocket.Conn
 	writeMu   sync.Mutex
 
-	pendingOrders map[string]chan *orderResponse
-	pendingMu     sync.Mutex
+	pendingOrders   map[string]chan *orderResponse
+	pendingAccounts map[string]chan *accountResponse
+	pendingMu       sync.Mutex
 }
 
 type orderResponse struct {
@@ -36,8 +37,9 @@ type orderResponse struct {
 
 func NewEngineClient(cfg *types.Config) *EngineClient {
 	return &EngineClient{
-		config:        cfg,
-		pendingOrders: make(map[string]chan *orderResponse),
+		config:          cfg,
+		pendingOrders:   make(map[string]chan *orderResponse),
+		pendingAccounts: make(map[string]chan *accountResponse),
 	}
 }
 
@@ -163,20 +165,38 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				return
 			}
 
-			// Handle pending PlaceOrder waiters
+			// Handle pending PlaceOrder/GetAccount waiters
 			if resp.RequestID != "" {
 				e.pendingMu.Lock()
-				ch, ok := e.pendingOrders[resp.RequestID]
-				if ok {
+				if ch, ok := e.pendingOrders[resp.RequestID]; ok {
 					var or orderResponse
 					if resp.Status == "error" {
 						or.err = fmt.Errorf(resp.Error)
 					} else {
+						var engineOrder struct {
+							ExchangeID int64 `json:"exchange_id"`
+						}
+						json.Unmarshal(resp.Data, &engineOrder)
 						json.Unmarshal(resp.Data, &or.order)
+
+						// Map int64 ID to string if it was missing
+						if or.order.ID == "" && engineOrder.ExchangeID != 0 {
+							or.order.ID = fmt.Sprintf("%d", engineOrder.ExchangeID)
+						}
 					}
 					ch <- &or
 					close(ch)
 					delete(e.pendingOrders, resp.RequestID)
+				} else if ch, ok := e.pendingAccounts[resp.RequestID]; ok {
+					var ar accountResponse
+					if resp.Status == "error" {
+						ar.err = fmt.Errorf(resp.Error)
+					} else {
+						json.Unmarshal(resp.Data, &ar.account)
+					}
+					ch <- &ar
+					close(ch)
+					delete(e.pendingAccounts, resp.RequestID)
 				}
 				e.pendingMu.Unlock()
 			}
@@ -219,11 +239,8 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 						IsComplete: dataStruct.Tick.Candle.Complete,
 					}
 				}
-				if !dataStruct.Done {
-					e.nextTick()
-				} else {
+				if dataStruct.Done {
 					log.Println("Backtest Engine: Data stream finished.")
-					// Can optionally signal completion here
 				}
 			}
 
@@ -237,8 +254,8 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 		}
 	}()
 
-	// Ask the engine for the first step
-	e.nextTick()
+	// Handshake: Initial account state should be fetched by the SDK before/during start
+	// The engine waits for the first "next" command from the SDK.
 
 	<-ctx.Done()
 	return nil
@@ -313,4 +330,59 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 func (e *EngineClient) CancelOrder(ctx context.Context, orderID string) error {
 	log.Printf("Backtest Engine: Canceling Order %s", orderID)
 	return nil
+}
+
+func (e *EngineClient) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {
+	if e.wsConn == nil {
+		return nil, fmt.Errorf("websocket not connected")
+	}
+
+	reqID := uuid.New().String()
+	respChan := make(chan *accountResponse, 1)
+
+	e.pendingMu.Lock()
+	e.pendingAccounts[reqID] = respChan
+	e.pendingMu.Unlock()
+
+	payload := map[string]interface{}{
+		"action":     "account",
+		"request_id": reqID,
+		"data": map[string]string{
+			"exchange": exchange,
+			"asset":    asset,
+		},
+	}
+
+	e.writeMu.Lock()
+	err := e.wsConn.WriteJSON(payload)
+	e.writeMu.Unlock()
+
+	if err != nil {
+		e.pendingMu.Lock()
+		delete(e.pendingAccounts, reqID)
+		e.pendingMu.Unlock()
+		return nil, err
+	}
+
+	select {
+	case resp := <-respChan:
+		if resp.err != nil {
+			return nil, resp.err
+		}
+		return resp.account, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(5 * time.Second):
+		return nil, fmt.Errorf("timeout waiting for account info")
+	}
+}
+
+func (e *EngineClient) Next(ctx context.Context) error {
+	e.nextTick()
+	return nil
+}
+
+type accountResponse struct {
+	account *types.Account
+	err     error
 }

@@ -31,6 +31,14 @@ func (m *mockAdapter) CancelOrder(ctx context.Context, orderID string) error {
 	return nil
 }
 
+func (m *mockAdapter) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {
+	return &types.Account{}, nil
+}
+
+func (m *mockAdapter) Next(ctx context.Context) error {
+	return nil
+}
+
 func TestNewSDK(t *testing.T) {
 	cfg := &types.Config{
 		Environment: types.EnvBacktest,

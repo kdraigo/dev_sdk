@@ -19,4 +19,10 @@ type Adapter interface {
 
 	// CancelOrder aborts a live order.
 	CancelOrder(ctx context.Context, orderID string) error
+
+	// GetAccount fetches the current balance for an asset.
+	GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error)
+
+	// Next requests the next data point (tick/candle) from the exchange (primarily for Backtesting).
+	Next(ctx context.Context) error
 }

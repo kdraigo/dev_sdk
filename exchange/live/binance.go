@@ -34,3 +34,11 @@ func (b *BinanceClient) PlaceOrder(ctx context.Context, req *types.OrderRequest)
 func (b *BinanceClient) CancelOrder(ctx context.Context, id string) error {
 	return nil
 }
+
+func (b *BinanceClient) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {
+	return &types.Account{Exchange: "binance"}, nil
+}
+
+func (b *BinanceClient) Next(ctx context.Context) error {
+	return nil
+}

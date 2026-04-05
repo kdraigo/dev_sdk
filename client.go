@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	"github.com/kdraigo/flow_v1/dev_sdk/aggregator"
 	"github.com/kdraigo/flow_v1/dev_sdk/exchange/backtest"
@@ -110,8 +112,56 @@ func (s *SDK) Start(ctx context.Context) error {
 		}
 	}()
 
-	// 3. Command the exchange Adapter to begin pumping data into `rawCandleChan` & `orderChan` natively
-	return s.adapter.ConnectStream(ctx, s.rawCandleChan, s.orderChan)
+	// 4. Perform Handshake: Fetch initial account info for all requested assets
+	// This ensures "Paper Wallet First" synchronization.
+	// But wait, we need the connection to be up.
+	// The adapter should handle this by ensuring its internal state is ready.
+
+	// 5. Command the exchange Adapter to begin pumping data into `rawCandleChan` & `orderChan` natives.
+	// We run this in a goroutine because it blocks, but we need it to start first.
+	go func() {
+		if err := s.adapter.ConnectStream(ctx, s.rawCandleChan, s.orderChan); err != nil {
+			log.Printf("ConnectStream error: %v", err)
+		}
+	}()
+
+	// Small delay to allow WS connection to establish (Handshake requires it)
+	time.Sleep(1 * time.Second)
+
+	for _, exchange := range s.config.Backtest.RequestedExchanges {
+		for _, asset := range s.config.Backtest.Assets {
+			quoteAsset := strings.Split(asset, "/")[1]
+			_, err := s.adapter.GetAccount(ctx, exchange, quoteAsset)
+			if err != nil {
+				log.Printf("Handshake: Failed to fetch initial account for %s-%s: %v", exchange, quoteAsset, err)
+			} else {
+				log.Printf("Handshake: Successfully synchronized wallet for %s-%s", exchange, quoteAsset)
+			}
+		}
+	}
+
+	// 6. Start the deterministic ticking loop for backtesting
+	if s.config.Environment == types.EnvBacktest {
+		go func() {
+			for {
+				select {
+				case <-sdkCtx.Ctx.Done():
+					return
+				default:
+					if err := s.adapter.Next(ctx); err != nil {
+						log.Printf("Next tick error: %v (likely finished)", err)
+						return
+					}
+					// Small safety delay for pipelines
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+		}()
+	}
+
+	// Stay alive until context is canceled
+	<-ctx.Done()
+	return nil
 }
 
 // Exposed methods passing through to adapter
@@ -122,6 +172,10 @@ func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.O
 
 func (s *SDK) CancelOrder(ctx context.Context, id string) error {
 	return s.adapter.CancelOrder(ctx, id)
+}
+
+func (s *SDK) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {
+	return s.adapter.GetAccount(ctx, exchange, asset)
 }
 
 func (s *SDK) IndicatorManager() indicators.IndicatorsCalculator {

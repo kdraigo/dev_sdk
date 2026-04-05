@@ -36,3 +36,11 @@ func (b *BybitClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) (
 func (b *BybitClient) CancelOrder(ctx context.Context, id string) error {
 	return nil
 }
+
+func (b *BybitClient) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {
+	return &types.Account{Exchange: "bybit"}, nil
+}
+
+func (b *BybitClient) Next(ctx context.Context) error {
+	return nil
+}

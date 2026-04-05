@@ -73,6 +73,19 @@ type Order struct {
 	UpdatedAt    time.Time
 }
 
+// Balance represents a single asset's available and locked funds.
+type Balance struct {
+	Asset string  `json:"asset"`
+	Free  float64 `json:"free"`
+	Lock  float64 `json:"lock"`
+}
+
+// Account represents the total state of a user's wallet on an exchange.
+type Account struct {
+	Exchange string    `json:"exchange"`
+	Balances []Balance `json:"balances"`
+}
+
 // Position standardizes an ongoing open position in a trading pair.
 type Position struct {
 	Symbol        string
@@ -87,6 +100,7 @@ type Position struct {
 type Trader interface {
 	PlaceOrder(ctx context.Context, req *OrderRequest) (*Order, error)
 	CancelOrder(ctx context.Context, id string) error
+	GetAccount(ctx context.Context, exchange string, asset string) (*Account, error)
 }
 
 // Context wraps runtime specifics accessible in callback functions.
