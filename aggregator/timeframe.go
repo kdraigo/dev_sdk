@@ -26,9 +26,12 @@ func NewTimeframeAggregator(tf types.Timeframe, outChan chan<- *types.Candle) *T
 }
 
 // Run loop listens to the raw channel and aggregates.
-func (ta *TimeframeAggregator) Run(rawChan <-chan *types.Candle) {
+func (ta *TimeframeAggregator) Run(rawChan <-chan *types.Candle, doneChan chan<- bool) {
 	for rawCandle := range rawChan {
 		ta.Process(rawCandle)
+		if doneChan != nil {
+			doneChan <- true
+		}
 	}
 }
 

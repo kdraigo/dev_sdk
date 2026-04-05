@@ -241,14 +241,31 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				}
 				if dataStruct.Done {
 					log.Println("Backtest Engine: Data stream finished.")
+					return
 				}
 			}
 
 			if resp.Action == "order" {
-				var order *types.Order
+				var engineOrder struct {
+					ID         int64 `json:"id"`
+					ExchangeID int64 `json:"exchange_id"`
+				}
+				json.Unmarshal(resp.Data, &engineOrder)
+
+				var order types.Order
 				json.Unmarshal(resp.Data, &order)
-				if order != nil {
-					orderChan <- order
+
+				// Ensure ID is populated for SDK tracking
+				if order.ID == "" {
+					if engineOrder.ID != 0 {
+						order.ID = fmt.Sprintf("%d", engineOrder.ID)
+					} else if engineOrder.ExchangeID != 0 {
+						order.ID = fmt.Sprintf("%d", engineOrder.ExchangeID)
+					}
+				}
+
+				if order.ID != "" {
+					orderChan <- &order
 				}
 			}
 		}

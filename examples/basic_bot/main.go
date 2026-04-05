@@ -52,21 +52,67 @@ func main() {
 			return
 		}
 
-		log.Printf("Current RSI14: %f\n", rsi[len(rsi)-1])
+		currentRSI := rsi[len(rsi)-1]
+		log.Printf("Current RSI14: %f\n", currentRSI)
 
-		if rsi[len(rsi)-1] > 70 {
-			req := &types.OrderRequest{
-				Symbol:   candle.Symbol,
-				Exchange: candle.Exchange,
-				Side:     types.OrderSideSell,
-				Type:     types.OrderTypeMarket,
-				Quantity: 0.1,
+		// 1. BUY logic: RSI < 30 (Use USDT to buy BTC)
+		if currentRSI < 30 {
+			acc, err := ctx.Trader.GetAccount(ctx.Ctx, candle.Exchange, "USDT")
+			if err == nil {
+				var usdtFree float64
+				for _, b := range acc.Balances {
+					if b.Asset == "USDT" {
+						usdtFree = b.Free
+						break
+					}
+				}
+
+				required := 0.1 * candle.Close
+				if usdtFree >= required {
+					req := &types.OrderRequest{
+						Symbol:   candle.Symbol,
+						Exchange: candle.Exchange,
+						Side:     types.OrderSideBuy,
+						Type:     types.OrderTypeMarket,
+						Quantity: 0.1,
+					}
+					placed, err := ctx.PlaceOrder(req)
+					if err == nil {
+						log.Printf("BUY Order placed! ID: %s", placed.ID)
+					}
+				} else {
+					log.Printf("Skip BUY: Insufficient USDT (Free: %f, Required: %f)", usdtFree, required)
+				}
 			}
-			placed, err := ctx.PlaceOrder(req)
-			if err != nil {
-				log.Printf("Failed to place order: %v", err)
-			} else {
-				log.Printf("Order placed! ID: %s", placed.ID)
+		}
+
+		// 2. SELL logic: RSI > 70 (Use BTC to sell)
+		if currentRSI > 70 {
+			acc, err := ctx.Trader.GetAccount(ctx.Ctx, candle.Exchange, "BTC")
+			if err == nil {
+				var btcFree float64
+				for _, b := range acc.Balances {
+					if b.Asset == "BTC" {
+						btcFree = b.Free
+						break
+					}
+				}
+
+				if btcFree >= 0.1 {
+					req := &types.OrderRequest{
+						Symbol:   candle.Symbol,
+						Exchange: candle.Exchange,
+						Side:     types.OrderSideSell,
+						Type:     types.OrderTypeMarket,
+						Quantity: 0.1,
+					}
+					placed, err := ctx.PlaceOrder(req)
+					if err == nil {
+						log.Printf("SELL Order placed! ID: %s", placed.ID)
+					}
+				} else {
+					log.Printf("Skip SELL: Insufficient BTC (Free: %f)", btcFree)
+				}
 			}
 		}
 	})

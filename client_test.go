@@ -64,7 +64,7 @@ func TestSDK_Start(t *testing.T) {
 		connectCalled: make(chan bool, 1),
 	}
 	sdk := &SDK{
-		config:        &types.Config{Timeframe: types.Timeframe1m},
+		config:        &types.Config{Timeframe: types.Timeframe1m, Backtest: &types.BacktestOptions{}},
 		adapter:       mock,
 		rawCandleChan: make(chan *types.Candle, 10),
 		orderChan:     make(chan *types.Order, 10),

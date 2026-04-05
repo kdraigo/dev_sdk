@@ -54,7 +54,9 @@ func (im *IndicatorManager) Run(
 
 			im.update(candle)
 
-			onCandleCallback(ctx, candle)
+			if onCandleCallback != nil {
+				onCandleCallback(ctx, candle)
+			}
 		}
 	}
 }

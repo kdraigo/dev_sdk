@@ -89,10 +89,11 @@ func (s *SDK) Start(ctx context.Context) error {
 
 	// 2. Start internal processing pipelines
 	aggChan := make(chan *types.Candle)
+	syncChan := make(chan bool, 1)
 
 	// Pipeline A: Aggregator converts 1m -> target (e.g. 15m)
 	timeframeAgg := aggregator.NewTimeframeAggregator(s.config.Timeframe, aggChan)
-	go timeframeAgg.Run(s.rawCandleChan)
+	go timeframeAgg.Run(s.rawCandleChan, syncChan)
 
 	// Pipeline B: Indicator Manager applies math state and fires the OnCandle core loop
 	s.indicatorsManager = indicators.NewIndicatorManager(s.config.Backtest.RequestedExchanges, s.config.Backtest.Assets)
@@ -126,7 +127,7 @@ func (s *SDK) Start(ctx context.Context) error {
 	}()
 
 	// Small delay to allow WS connection to establish (Handshake requires it)
-	time.Sleep(1 * time.Second)
+	time.Sleep(500 * time.Millisecond)
 
 	for _, exchange := range s.config.Backtest.RequestedExchanges {
 		for _, asset := range s.config.Backtest.Assets {
@@ -143,17 +144,24 @@ func (s *SDK) Start(ctx context.Context) error {
 	// 6. Start the deterministic ticking loop for backtesting
 	if s.config.Environment == types.EnvBacktest {
 		go func() {
+			// Trigger initial tick
+			if err := s.adapter.Next(ctx); err != nil {
+				log.Printf("Initial tick error: %v", err)
+				cancel()
+				return
+			}
+
 			for {
 				select {
 				case <-sdkCtx.Ctx.Done():
 					return
-				default:
+				case <-syncChan:
+					// Signal received: Previous candle fully processed by pipelines.
 					if err := s.adapter.Next(ctx); err != nil {
-						log.Printf("Next tick error: %v (likely finished)", err)
+						log.Printf("Backtest finished: %v", err)
+						cancel()
 						return
 					}
-					// Small safety delay for pipelines
-					time.Sleep(50 * time.Millisecond)
 				}
 			}
 		}()
