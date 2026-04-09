@@ -3,11 +3,14 @@ package backtest
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,8 +50,8 @@ type startSessionRequestStream struct {
 	SessionID uuid.UUID `json:"sessionID"`
 	Pair      string    `json:"pair"`
 	Timeframe string    `json:"timeframe"`
-	From      string    `json:"from"`
-	To        string    `json:"to"`
+	From      time.Time `json:"from"`
+	To        time.Time `json:"to"`
 }
 
 type startSessionRequestWallet struct {
@@ -88,8 +91,8 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 			SessionID: uid,
 			Pair:      asset,
 			Timeframe: string(cfg.Timeframe),
-			From:      cfg.Backtest.StartTime.Format("2006-01-02T15:04:05Z07:00"),
-			To:        cfg.Backtest.EndTime.Format("2006-01-02T15:04:05Z07:00"),
+			From:      cfg.Backtest.StartTime,
+			To:        cfg.Backtest.EndTime,
 		})
 	}
 
@@ -108,14 +111,22 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	}
 
 	payload := newSessionRequestPayload{Streams: streams, InitialWallets: wallets}
-	data, _ := json.Marshal(payload)
+	body, _ := json.Marshal(payload)
 
 	// 2. Perform HTTP action
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Backtest.Endpoint+"/api/v1/dev/session", bytes.NewBuffer(data))
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	sig, err := e.generateSignature(http.MethodPost, "/api/v1/dev/session", timestamp, string(body))
+	if err != nil {
+		return fmt.Errorf("failed to generate signature: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Backtest.Endpoint+"/api/v1/dev/session", bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-User-ID", uid.String())
+	req.Header.Set("X-API-KEY", e.config.Credentials.KeyID)
+	req.Header.Set("X-SIGNATURE", sig)
+	req.Header.Set("X-TIMESTAMP", timestamp)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -141,8 +152,17 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 
 func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *types.Candle, orderChan chan<- *types.Order) error {
 	log.Printf("Backtest Engine: Establishing WS connection for session %s...", e.sessionID)
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	sig, err := e.generateSignature(http.MethodGet, "/api/v1/dev/session/ws", timestamp, "")
+	if err != nil {
+		return fmt.Errorf("failed to generate signature: %v", err)
+	}
 
-	wsEndpoint := strings.Replace(e.config.Backtest.Endpoint, "http", "ws", 1) + "/api/v1/dev/session/ws?id=" + e.sessionID
+	wsEndpoint := strings.Replace(e.config.Backtest.Endpoint, "http", "ws", 1) +
+		"/api/v1/dev/session/ws?id=" + e.sessionID +
+		"&key_id=" + e.config.Credentials.KeyID +
+		"&signature=" + sig +
+		"&timestamp=" + timestamp
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsEndpoint, nil)
 	if err != nil {
@@ -397,6 +417,25 @@ func (e *EngineClient) GetAccount(ctx context.Context, exchange string, asset st
 func (e *EngineClient) Next(ctx context.Context) error {
 	e.nextTick()
 	return nil
+}
+
+func (e *EngineClient) generateSignature(method, path, timestamp, body string) (string, error) {
+	if e.config.Credentials.PrivateKey == "" {
+		return "", fmt.Errorf("platform private key is missing in config")
+	}
+
+	privKeyBytes, err := hex.DecodeString(e.config.Credentials.PrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode private key: %v", err)
+	}
+
+	if len(privKeyBytes) != ed25519.PrivateKeySize {
+		return "", fmt.Errorf("invalid private key size: expected %d, got %d", ed25519.PrivateKeySize, len(privKeyBytes))
+	}
+
+	canonical := fmt.Sprintf("%s\n%s\n%s\n%s", method, path, timestamp, body)
+	sig := ed25519.Sign(privKeyBytes, []byte(canonical))
+	return hex.EncodeToString(sig), nil
 }
 
 type accountResponse struct {

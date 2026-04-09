@@ -37,11 +37,14 @@ type Config struct {
 	Backtest    *BacktestOptions // Specific settings required when configuring a new backtest engine session.
 }
 
-// Credentials holds sensitive authentication data for exchange APIs.
+// Credentials holds sensitive authentication data for exchange APIs and platform access.
 type Credentials struct {
-	APIKey    string
-	APISecret string
-	// Optional passphrase or subaccount details for specific exchanges can be added below.
+	APIKey    string // Exchange API Key
+	APISecret string // Exchange API Secret
+
+	// Kdraigo Platform API Key
+	KeyID      string // API Key ID (UUID)
+	PrivateKey string // Ed25519 Private Key (Hex)
 }
 
 // BacktestOptions contains configuration necessary to prepare the engine session for backtesting.
