@@ -261,6 +261,7 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				}
 				if dataStruct.Done {
 					log.Println("Backtest Engine: Data stream finished.")
+					close(candleChan) // Signal aggregator that no more candles are coming
 					return
 				}
 			}

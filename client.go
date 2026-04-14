@@ -22,6 +22,7 @@ type SDK struct {
 	// Callbacks
 	onCandle      types.OnCandleFunc
 	onOrderUpdate types.OnOrderUpdateFunc
+	onComplete    func() // Called when a backtest run finishes naturally
 
 	// Channels for internal piping
 	rawCandleChan chan *types.Candle
@@ -65,6 +66,12 @@ func (s *SDK) SetOnOrderUpdate(fn types.OnOrderUpdateFunc) {
 	s.onOrderUpdate = fn
 }
 
+// SetOnComplete registers a callback invoked when a backtest run finishes naturally.
+// The callback fires before Start() returns, allowing cleanup or result reporting.
+func (s *SDK) SetOnComplete(fn func()) {
+	s.onComplete = fn
+}
+
 // Start launches the architecture pipeline and begins processing stream data.
 func (s *SDK) Start(ctx context.Context) error {
 	if s.adapter == nil {
@@ -88,16 +95,35 @@ func (s *SDK) Start(ctx context.Context) error {
 	}
 
 	// 2. Start internal processing pipelines
-	aggChan := make(chan *types.Candle)
+	// syncChan coordinates the ticking loop: one signal per raw candle consumed,
+	// sent only AFTER OnCandle (and any PlaceOrder calls inside it) have returned.
+	// This keeps the pipeline fully sequential and deterministic — the engine never
+	// receives a "next" request while a concurrent "order" request is in flight.
 	syncChan := make(chan bool, 1)
 
-	// Pipeline A: Aggregator converts 1m -> target (e.g. 15m)
-	timeframeAgg := aggregator.NewTimeframeAggregator(s.config.Timeframe, aggChan)
-	go timeframeAgg.Run(s.rawCandleChan, syncChan)
+	var imExchanges, imAssets []string
+	if s.config.Backtest != nil {
+		imExchanges = s.config.Backtest.RequestedExchanges
+		imAssets = s.config.Backtest.Assets
+	}
+	s.indicatorsManager = indicators.NewIndicatorManager(imExchanges, imAssets)
+	timeframeAgg := aggregator.NewTimeframeAggregator(s.config.Timeframe)
 
-	// Pipeline B: Indicator Manager applies math state and fires the OnCandle core loop
-	s.indicatorsManager = indicators.NewIndicatorManager(s.config.Backtest.RequestedExchanges, s.config.Backtest.Assets)
-	go s.indicatorsManager.Run(sdkCtx, aggChan, s.onCandle)
+	// Single goroutine: aggregate → update indicators → fire OnCandle → signal ticking loop.
+	// All three steps complete before "next" is sent to the engine, eliminating the race
+	// between concurrent "next" and "order" WS messages.
+	go func() {
+		for rawCandle := range s.rawCandleChan {
+			if aggregated := timeframeAgg.Process(rawCandle); aggregated != nil {
+				s.indicatorsManager.Update(aggregated)
+				if s.onCandle != nil {
+					s.onCandle(sdkCtx, aggregated)
+				}
+			}
+			syncChan <- true
+		}
+		close(syncChan)
+	}()
 
 	// Pipeline C: Order Updates dispatch loop
 	go func() {
@@ -155,10 +181,22 @@ func (s *SDK) Start(ctx context.Context) error {
 				select {
 				case <-sdkCtx.Ctx.Done():
 					return
-				case <-syncChan:
+				case _, ok := <-syncChan:
+					if !ok {
+						// Aggregator closed syncChan — all candles processed, backtest done.
+						log.Println("DevSDK: Backtest complete.")
+						if s.onComplete != nil {
+							s.onComplete()
+						}
+						cancel()
+						return
+					}
 					// Signal received: Previous candle fully processed by pipelines.
 					if err := s.adapter.Next(ctx); err != nil {
 						log.Printf("Backtest finished: %v", err)
+						if s.onComplete != nil {
+							s.onComplete()
+						}
 						cancel()
 						return
 					}
@@ -167,8 +205,8 @@ func (s *SDK) Start(ctx context.Context) error {
 		}()
 	}
 
-	// Stay alive until context is canceled
-	<-ctx.Done()
+	// Stay alive until the SDK's own context is canceled (backtest done or user interrupt).
+	<-sdkCtx.Ctx.Done()
 	return nil
 }
 

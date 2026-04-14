@@ -52,7 +52,7 @@ func (im *IndicatorManager) Run(
 				return
 			}
 
-			im.update(candle)
+			im.Update(candle)
 
 			if onCandleCallback != nil {
 				onCandleCallback(ctx, candle)
@@ -61,7 +61,9 @@ func (im *IndicatorManager) Run(
 	}
 }
 
-func (im *IndicatorManager) update(candle *types.Candle) {
+// Update adds a completed aggregated candle to the indicator history.
+// Must be called before the OnCandle callback so RSI/etc. reflect the new candle.
+func (im *IndicatorManager) Update(candle *types.Candle) {
 	im.guard.Lock()
 	defer im.guard.Unlock()
 

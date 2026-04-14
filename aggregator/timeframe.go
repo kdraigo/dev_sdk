@@ -11,40 +11,30 @@ import (
 // and aggregates them into the user-requested Timeframe (e.g. 15m), only emitting when complete.
 type TimeframeAggregator struct {
 	targetTimeframe types.Timeframe
-	outChan         chan<- *types.Candle
 
 	mu      sync.Mutex
 	current *types.Candle
 }
 
-// NewTimeframeAggregator builds an aggregator that pumps completed candles to outChan.
-func NewTimeframeAggregator(tf types.Timeframe, outChan chan<- *types.Candle) *TimeframeAggregator {
+// NewTimeframeAggregator builds an aggregator for the given target timeframe.
+func NewTimeframeAggregator(tf types.Timeframe) *TimeframeAggregator {
 	return &TimeframeAggregator{
 		targetTimeframe: tf,
-		outChan:         outChan,
 	}
 }
 
-// Run loop listens to the raw channel and aggregates.
-func (ta *TimeframeAggregator) Run(rawChan <-chan *types.Candle, doneChan chan<- bool) {
-	for rawCandle := range rawChan {
-		ta.Process(rawCandle)
-		if doneChan != nil {
-			doneChan <- true
-		}
-	}
-}
-
-// Process handles a single high-frequency candle.
-func (ta *TimeframeAggregator) Process(raw *types.Candle) {
+// Process handles a single high-frequency candle and returns a completed aggregated candle
+// when a timeframe boundary is crossed, or nil if the boundary has not yet been reached.
+// The caller is responsible for acting on the returned candle (updating indicators, firing OnCandle)
+// before requesting the next raw candle — this keeps the pipeline fully sequential and deterministic.
+func (ta *TimeframeAggregator) Process(raw *types.Candle) *types.Candle {
 	ta.mu.Lock()
 	defer ta.mu.Unlock()
 
 	// If the user requested the same timeframe as the raw feed (e.g., Engine gives 1m, User requested 1m)
 	// We pass it directly if it's completed.
 	if ta.targetTimeframe == types.Timeframe1m || ta.targetTimeframe == raw.Timeframe {
-		ta.outChan <- raw
-		return
+		return raw
 	}
 
 	// This is a naive check; full implementation will use time/math to determine explicit boundary crossings
@@ -56,13 +46,13 @@ func (ta *TimeframeAggregator) Process(raw *types.Candle) {
 		ta.current.IsComplete = true
 		ta.current.CloseTime = raw.CloseTime
 
-		// Send a copy to the output channel
+		// Return a copy; reset for the next period.
 		completedCandle := *ta.current
-		ta.outChan <- &completedCandle
-
-		// Reset for next period
 		ta.current = nil
+		return &completedCandle
 	}
+
+	return nil
 }
 
 func (ta *TimeframeAggregator) aggregate(raw *types.Candle) {

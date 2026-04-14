@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -13,144 +14,218 @@ import (
 	"github.com/kdraigo/flow_v1/dev_sdk/types"
 )
 
-func main() {
-	// 1. Unified configuration: simply switch the string here to move from Backtesting to Production!
-	config := &types.Config{
+const (
+	totalRuns  = 10
+	rsiPeriod  = 14
+	btcQty     = 0.1
+	exchange   = "binance"
+	symbol     = "BTC/USDT"
+	quoteAsset = "USDT"
+	baseAsset  = "BTC"
+)
+
+// Fixed time window — computed once at startup so all 10 runs use identical candle data.
+var (
+	backtestEnd   = time.Now().UTC().Truncate(time.Hour)
+	backtestStart = backtestEnd.Add(-720 * time.Hour)
+)
+
+func makeConfig() *types.Config {
+	return &types.Config{
 		Environment: types.EnvBacktest,
 		Timeframe:   types.Timeframe15m,
-		// Example: requesting EMA and RSI calculation injects over our candles automatically
-		// Indicators: []string{"EMA50", "RSI14"},
 		Credentials: types.Credentials{
-			APIKey:    "USER_BACKTEST_OR_REAL_KEY",
-			APISecret: "SECRET",
+			KeyID:      "7b89ece9-97ae-4b76-b938-ce9e5345bfce",
+			PrivateKey: "385d5c080a1b4140a5ed9ee76d0ef3fcd291cabab4ec6759bc178ad3a8ed837148309e3cb2a3a014c93d68b4f20a0ba5978ab300531c844dcec672925eb8d63a",
 		},
 		Backtest: &types.BacktestOptions{
 			Endpoint:           "http://localhost:4000",
-			SessionName:        "Strategy-EMA-Cross",
-			RequestedExchanges: []string{"binance"},
-			Assets:             []string{"BTC/USDT"},
-			Wallets:            map[string]float64{"USDT": 100000.0},
-			StartTime:          time.Now().Add(-720 * time.Hour), // Last 30 days
-			EndTime:            time.Now(),
+			SessionName:        "Determinism-Test",
+			RequestedExchanges: []string{exchange},
+			Assets:             []string{symbol},
+			Wallets:            map[string]float64{quoteAsset: 100000.0},
+			StartTime:          backtestStart,
+			EndTime:            backtestEnd,
 		},
 	}
+}
 
-	// 2. Initialize the architecture wrapper
-	chatbotSDK, err := sdk.New(config)
+// runOnce executes the RSI strategy once and returns all FILLED orders in placement order.
+// Orders are collected synchronously inside OnCandle from PlaceOrder's return value,
+// eliminating any race between the async order-update pipeline and shutdown.
+func runOnce(ctx context.Context, run int) ([]*types.Order, error) {
+	botSDK, err := sdk.New(makeConfig())
 	if err != nil {
-		log.Fatalf("Failed to initialize dev_sdk: %v", err)
+		return nil, fmt.Errorf("run %d: failed to init SDK: %w", run, err)
 	}
 
-	// 3. Bind core logic callbacks
-	chatbotSDK.SetOnCandle(func(ctx *types.Context, candle *types.Candle) {
-		log.Printf("Received %s candle close at %f", candle.Timeframe, candle.Close)
+	var (
+		mu     sync.Mutex
+		orders []*types.Order
+		done   = make(chan struct{})
+	)
 
-		// Access integrated indicators mathematically evaluated by the inner framework
-		rsi, err := chatbotSDK.IndicatorManager().RSI("binance", "BTC/USDT", 14, "")
-		if err != nil {
-			log.Printf("Failed to calculate RSI: %v", err)
+	placeAndCollect := func(sdkCtx *types.Context, req *types.OrderRequest) {
+		order, err := sdkCtx.PlaceOrder(req)
+		if err != nil || order == nil {
 			return
 		}
-
-		currentRSI := rsi[len(rsi)-1]
-		log.Printf("Current RSI14: %f\n", currentRSI)
-
-		// 1. BUY logic: RSI < 30 (Use USDT to buy BTC)
-		if currentRSI < 30 {
-			acc, err := ctx.Trader.GetAccount(ctx.Ctx, candle.Exchange, "USDT")
-			if err == nil {
-				var usdtFree float64
-				for _, b := range acc.Balances {
-					if b.Asset == "USDT" {
-						usdtFree = b.Free
-						break
-					}
-				}
-
-				required := 0.1 * candle.Close
-				if usdtFree >= required {
-					req := &types.OrderRequest{
-						Symbol:   candle.Symbol,
-						Exchange: candle.Exchange,
-						Side:     types.OrderSideBuy,
-						Type:     types.OrderTypeMarket,
-						Quantity: 0.1,
-					}
-					placed, err := ctx.PlaceOrder(req)
-					if err == nil {
-						log.Printf("BUY Order placed! ID: %s", placed.ID)
-					}
-				} else {
-					log.Printf("Skip BUY: Insufficient USDT (Free: %f, Required: %f)", usdtFree, required)
-				}
-			}
-		}
-
-		// 2. SELL logic: RSI > 70 (Use BTC to sell)
-		if currentRSI > 70 {
-			acc, err := ctx.Trader.GetAccount(ctx.Ctx, candle.Exchange, "BTC")
-			if err == nil {
-				var btcFree float64
-				for _, b := range acc.Balances {
-					if b.Asset == "BTC" {
-						btcFree = b.Free
-						break
-					}
-				}
-
-				if btcFree >= 0.1 {
-					req := &types.OrderRequest{
-						Symbol:   candle.Symbol,
-						Exchange: candle.Exchange,
-						Side:     types.OrderSideSell,
-						Type:     types.OrderTypeMarket,
-						Quantity: 0.1,
-					}
-					placed, err := ctx.PlaceOrder(req)
-					if err == nil {
-						log.Printf("SELL Order placed! ID: %s", placed.ID)
-					}
-				} else {
-					log.Printf("Skip SELL: Insufficient BTC (Free: %f)", btcFree)
-				}
-			}
-		}
-	})
-
-	var openedOrders = make(map[string]*types.Order)
-	var mu sync.Mutex
-
-	chatbotSDK.SetOnOrderUpdate(func(ctx *types.Context, order *types.Order) {
-		log.Printf("Lifecycle Event: Order %s is now %s", order.ID, order.Status)
-
-		// Typically you'd check for OrderStatusNew or OrderStatusFilled
-		if order.Status == types.OrderStatusNew || order.Status == types.OrderStatusFilled {
+		if order.Status == types.OrderStatusFilled {
 			mu.Lock()
-			openedOrders[order.ID] = order
+			orders = append(orders, order)
 			mu.Unlock()
 		}
+	}
+
+	botSDK.SetOnCandle(func(sdkCtx *types.Context, candle *types.Candle) {
+		rsi, err := botSDK.IndicatorManager().RSI(exchange, symbol, rsiPeriod, "")
+		if err != nil {
+			return
+		}
+		currentRSI := rsi[len(rsi)-1]
+
+		if currentRSI < 30 {
+			acc, err := sdkCtx.Trader.GetAccount(sdkCtx.Ctx, candle.Exchange, quoteAsset)
+			if err != nil {
+				return
+			}
+			var usdtFree float64
+			for _, b := range acc.Balances {
+				if b.Asset == quoteAsset {
+					usdtFree = b.Free
+					break
+				}
+			}
+			if usdtFree >= btcQty*candle.Close {
+				placeAndCollect(sdkCtx, &types.OrderRequest{
+					Symbol:   symbol,
+					Exchange: exchange,
+					Side:     types.OrderSideBuy,
+					Type:     types.OrderTypeMarket,
+					Quantity: btcQty,
+				})
+			}
+		}
+
+		if currentRSI > 70 {
+			acc, err := sdkCtx.Trader.GetAccount(sdkCtx.Ctx, candle.Exchange, baseAsset)
+			if err != nil {
+				return
+			}
+			var btcFree float64
+			for _, b := range acc.Balances {
+				if b.Asset == baseAsset {
+					btcFree = b.Free
+					break
+				}
+			}
+			if btcFree >= btcQty {
+				placeAndCollect(sdkCtx, &types.OrderRequest{
+					Symbol:   symbol,
+					Exchange: exchange,
+					Side:     types.OrderSideSell,
+					Type:     types.OrderTypeMarket,
+					Quantity: btcQty,
+				})
+			}
+		}
 	})
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		log.Println("\nReceived CTRL+C. Shutting down...")
+	botSDK.SetOnComplete(func() {
+		close(done)
+	})
 
-		mu.Lock()
-		log.Printf("Successfully opened orders: %d\n", len(openedOrders))
-		for _, o := range openedOrders {
-			log.Printf(" - ID: %s, Symbol: %s, Side: %s, Status: %s, Qty: %f, Price: %f\n", o.ID, o.Symbol, o.Side, o.Status, o.Quantity, o.Price)
+	if err := botSDK.Start(ctx); err != nil {
+		return nil, fmt.Errorf("run %d: SDK error: %w", run, err)
+	}
+
+	<-done
+	return orders, nil
+}
+
+// ordersEqual compares two orders on every field that must be deterministic across runs.
+// Excludes ID (engine-assigned per session, differs between sessions by design).
+func ordersEqual(a, b *types.Order) bool {
+	return a.Side == b.Side &&
+		a.Type == b.Type &&
+		a.Status == b.Status &&
+		a.Quantity == b.Quantity &&
+		a.Price == b.Price &&
+		a.FilledQty == b.FilledQty &&
+		a.AveragePrice == b.AveragePrice &&
+		a.CreatedAt.Equal(b.CreatedAt) &&
+		a.UpdatedAt.Equal(b.UpdatedAt)
+}
+
+// checkDeterminism compares all runs and reports any divergence.
+// Returns true if all runs produced identical order sequences.
+func checkDeterminism(allRuns [][]*types.Order) bool {
+	reference := allRuns[0]
+	passed := true
+
+	for i := 1; i < len(allRuns); i++ {
+		run := allRuns[i]
+		if len(run) != len(reference) {
+			log.Printf("FAIL: run %d has %d orders, run 1 has %d orders", i+1, len(run), len(reference))
+			passed = false
+			continue
 		}
-		mu.Unlock()
+		for pos, refOrder := range reference {
+			if !ordersEqual(refOrder, run[pos]) {
+				log.Printf("FAIL: run %d differs at position %d", i+1, pos)
+				log.Printf("  ref  : side=%s type=%s price=%f qty=%f status=%s createdAt=%s updatedAt=%s",
+					refOrder.Side, refOrder.Type, refOrder.Price, refOrder.Quantity, refOrder.Status,
+					refOrder.CreatedAt.Format(time.RFC3339), refOrder.UpdatedAt.Format(time.RFC3339))
+				log.Printf("  run%d : side=%s type=%s price=%f qty=%f status=%s createdAt=%s updatedAt=%s",
+					i+1, run[pos].Side, run[pos].Type, run[pos].Price, run[pos].Quantity, run[pos].Status,
+					run[pos].CreatedAt.Format(time.RFC3339), run[pos].UpdatedAt.Format(time.RFC3339))
+				passed = false
+			}
+		}
+	}
+	return passed
+}
 
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Graceful interrupt
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sig
+		log.Println("Interrupted. Shutting down...")
+		cancel()
 		os.Exit(0)
 	}()
 
-	// 4. Start execution (Blocks and processes events)
-	ctx := context.Background()
-	log.Println("Starting Bot...")
-	if err := chatbotSDK.Start(ctx); err != nil {
-		log.Fatalf("SDK Run Error: %v", err)
+	log.Printf("=== Determinism Test: running strategy %d times ===", totalRuns)
+
+	allRuns := make([][]*types.Order, 0, totalRuns)
+
+	for i := 1; i <= totalRuns; i++ {
+		log.Printf("--- Run %d/%d ---", i, totalRuns)
+		orders, err := runOnce(ctx, i)
+		if err != nil {
+			log.Fatalf("Run %d failed: %v", i, err)
+		}
+		log.Printf("Run %d finished: %d FILLED orders", i, len(orders))
+		allRuns = append(allRuns, orders)
+	}
+
+	log.Println("\n=== Results ===")
+	log.Printf("Reference run produced %d orders:", len(allRuns[0]))
+	for pos, o := range allRuns[0] {
+		log.Printf("  [%d] %s %s | qty=%f price=%f status=%s createdAt=%s",
+			pos, o.Side, o.Type, o.Quantity, o.Price, o.Status, o.CreatedAt.Format(time.RFC3339))
+	}
+
+	log.Println("\nComparing all runs...")
+	if checkDeterminism(allRuns) {
+		log.Printf("PASS: all %d runs produced identical order sequences (%d orders each)", totalRuns, len(allRuns[0]))
+	} else {
+		log.Printf("FAIL: strategy is not deterministic across %d runs", totalRuns)
+		os.Exit(1)
 	}
 }
