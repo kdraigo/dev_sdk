@@ -105,6 +105,9 @@ func (s *SDK) Start(ctx context.Context) error {
 	if s.config.Backtest != nil {
 		imExchanges = s.config.Backtest.RequestedExchanges
 		imAssets = s.config.Backtest.Assets
+	} else if s.config.Live != nil {
+		imExchanges = s.config.Live.RequestedExchanges
+		imAssets = s.config.Live.Assets
 	}
 	s.indicatorsManager = indicators.NewIndicatorManager(imExchanges, imAssets)
 	timeframeAgg := aggregator.NewTimeframeAggregator(s.config.Timeframe)

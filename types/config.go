@@ -35,6 +35,7 @@ type Config struct {
 	Indicators  []string         // Formatted indicator names (e.g. "EMA10", "RSI14") to pre-calculate.
 	Credentials Credentials      // API Keys for specific real/testnet exchanges
 	Backtest    *BacktestOptions // Specific settings required when configuring a new backtest engine session.
+	Live        *LiveOptions     // Specific settings required when configuring a real exchange stream.
 }
 
 // Credentials holds sensitive authentication data for exchange APIs and platform access.
@@ -56,4 +57,10 @@ type BacktestOptions struct {
 	Wallets            map[string]float64 // Initial starting balances. Key is asset symbol (e.g. "USDT"), Value is amount.
 	StartTime          time.Time          // Historic start time for data stream.
 	EndTime            time.Time          // Historic end time for data stream.
+}
+
+// LiveOptions contains configuration necessary to hook onto live order books and websocket endpoints.
+type LiveOptions struct {
+	RequestedExchanges []string // List of real exchanges to connect to (e.g., "binance", "bybit").
+	Assets             []string // Trading pairs requested (e.g., "BTCUSDT", "ETHUSDT"). Note: Binance requires no slashes usually.
 }
