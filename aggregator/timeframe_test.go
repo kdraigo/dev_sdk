@@ -9,7 +9,7 @@ import (
 
 func TestTimeframeAggregator_Process(t *testing.T) {
 	outChan := make(chan *types.Candle, 10)
-	agg := NewTimeframeAggregator(types.Timeframe5m, outChan)
+	agg := NewTimeframeAggregator(types.Timeframe5m)
 
 	now := time.Date(2023, 1, 1, 10, 0, 0, 0, time.UTC)
 
@@ -61,7 +61,7 @@ func TestTimeframeAggregator_Process(t *testing.T) {
 
 func TestTimeframeAggregator_SameTimeframe(t *testing.T) {
 	outChan := make(chan *types.Candle, 10)
-	agg := NewTimeframeAggregator(types.Timeframe1m, outChan)
+	agg := NewTimeframeAggregator(types.Timeframe1m)
 
 	now := time.Now()
 	candle := &types.Candle{

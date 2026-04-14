@@ -78,11 +78,11 @@ func runOnce(ctx context.Context, run int) ([]*types.Order, error) {
 	}
 
 	botSDK.SetOnCandle(func(sdkCtx *types.Context, candle *types.Candle) {
-		rsi, err := botSDK.IndicatorManager().RSI(exchange, symbol, rsiPeriod, "")
+		rsiValues, err := botSDK.IndicatorManager().RSI(exchange, symbol, "close", rsiPeriod)
 		if err != nil {
 			return
 		}
-		currentRSI := rsi[len(rsi)-1]
+		currentRSI := rsiValues[len(rsiValues)-1]
 
 		if currentRSI < 30 {
 			acc, err := sdkCtx.Trader.GetAccount(sdkCtx.Ctx, candle.Exchange, quoteAsset)

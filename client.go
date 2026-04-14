@@ -28,7 +28,7 @@ type SDK struct {
 	rawCandleChan chan *types.Candle
 	orderChan     chan *types.Order
 
-	indicatorsManager *indicators.IndicatorManager
+	indicatorsManager indicators.IndicatorManager
 }
 
 var _ types.Trader = (*SDK)(nil)
