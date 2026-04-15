@@ -41,27 +41,8 @@ func (b *BinanceClient) PrepareSession(ctx context.Context, cfg *types.Config) e
 func (b *BinanceClient) ConnectStream(ctx context.Context, candleChan chan<- *types.Candle, orderChan chan<- *types.Order) error {
 	log.Println("Real Binance: Connecting to Binance WebSocket...")
 
+	// Always subscribe to 1m as the base feed; the SDK aggregates up to requested timeframes.
 	interval := "1m"
-	switch b.config.Timeframe {
-	case types.Timeframe1m:
-		interval = "1m"
-	case types.Timeframe3m:
-		interval = "3m"
-	case types.Timeframe5m:
-		interval = "5m"
-	case types.Timeframe15m:
-		interval = "15m"
-	case types.Timeframe30m:
-		interval = "30m"
-	case types.Timeframe1h:
-		interval = "1h"
-	case types.Timeframe2h:
-		interval = "2h"
-	case types.Timeframe4h:
-		interval = "4h"
-	case types.Timeframe1d:
-		interval = "1d"
-	}
 
 	assets := []string{}
 	if b.config.Live != nil {
@@ -84,7 +65,7 @@ func (b *BinanceClient) ConnectStream(ctx context.Context, candleChan chan<- *ty
 				candle := &types.Candle{
 					Symbol:     origSym,
 					Exchange:   "binance",
-					Timeframe:  b.config.Timeframe,
+					Timeframe:  types.Timeframe1m,
 					OpenTime:   time.UnixMilli(event.Kline.StartTime),
 					CloseTime:  time.UnixMilli(event.Kline.EndTime),
 					Open:       open,

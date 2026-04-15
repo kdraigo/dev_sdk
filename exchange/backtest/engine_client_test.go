@@ -45,7 +45,7 @@ func TestEngineClient_PrepareSession(t *testing.T) {
 
 	// 2. Configure Client
 	cfg := &types.Config{
-		Timeframe: types.Timeframe15m,
+		Timeframes: []types.Timeframe{types.Timeframe15m},
 		Backtest: &types.BacktestOptions{
 			Endpoint:           ts.URL,
 			SessionName:        "Test-Session",

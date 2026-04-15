@@ -46,27 +46,8 @@ func (b *BybitClient) ConnectStream(ctx context.Context, candleChan chan<- *type
 		return fmt.Errorf("failed to initialize bybit ws: %w", err)
 	}
 
+	// Always subscribe to 1m as the base feed; the SDK aggregates up to requested timeframes.
 	interval := bybit.Interval("1")
-	switch b.config.Timeframe {
-	case types.Timeframe1m:
-		interval = bybit.Interval("1")
-	case types.Timeframe3m:
-		interval = bybit.Interval("3")
-	case types.Timeframe5m:
-		interval = bybit.Interval("5")
-	case types.Timeframe15m:
-		interval = bybit.Interval("15")
-	case types.Timeframe30m:
-		interval = bybit.Interval("30")
-	case types.Timeframe1h:
-		interval = bybit.Interval("60")
-	case types.Timeframe2h:
-		interval = bybit.Interval("120")
-	case types.Timeframe4h:
-		interval = bybit.Interval("240")
-	case types.Timeframe1d:
-		interval = bybit.Interval("D")
-	}
 
 	assets := []string{}
 	if b.config.Live != nil {
@@ -91,7 +72,7 @@ func (b *BybitClient) ConnectStream(ctx context.Context, candleChan chan<- *type
 				candleChan <- &types.Candle{
 					Symbol:     origSym,
 					Exchange:   "bybit",
-					Timeframe:  b.config.Timeframe,
+					Timeframe:  types.Timeframe1m,
 					OpenTime:   time.UnixMilli(k.Start),
 					CloseTime:  time.UnixMilli(k.End),
 					Open:       open,

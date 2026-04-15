@@ -8,12 +8,12 @@ import (
 )
 
 func TestTimeframeAggregator_Process(t *testing.T) {
-	outChan := make(chan *types.Candle, 10)
 	agg := NewTimeframeAggregator(types.Timeframe5m)
 
 	now := time.Date(2023, 1, 1, 10, 0, 0, 0, time.UTC)
 
-	// Feed 5 x 1m candles
+	var aggregated *types.Candle
+	// Feed 5 x 1m candles; the 5th should produce a completed 5m candle.
 	for i := 0; i < 5; i++ {
 		candle := &types.Candle{
 			Symbol:    "BTC/USDT",
@@ -27,40 +27,36 @@ func TestTimeframeAggregator_Process(t *testing.T) {
 			Close:     101 + float64(i),
 			Volume:    10,
 		}
-		agg.Process(candle)
+		aggregated = agg.Process(candle)
 	}
 
-	// We expect 1 candle in outChan
-	select {
-	case aggregated := <-outChan:
-		if aggregated.Timeframe != types.Timeframe5m {
-			t.Errorf("Expected timeframe 5m, got %v", aggregated.Timeframe)
-		}
-		if aggregated.Open != 100 {
-			t.Errorf("Expected open 100, got %f", aggregated.Open)
-		}
-		if aggregated.Close != 105 {
-			t.Errorf("Expected close 105, got %f", aggregated.Close)
-		}
-		if aggregated.High != 114 {
-			t.Errorf("Expected high 114, got %f", aggregated.High)
-		}
-		if aggregated.Low != 90 {
-			t.Errorf("Expected low 90, got %f", aggregated.Low)
-		}
-		if aggregated.Volume != 50 {
-			t.Errorf("Expected volume 50, got %f", aggregated.Volume)
-		}
-		if !aggregated.IsComplete {
-			t.Error("Expected candle to be complete")
-		}
-	default:
+	if aggregated == nil {
 		t.Fatal("Expected an aggregated candle, but got none")
+	}
+	if aggregated.Timeframe != types.Timeframe5m {
+		t.Errorf("Expected timeframe 5m, got %v", aggregated.Timeframe)
+	}
+	if aggregated.Open != 100 {
+		t.Errorf("Expected open 100, got %f", aggregated.Open)
+	}
+	if aggregated.Close != 105 {
+		t.Errorf("Expected close 105, got %f", aggregated.Close)
+	}
+	if aggregated.High != 114 {
+		t.Errorf("Expected high 114, got %f", aggregated.High)
+	}
+	if aggregated.Low != 90 {
+		t.Errorf("Expected low 90, got %f", aggregated.Low)
+	}
+	if aggregated.Volume != 50 {
+		t.Errorf("Expected volume 50, got %f", aggregated.Volume)
+	}
+	if !aggregated.IsComplete {
+		t.Error("Expected candle to be complete")
 	}
 }
 
 func TestTimeframeAggregator_SameTimeframe(t *testing.T) {
-	outChan := make(chan *types.Candle, 10)
 	agg := NewTimeframeAggregator(types.Timeframe1m)
 
 	now := time.Now()
@@ -74,14 +70,11 @@ func TestTimeframeAggregator_SameTimeframe(t *testing.T) {
 		Close:     101,
 	}
 
-	agg.Process(candle)
-
-	select {
-	case out := <-outChan:
-		if out != candle {
-			t.Error("Expected same candle returned for same timeframe")
-		}
-	default:
-		t.Fatal("Expected candle in outChan")
+	out := agg.Process(candle)
+	if out == nil {
+		t.Fatal("Expected candle returned for same timeframe, got nil")
+	}
+	if out != candle {
+		t.Error("Expected same candle pointer returned for 1m pass-through")
 	}
 }

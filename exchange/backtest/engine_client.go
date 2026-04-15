@@ -90,7 +90,7 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 		streams = append(streams, startSessionRequestStream{
 			SessionID: uid,
 			Pair:      asset,
-			Timeframe: string(cfg.Timeframe),
+			Timeframe: string(types.Timeframe1m), // SDK aggregates up to requested timeframes client-side.
 			From:      cfg.Backtest.StartTime,
 			To:        cfg.Backtest.EndTime,
 		})
@@ -191,7 +191,7 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				if ch, ok := e.pendingOrders[resp.RequestID]; ok {
 					var or orderResponse
 					if resp.Status == "error" {
-						or.err = fmt.Errorf(resp.Error)
+						or.err = fmt.Errorf("%s", resp.Error)
 					} else {
 						var engineOrder struct {
 							ExchangeID int64 `json:"exchange_id"`
@@ -210,7 +210,7 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				} else if ch, ok := e.pendingAccounts[resp.RequestID]; ok {
 					var ar accountResponse
 					if resp.Status == "error" {
-						ar.err = fmt.Errorf(resp.Error)
+						ar.err = fmt.Errorf("%s", resp.Error)
 					} else {
 						json.Unmarshal(resp.Data, &ar.account)
 					}

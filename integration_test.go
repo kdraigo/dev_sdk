@@ -140,7 +140,7 @@ func TestSDK_Integration_Flow(t *testing.T) {
 	// Adjust endpoint to mock server
 	config := &types.Config{
 		Environment: types.EnvBacktest,
-		Timeframe:   types.Timeframe1m, // Fast test
+		Timeframes:  []types.Timeframe{types.Timeframe1m}, // Fast test
 		Backtest: &types.BacktestOptions{
 			Endpoint:           mock.server.URL,
 			SessionName:        "Test-Session",

@@ -33,14 +33,16 @@ var (
 func makeConfig() *types.Config {
 	return &types.Config{
 		Environment: types.EnvBacktest,
-		Timeframe:   types.Timeframe15m,
+		// Subscribe to two timeframes: 15m for entry signals, 1h for trend filter.
+		// The SDK will round the start time up to the next 1h boundary automatically.
+		Timeframes: []types.Timeframe{types.Timeframe15m, types.Timeframe1h},
 		Credentials: types.Credentials{
 			KeyID:      "7b89ece9-97ae-4b76-b938-ce9e5345bfce",
 			PrivateKey: "385d5c080a1b4140a5ed9ee76d0ef3fcd291cabab4ec6759bc178ad3a8ed837148309e3cb2a3a014c93d68b4f20a0ba5978ab300531c844dcec672925eb8d63a",
 		},
 		Backtest: &types.BacktestOptions{
 			Endpoint:           "http://localhost:4000",
-			SessionName:        "Determinism-Test",
+			SessionName:        "Multi-TF-Test",
 			RequestedExchanges: []string{exchange},
 			Assets:             []string{symbol},
 			Wallets:            map[string]float64{quoteAsset: 100000.0},
@@ -50,9 +52,14 @@ func makeConfig() *types.Config {
 	}
 }
 
-// runOnce executes the RSI strategy once and returns all FILLED orders in placement order.
-// Orders are collected synchronously inside OnCandle from PlaceOrder's return value,
-// eliminating any race between the async order-update pipeline and shutdown.
+// runOnce executes the multi-timeframe RSI strategy once and returns all FILLED orders.
+//
+// Strategy logic:
+//
+//	1h handler  — updates the trend bias: bullish when 1h RSI > 50, bearish otherwise.
+//	15m handler — fires entry signals using 15m RSI, but only when the 1h trend agrees:
+//	               RSI(15m) < 30 AND trend bullish  → BUY  (oversold in an uptrend)
+//	               RSI(15m) > 70 AND trend bearish  → SELL (overbought in a downtrend)
 func runOnce(ctx context.Context, run int) ([]*types.Order, error) {
 	botSDK, err := sdk.New(makeConfig())
 	if err != nil {
@@ -60,9 +67,10 @@ func runOnce(ctx context.Context, run int) ([]*types.Order, error) {
 	}
 
 	var (
-		mu     sync.Mutex
-		orders []*types.Order
-		done   = make(chan struct{})
+		mu           sync.Mutex
+		orders       []*types.Order
+		trendBullish bool // Updated by the 1h handler, read by the 15m handler.
+		done         = make(chan struct{})
 	)
 
 	placeAndCollect := func(sdkCtx *types.Context, req *types.OrderRequest) {
@@ -77,14 +85,33 @@ func runOnce(ctx context.Context, run int) ([]*types.Order, error) {
 		}
 	}
 
-	botSDK.SetOnCandle(func(sdkCtx *types.Context, candle *types.Candle) {
-		rsiValues, err := botSDK.IndicatorManager().RSI(exchange, symbol, "close", rsiPeriod)
-		if err != nil {
+	// 1h handler: update trend bias based on 1h RSI.
+	botSDK.SetOnCandleFor(types.Timeframe1h, func(sdkCtx *types.Context, candle *types.Candle) {
+		rsiValues, err := botSDK.IndicatorManagerFor(types.Timeframe1h).RSI(exchange, symbol, "close", rsiPeriod)
+		if err != nil || len(rsiValues) == 0 {
 			return
 		}
-		currentRSI := rsiValues[len(rsiValues)-1]
+		rsi1h := rsiValues[len(rsiValues)-1]
+		mu.Lock()
+		trendBullish = rsi1h > 50
+		mu.Unlock()
+		log.Printf("[1h] RSI=%.2f  trend=%s", rsi1h, map[bool]string{true: "BULLISH", false: "BEARISH"}[trendBullish])
+	})
 
-		if currentRSI < 30 {
+	// 15m handler: fire entries only when 15m RSI agrees with the 1h trend.
+	botSDK.SetOnCandleFor(types.Timeframe15m, func(sdkCtx *types.Context, candle *types.Candle) {
+		rsiValues, err := botSDK.IndicatorManagerFor(types.Timeframe15m).RSI(exchange, symbol, "close", rsiPeriod)
+		if err != nil || len(rsiValues) == 0 {
+			return
+		}
+		rsi15m := rsiValues[len(rsiValues)-1]
+
+		mu.Lock()
+		bullish := trendBullish
+		mu.Unlock()
+
+		// BUY: 15m oversold + 1h uptrend
+		if rsi15m < 30 && bullish {
 			acc, err := sdkCtx.Trader.GetAccount(sdkCtx.Ctx, candle.Exchange, quoteAsset)
 			if err != nil {
 				return
@@ -97,6 +124,7 @@ func runOnce(ctx context.Context, run int) ([]*types.Order, error) {
 				}
 			}
 			if usdtFree >= btcQty*candle.Close {
+				log.Printf("[15m] BUY signal  RSI=%.2f price=%.2f (1h trend: BULLISH)", rsi15m, candle.Close)
 				placeAndCollect(sdkCtx, &types.OrderRequest{
 					Symbol:   symbol,
 					Exchange: exchange,
@@ -107,7 +135,8 @@ func runOnce(ctx context.Context, run int) ([]*types.Order, error) {
 			}
 		}
 
-		if currentRSI > 70 {
+		// SELL: 15m overbought + 1h downtrend
+		if rsi15m > 70 && !bullish {
 			acc, err := sdkCtx.Trader.GetAccount(sdkCtx.Ctx, candle.Exchange, baseAsset)
 			if err != nil {
 				return
@@ -120,6 +149,7 @@ func runOnce(ctx context.Context, run int) ([]*types.Order, error) {
 				}
 			}
 			if btcFree >= btcQty {
+				log.Printf("[15m] SELL signal RSI=%.2f price=%.2f (1h trend: BEARISH)", rsi15m, candle.Close)
 				placeAndCollect(sdkCtx, &types.OrderRequest{
 					Symbol:   symbol,
 					Exchange: exchange,
@@ -200,7 +230,9 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("=== Determinism Test: running strategy %d times ===", totalRuns)
+	log.Printf("=== Multi-Timeframe Determinism Test: running strategy %d times ===", totalRuns)
+	log.Printf("Strategy: 15m RSI entries filtered by 1h RSI trend bias")
+	log.Printf("Window: %s → %s", backtestStart.Format(time.RFC3339), backtestEnd.Format(time.RFC3339))
 
 	allRuns := make([][]*types.Order, 0, totalRuns)
 

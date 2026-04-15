@@ -94,17 +94,31 @@ func (ta *TimeframeAggregator) isBoundaryCrossed(raw *types.Candle) bool {
 }
 
 func extractDuration(tf types.Timeframe) time.Duration {
-	// Simple mapping stub
 	switch tf {
+	case types.Timeframe1m:
+		return time.Minute
+	case types.Timeframe3m:
+		return 3 * time.Minute
 	case types.Timeframe5m:
 		return 5 * time.Minute
 	case types.Timeframe15m:
 		return 15 * time.Minute
+	case types.Timeframe30m:
+		return 30 * time.Minute
 	case types.Timeframe1h:
 		return time.Hour
+	case types.Timeframe2h:
+		return 2 * time.Hour
+	case types.Timeframe4h:
+		return 4 * time.Hour
 	case types.Timeframe1d:
 		return 24 * time.Hour
 	default:
 		return time.Minute
 	}
+}
+
+// ExtractDuration is the exported version for use in client-side start-time rounding.
+func ExtractDuration(tf types.Timeframe) time.Duration {
+	return extractDuration(tf)
 }

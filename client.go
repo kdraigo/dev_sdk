@@ -20,15 +20,18 @@ type SDK struct {
 	adapter Adapter
 
 	// Callbacks
-	onCandle      types.OnCandleFunc
-	onOrderUpdate types.OnOrderUpdateFunc
-	onComplete    func() // Called when a backtest run finishes naturally
+	onCandleAll      types.OnCandleFunc                     // Fires on every closed candle regardless of timeframe.
+	onCandleHandlers map[types.Timeframe]types.OnCandleFunc // Per-timeframe callbacks.
+	onOrderUpdate    types.OnOrderUpdateFunc
+	onComplete       func() // Called when a backtest run finishes naturally
 
 	// Channels for internal piping
 	rawCandleChan chan *types.Candle
 	orderChan     chan *types.Order
 
-	indicatorsManager indicators.IndicatorManager
+	// Per-timeframe indicator managers and aggregators.
+	indManagers map[types.Timeframe]indicators.IndicatorManager
+	aggregators map[types.Timeframe]*aggregator.TimeframeAggregator
 }
 
 var _ types.Trader = (*SDK)(nil)
@@ -56,9 +59,19 @@ func New(cfg *types.Config) (*SDK, error) {
 	}, nil
 }
 
-// SetOnCandle binds the strategy candle iteration callback.
+// SetOnCandle registers a catch-all callback that fires whenever any subscribed timeframe closes.
+// candle.Timeframe identifies which timeframe triggered the call.
 func (s *SDK) SetOnCandle(fn types.OnCandleFunc) {
-	s.onCandle = fn
+	s.onCandleAll = fn
+}
+
+// SetOnCandleFor registers a callback that fires only when the given timeframe closes.
+// Multiple calls with different timeframes register independent handlers.
+func (s *SDK) SetOnCandleFor(tf types.Timeframe, fn types.OnCandleFunc) {
+	if s.onCandleHandlers == nil {
+		s.onCandleHandlers = make(map[types.Timeframe]types.OnCandleFunc)
+	}
+	s.onCandleHandlers[tf] = fn
 }
 
 // SetOnOrderUpdate binds the strategy callback to watch execution.
@@ -101,26 +114,41 @@ func (s *SDK) Start(ctx context.Context) error {
 	// receives a "next" request while a concurrent "order" request is in flight.
 	syncChan := make(chan bool, 1)
 
+	if len(s.config.Timeframes) == 0 {
+		return fmt.Errorf("config.Timeframes must contain at least one timeframe")
+	}
+
 	var imExchanges, imAssets []string
 	if s.config.Backtest != nil {
 		imExchanges = s.config.Backtest.RequestedExchanges
 		imAssets = s.config.Backtest.Assets
+
+		// Round start time up to the next boundary of the largest requested timeframe
+		// to avoid receiving a partial first candle.
+		largest := largestTimeframe(s.config.Timeframes)
+		s.config.Backtest.StartTime = roundUpToTimeframe(s.config.Backtest.StartTime, largest)
 	} else if s.config.Live != nil {
 		imExchanges = s.config.Live.RequestedExchanges
 		imAssets = s.config.Live.Assets
 	}
-	s.indicatorsManager = indicators.NewIndicatorManager(imExchanges, imAssets)
-	timeframeAgg := aggregator.NewTimeframeAggregator(s.config.Timeframe)
 
-	// Single goroutine: aggregate → update indicators → fire OnCandle → signal ticking loop.
-	// All three steps complete before "next" is sent to the engine, eliminating the race
-	// between concurrent "next" and "order" WS messages.
+	// Build one indicator manager and one aggregator per requested timeframe.
+	s.indManagers = make(map[types.Timeframe]indicators.IndicatorManager, len(s.config.Timeframes))
+	s.aggregators = make(map[types.Timeframe]*aggregator.TimeframeAggregator, len(s.config.Timeframes))
+	for _, tf := range s.config.Timeframes {
+		s.indManagers[tf] = indicators.NewIndicatorManager(imExchanges, imAssets)
+		s.aggregators[tf] = aggregator.NewTimeframeAggregator(tf)
+	}
+
+	// Single goroutine: fan out each raw tick to all aggregators, fire callbacks for any
+	// that cross a boundary, then signal the ticking loop exactly once per raw tick.
+	// This keeps the pipeline fully sequential and deterministic.
 	go func() {
 		for rawCandle := range s.rawCandleChan {
-			if aggregated := timeframeAgg.Process(rawCandle); aggregated != nil {
-				s.indicatorsManager.Update(aggregated)
-				if s.onCandle != nil {
-					s.onCandle(sdkCtx, aggregated)
+			for _, tf := range s.config.Timeframes {
+				if closed := s.aggregators[tf].Process(rawCandle); closed != nil {
+					s.indManagers[tf].Update(closed)
+					s.dispatchCandle(sdkCtx, tf, closed)
 				}
 			}
 			syncChan <- true
@@ -227,6 +255,54 @@ func (s *SDK) GetAccount(ctx context.Context, exchange string, asset string) (*t
 	return s.adapter.GetAccount(ctx, exchange, asset)
 }
 
+// IndicatorManagerFor returns the indicator manager scoped to the given timeframe.
+// Call this inside SetOnCandleFor or SetOnCandle (use candle.Timeframe) to get
+// RSI/EMA/etc. values calculated from candles of that specific timeframe.
+func (s *SDK) IndicatorManagerFor(tf types.Timeframe) indicators.IndicatorsCalculator {
+	return s.indManagers[tf]
+}
+
+// IndicatorManager returns the indicator manager for the first configured timeframe.
+// Kept for single-timeframe backward compatibility.
 func (s *SDK) IndicatorManager() indicators.IndicatorsCalculator {
-	return s.indicatorsManager
+	if len(s.config.Timeframes) == 0 {
+		return nil
+	}
+	return s.indManagers[s.config.Timeframes[0]]
+}
+
+// dispatchCandle fires the per-timeframe handler (if any) then the catch-all handler (if any).
+func (s *SDK) dispatchCandle(ctx *types.Context, tf types.Timeframe, candle *types.Candle) {
+	if fn, ok := s.onCandleHandlers[tf]; ok {
+		fn(ctx, candle)
+	}
+	if s.onCandleAll != nil {
+		s.onCandleAll(ctx, candle)
+	}
+}
+
+// largestTimeframe returns the timeframe with the longest duration from the slice.
+func largestTimeframe(tfs []types.Timeframe) types.Timeframe {
+	largest := tfs[0]
+	largestD := aggregator.ExtractDuration(largest)
+	for _, tf := range tfs[1:] {
+		if d := aggregator.ExtractDuration(tf); d > largestD {
+			largest = tf
+			largestD = d
+		}
+	}
+	return largest
+}
+
+// roundUpToTimeframe rounds t up to the next boundary of the given timeframe duration.
+// If t is already on a boundary it is returned unchanged.
+func roundUpToTimeframe(t time.Time, tf types.Timeframe) time.Time {
+	d := aggregator.ExtractDuration(tf)
+	truncated := t.UTC().Truncate(d)
+	if truncated.Equal(t.UTC()) {
+		return t
+	}
+	rounded := truncated.Add(d)
+	log.Printf("DevSDK: start time rounded up from %s to %s (largest timeframe: %s)", t.UTC().Format(time.RFC3339), rounded.Format(time.RFC3339), tf)
+	return rounded
 }

@@ -31,7 +31,7 @@ const (
 // Config is the main configuration object provided by user to initialize the strategy bot SDK.
 type Config struct {
 	Environment Environment      // The environment to connect to.
-	Timeframe   Timeframe        // The aggregate candle size the strategy expects.
+	Timeframes  []Timeframe      // One or more aggregate candle sizes the strategy subscribes to (e.g. [15m, 1h]).
 	Indicators  []string         // Formatted indicator names (e.g. "EMA10", "RSI14") to pre-calculate.
 	Credentials Credentials      // API Keys for specific real/testnet exchanges
 	Backtest    *BacktestOptions // Specific settings required when configuring a new backtest engine session.
