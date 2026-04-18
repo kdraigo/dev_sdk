@@ -54,7 +54,7 @@ func New(cfg *types.Config) (*SDK, error) {
 	return &SDK{
 		config:        cfg,
 		adapter:       adapter,
-		rawCandleChan: make(chan *types.Candle),
+		rawCandleChan: make(chan *types.Candle, 100),
 		orderChan:     make(chan *types.Order, 100),
 	}, nil
 }
@@ -176,24 +176,23 @@ func (s *SDK) Start(ctx context.Context) error {
 	// The adapter should handle this by ensuring its internal state is ready.
 
 	// 5. Command the exchange Adapter to begin pumping data into `rawCandleChan` & `orderChan` natives.
-	// We run this in a goroutine because it blocks, but we need it to start first.
-	go func() {
-		if err := s.adapter.ConnectStream(ctx, s.rawCandleChan, s.orderChan); err != nil {
-			log.Printf("ConnectStream error: %v", err)
-		}
-	}()
+	if err := s.adapter.ConnectStream(ctx, s.rawCandleChan, s.orderChan); err != nil {
+		return fmt.Errorf("failed to connect stream: %w", err)
+	}
 
-	// Small delay to allow WS connection to establish (Handshake requires it)
+	// Allow WS connection to fully establish before the handshake.
 	time.Sleep(500 * time.Millisecond)
 
-	for _, exchange := range s.config.Backtest.RequestedExchanges {
-		for _, asset := range s.config.Backtest.Assets {
-			quoteAsset := strings.Split(asset, "/")[1]
-			_, err := s.adapter.GetAccount(ctx, exchange, quoteAsset)
-			if err != nil {
-				log.Printf("Handshake: Failed to fetch initial account for %s-%s: %v", exchange, quoteAsset, err)
-			} else {
-				log.Printf("Handshake: Successfully synchronized wallet for %s-%s", exchange, quoteAsset)
+	if s.config.Backtest != nil {
+		for _, exchange := range s.config.Backtest.RequestedExchanges {
+			for _, asset := range s.config.Backtest.Assets {
+				quoteAsset := strings.Split(asset, "/")[1]
+				_, err := s.adapter.GetAccount(ctx, exchange, quoteAsset)
+				if err != nil {
+					log.Printf("Handshake: Failed to fetch initial account for %s-%s: %v", exchange, quoteAsset, err)
+				} else {
+					log.Printf("Handshake: Successfully synchronized wallet for %s-%s", exchange, quoteAsset)
+				}
 			}
 		}
 	}
@@ -203,10 +202,15 @@ func (s *SDK) Start(ctx context.Context) error {
 		go func() {
 			// Trigger initial tick
 			if err := s.adapter.Next(ctx); err != nil {
-				log.Printf("Initial tick error: %v", err)
+				log.Printf("DevSDK: initial tick error: %v", err)
 				cancel()
 				return
 			}
+
+			// nextTimeout is how long the tick loop waits for syncChan before
+			// assuming the engine went silent (e.g. after an order fill) and
+			// re-issuing a "next" command to unblock it.
+			const nextTimeout = 15 * time.Second
 
 			for {
 				select {
@@ -222,9 +226,21 @@ func (s *SDK) Start(ctx context.Context) error {
 						cancel()
 						return
 					}
-					// Signal received: Previous candle fully processed by pipelines.
 					if err := s.adapter.Next(ctx); err != nil {
-						log.Printf("Backtest finished: %v", err)
+						log.Printf("DevSDK: Next() error: %v", err)
+						if s.onComplete != nil {
+							s.onComplete()
+						}
+						cancel()
+						return
+					}
+				case <-time.After(nextTimeout):
+					// Engine went silent (no candle arrived within nextTimeout).
+					// This happens when the engine sends an order-fill event but waits
+					// for another "next" command before streaming the following candle.
+					log.Printf("DevSDK: engine silent for %s — re-issuing next", nextTimeout)
+					if err := s.adapter.Next(ctx); err != nil {
+						log.Printf("DevSDK: recovery Next() error: %v", err)
 						if s.onComplete != nil {
 							s.onComplete()
 						}

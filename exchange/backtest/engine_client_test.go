@@ -17,13 +17,13 @@ func TestEngineClient_PrepareSession(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("Expected POST, got %s", r.Method)
 		}
-		if r.URL.Path != "/session" {
-			t.Errorf("Expected path /session, got %s", r.URL.Path)
+		if r.URL.Path != "/api/v1/dev/session" {
+			t.Errorf("Expected path /api/v1/dev/session, got %s", r.URL.Path)
 		}
 
-		// Verify User-ID header
-		if r.Header.Get("X-User-ID") == "" {
-			t.Error("Missing X-User-ID header")
+		// Verify API-KEY header
+		if r.Header.Get("X-API-KEY") == "" {
+			t.Error("Missing X-API-KEY header")
 		}
 
 		// Decode payload
@@ -54,6 +54,10 @@ func TestEngineClient_PrepareSession(t *testing.T) {
 			StartTime:          time.Now(),
 			EndTime:            time.Now().Add(time.Hour),
 			Wallets:            map[string]float64{"USDT": 1000},
+		},
+		Credentials: types.Credentials{
+			KeyID:      "test-key",
+			PrivateKey: "385d5c080a1b4140a5ed9ee76d0ef3fcd291cabab4ec6759bc178ad3a8ed837148309e3cb2a3a014c93d68b4f20a0ba5978ab300531c844dcec672925eb8d63a",
 		},
 	}
 

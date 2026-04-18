@@ -78,3 +78,32 @@ func TestTimeframeAggregator_SameTimeframe(t *testing.T) {
 		t.Error("Expected same candle pointer returned for 1m pass-through")
 	}
 }
+
+func TestTimeframeAggregator_BoundaryAlignment(t *testing.T) {
+	agg := NewTimeframeAggregator(types.Timeframe15m)
+
+	// A candle starting at 10:07 should result in an aggregated candle starting at 10:00
+	startTime := time.Date(2023, 1, 1, 10, 7, 0, 0, time.UTC)
+	candle := &types.Candle{
+		Symbol:    "BTC/USDT",
+		Exchange:  "binance",
+		Timeframe: types.Timeframe1m,
+		OpenTime:  startTime,
+		CloseTime: startTime.Add(time.Minute),
+		Open:      100,
+		High:      101,
+		Low:       99,
+		Close:     100.5,
+	}
+
+	agg.Process(candle) // First candle starts the aggregation
+
+	if agg.current == nil {
+		t.Fatal("Expected current candle to be initialized")
+	}
+
+	expectedOpenTime := time.Date(2023, 1, 1, 10, 0, 0, 0, time.UTC)
+	if !agg.current.OpenTime.Equal(expectedOpenTime) {
+		t.Errorf("Expected aligned OpenTime %v, got %v", expectedOpenTime, agg.current.OpenTime)
+	}
+}

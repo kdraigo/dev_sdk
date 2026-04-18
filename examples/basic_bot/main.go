@@ -27,7 +27,7 @@ const (
 // Fixed time window — computed once at startup so all 10 runs use identical candle data.
 var (
 	backtestEnd   = time.Now().UTC().Truncate(time.Hour)
-	backtestStart = backtestEnd.Add(-720 * time.Hour)
+	backtestStart = time.Date(2025, 6, 6, 0, 0, 0, 0, time.UTC)
 )
 
 func makeConfig() *types.Config {

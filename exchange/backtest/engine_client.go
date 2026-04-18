@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,6 +28,8 @@ type EngineClient struct {
 	sessionID string
 	wsConn    *websocket.Conn
 	writeMu   sync.Mutex
+
+	streamDone atomic.Bool // set when the engine sends done:true; nextTick becomes a no-op
 
 	pendingOrders   map[string]chan *orderResponse
 	pendingAccounts map[string]chan *accountResponse
@@ -170,9 +173,25 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 	}
 	e.wsConn = conn
 
-	// Spawn listening routine
+	// Use gorilla's default ping handler (sends pong automatically, no mutex needed).
+	// Our custom handler was acquiring writeMu inside ReadJSON which could deadlock
+	// if writeMu was held by nextTick() at the same moment.
+	conn.SetPingHandler(nil)
+
+	// Refresh read deadline after every message so a silent engine is detected quickly.
+	const readTimeout = 60 * time.Second
+	conn.SetReadDeadline(time.Now().Add(readTimeout))
+
+	// 5. Command the exchange Adapter to begin pumping data into `rawCandleChan` & `orderChan` natives.
 	go func() {
 		defer conn.Close()
+		candleClosed := false
+		closeCandleChan := func() {
+			if !candleClosed {
+				candleClosed = true
+				close(candleChan)
+			}
+		}
 		for {
 			var resp struct {
 				Action    string          `json:"action"`
@@ -181,14 +200,29 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				Error     string          `json:"error"`
 				RequestID string          `json:"request_id"`
 			}
+			conn.SetReadDeadline(time.Now().Add(readTimeout))
 			if err := conn.ReadJSON(&resp); err != nil {
+				log.Printf("Backtest Engine WS disconnected: %v", err)
+				closeCandleChan() // unblock dispatch goroutine so the tick loop can shut down cleanly
 				return
 			}
 
 			// Handle pending PlaceOrder/GetAccount waiters
 			if resp.RequestID != "" {
+				var orderCh chan *orderResponse
+				var accountCh chan *accountResponse
+
 				e.pendingMu.Lock()
 				if ch, ok := e.pendingOrders[resp.RequestID]; ok {
+					orderCh = ch
+					delete(e.pendingOrders, resp.RequestID)
+				} else if ch, ok := e.pendingAccounts[resp.RequestID]; ok {
+					accountCh = ch
+					delete(e.pendingAccounts, resp.RequestID)
+				}
+				e.pendingMu.Unlock()
+
+				if orderCh != nil {
 					var or orderResponse
 					if resp.Status == "error" {
 						or.err = fmt.Errorf("%s", resp.Error)
@@ -200,25 +234,22 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 						json.Unmarshal(resp.Data, &or.order)
 
 						// Map int64 ID to string if it was missing
-						if or.order.ID == "" && engineOrder.ExchangeID != 0 {
+						if or.order != nil && or.order.ID == "" && engineOrder.ExchangeID != 0 {
 							or.order.ID = fmt.Sprintf("%d", engineOrder.ExchangeID)
 						}
 					}
-					ch <- &or
-					close(ch)
-					delete(e.pendingOrders, resp.RequestID)
-				} else if ch, ok := e.pendingAccounts[resp.RequestID]; ok {
+					orderCh <- &or
+					close(orderCh)
+				} else if accountCh != nil {
 					var ar accountResponse
 					if resp.Status == "error" {
 						ar.err = fmt.Errorf("%s", resp.Error)
 					} else {
 						json.Unmarshal(resp.Data, &ar.account)
 					}
-					ch <- &ar
-					close(ch)
-					delete(e.pendingAccounts, resp.RequestID)
+					accountCh <- &ar
+					close(accountCh)
 				}
-				e.pendingMu.Unlock()
 			}
 
 			if resp.Status != "ok" {
@@ -242,7 +273,17 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 							Complete  bool      `json:"complete"`
 						} `json:"Candle"`
 					} `json:"tick"`
-					Done bool `json:"done"`
+					Done   bool `json:"done"`
+					Orders []struct {
+						ID         int64   `json:"id"`
+						ExchangeID int64   `json:"exchange_id"`
+						Pair       string  `json:"pair"`
+						Side       string  `json:"side"`
+						Type       string  `json:"type"`
+						Status     string  `json:"status"`
+						Price      float64 `json:"price"`
+						Quantity   float64 `json:"quantity"`
+					} `json:"orders"`
 				}
 				json.Unmarshal(resp.Data, &dataStruct)
 				if dataStruct.Tick != nil {
@@ -259,53 +300,56 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 						IsComplete: dataStruct.Tick.Candle.Complete,
 					}
 				}
-				if dataStruct.Done {
-					log.Println("Backtest Engine: Data stream finished.")
-					close(candleChan) // Signal aggregator that no more candles are coming
-					return
-				}
-			}
-
-			if resp.Action == "order" {
-				var engineOrder struct {
-					ID         int64 `json:"id"`
-					ExchangeID int64 `json:"exchange_id"`
-				}
-				json.Unmarshal(resp.Data, &engineOrder)
-
-				var order types.Order
-				json.Unmarshal(resp.Data, &order)
-
-				// Ensure ID is populated for SDK tracking
-				if order.ID == "" {
-					if engineOrder.ID != 0 {
-						order.ID = fmt.Sprintf("%d", engineOrder.ID)
-					} else if engineOrder.ExchangeID != 0 {
-						order.ID = fmt.Sprintf("%d", engineOrder.ExchangeID)
+				// Dispatch any orders filled during this tick to the order channel.
+				for _, o := range dataStruct.Orders {
+					id := fmt.Sprintf("%d", o.ExchangeID)
+					if id == "0" {
+						id = fmt.Sprintf("%d", o.ID)
+					}
+					if id == "0" {
+						continue
+					}
+					orderChan <- &types.Order{
+						ID:           id,
+						Symbol:       o.Pair,
+						Side:         types.OrderSide(strings.ToUpper(o.Side)),
+						Type:         types.OrderType(strings.ToUpper(o.Type)),
+						Status:       types.OrderStatus(strings.ToUpper(o.Status)),
+						Price:        o.Price,
+						Quantity:     o.Quantity,
+						FilledQty:    o.Quantity, // engine fills fully
+						AveragePrice: o.Price,    // limit order fills at limit price
 					}
 				}
-
-				if order.ID != "" {
-					orderChan <- &order
+				if dataStruct.Done {
+					log.Println("Backtest Engine: Data stream finished.")
+					e.streamDone.Store(true)
+					close(candleChan) // Signal aggregator that no more candles are coming
+					return
 				}
 			}
 		}
 	}()
 
-	// Handshake: Initial account state should be fetched by the SDK before/during start
-	// The engine waits for the first "next" command from the SDK.
-
-	<-ctx.Done()
 	return nil
 }
 
 // nextTick issues a "next" command to step the backtester engine.
-func (e *EngineClient) nextTick() {
-	if e.wsConn != nil {
-		e.writeMu.Lock()
-		defer e.writeMu.Unlock()
-		e.wsConn.WriteJSON(map[string]string{"action": "next"})
+// It is a no-op once the engine has signalled that the stream is finished.
+func (e *EngineClient) nextTick() error {
+	if e.streamDone.Load() {
+		return nil
 	}
+	if e.wsConn == nil {
+		return fmt.Errorf("nextTick failed: websocket not connected")
+	}
+
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if err := e.wsConn.WriteJSON(map[string]string{"action": "next"}); err != nil {
+		return fmt.Errorf("nextTick WriteJSON error: %w", err)
+	}
+	return nil
 }
 
 func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error) {
@@ -416,8 +460,7 @@ func (e *EngineClient) GetAccount(ctx context.Context, exchange string, asset st
 }
 
 func (e *EngineClient) Next(ctx context.Context) error {
-	e.nextTick()
-	return nil
+	return e.nextTick()
 }
 
 func (e *EngineClient) generateSignature(method, path, timestamp, body string) (string, error) {

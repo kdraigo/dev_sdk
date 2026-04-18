@@ -57,11 +57,12 @@ func (ta *TimeframeAggregator) Process(raw *types.Candle) *types.Candle {
 
 func (ta *TimeframeAggregator) aggregate(raw *types.Candle) {
 	if ta.current == nil {
+		duration := extractDuration(ta.targetTimeframe)
 		ta.current = &types.Candle{
 			Symbol:    raw.Symbol,
 			Exchange:  raw.Exchange,
 			Timeframe: ta.targetTimeframe,
-			OpenTime:  raw.OpenTime, // Round down to explicit boundary internally
+			OpenTime:  raw.OpenTime.Truncate(duration),
 			Open:      raw.Open,
 			High:      raw.High,
 			Low:       raw.Low,
