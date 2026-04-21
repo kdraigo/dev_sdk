@@ -149,10 +149,15 @@ func (b *BinanceClient) PlaceOrder(ctx context.Context, req *types.OrderRequest)
 	}, nil
 }
 
-func (b *BinanceClient) CancelOrder(ctx context.Context, id string) error {
-	// Require symbol! For Binance, Cancel Order requires Symbol and OrderID.
-	// Our strict signature doesn't have Symbol but we'll try parsing or logging error.
-	return fmt.Errorf("in binance, cancellation requires symbol which is not in interface, implement symbol cache locally")
+func (b *BinanceClient) CancelOrder(ctx context.Context, exchange, symbol, id string) error {
+	orderID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return fmt.Errorf("binance CancelOrder: invalid orderID %q: %w", id, err)
+	}
+	// Binance uses no slash in symbol (e.g. BTCUSDT not BTC/USDT)
+	sym := strings.ReplaceAll(symbol, "/", "")
+	_, err = b.client.NewCancelOrderService().Symbol(sym).OrderID(orderID).Do(ctx)
+	return err
 }
 
 func (b *BinanceClient) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {
