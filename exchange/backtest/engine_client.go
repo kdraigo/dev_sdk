@@ -33,6 +33,7 @@ type EngineClient struct {
 
 	pendingOrders   map[string]chan *orderResponse
 	pendingAccounts map[string]chan *accountResponse
+	pendingCancels  map[string]chan error
 	pendingMu       sync.Mutex
 }
 
@@ -46,6 +47,7 @@ func NewEngineClient(cfg *types.Config) *EngineClient {
 		config:          cfg,
 		pendingOrders:   make(map[string]chan *orderResponse),
 		pendingAccounts: make(map[string]chan *accountResponse),
+		pendingCancels:  make(map[string]chan error),
 	}
 }
 
@@ -207,10 +209,11 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				return
 			}
 
-			// Handle pending PlaceOrder/GetAccount waiters
+			// Handle pending PlaceOrder/GetAccount/CancelOrder waiters
 			if resp.RequestID != "" {
 				var orderCh chan *orderResponse
 				var accountCh chan *accountResponse
+				var cancelCh chan error
 
 				e.pendingMu.Lock()
 				if ch, ok := e.pendingOrders[resp.RequestID]; ok {
@@ -219,6 +222,9 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				} else if ch, ok := e.pendingAccounts[resp.RequestID]; ok {
 					accountCh = ch
 					delete(e.pendingAccounts, resp.RequestID)
+				} else if ch, ok := e.pendingCancels[resp.RequestID]; ok {
+					cancelCh = ch
+					delete(e.pendingCancels, resp.RequestID)
 				}
 				e.pendingMu.Unlock()
 
@@ -249,6 +255,13 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 					}
 					accountCh <- &ar
 					close(accountCh)
+				} else if cancelCh != nil {
+					if resp.Status == "error" {
+						cancelCh <- fmt.Errorf("%s", resp.Error)
+					} else {
+						cancelCh <- nil
+					}
+					close(cancelCh)
 				}
 			}
 
@@ -409,9 +422,51 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 	}
 }
 
-func (e *EngineClient) CancelOrder(ctx context.Context, orderID string) error {
-	log.Printf("Backtest Engine: Canceling Order %s", orderID)
-	return nil
+func (e *EngineClient) CancelOrder(ctx context.Context, exchange, symbol, orderID string) error {
+	if e.wsConn == nil {
+		return fmt.Errorf("websocket not connected")
+	}
+
+	reqID := uuid.New().String()
+	respChan := make(chan error, 1)
+
+	e.pendingMu.Lock()
+	e.pendingCancels[reqID] = respChan
+	e.pendingMu.Unlock()
+
+	payload := map[string]interface{}{
+		"action":     "cancel",
+		"request_id": reqID,
+		"data": map[string]string{
+			"order_id": orderID,
+		},
+	}
+
+	e.writeMu.Lock()
+	err := e.wsConn.WriteJSON(payload)
+	e.writeMu.Unlock()
+
+	if err != nil {
+		e.pendingMu.Lock()
+		delete(e.pendingCancels, reqID)
+		e.pendingMu.Unlock()
+		return err
+	}
+
+	select {
+	case err := <-respChan:
+		return err
+	case <-ctx.Done():
+		e.pendingMu.Lock()
+		delete(e.pendingCancels, reqID)
+		e.pendingMu.Unlock()
+		return ctx.Err()
+	case <-time.After(5 * time.Second):
+		e.pendingMu.Lock()
+		delete(e.pendingCancels, reqID)
+		e.pendingMu.Unlock()
+		return fmt.Errorf("timeout waiting for cancel confirmation")
+	}
 }
 
 func (e *EngineClient) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {

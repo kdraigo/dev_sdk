@@ -99,7 +99,7 @@ type Position struct {
 // Trader is the internal dependency decoupled interface to execute logic.
 type Trader interface {
 	PlaceOrder(ctx context.Context, req *OrderRequest) (*Order, error)
-	CancelOrder(ctx context.Context, id string) error
+	CancelOrder(ctx context.Context, exchange, symbol, id string) error
 	GetAccount(ctx context.Context, exchange string, asset string) (*Account, error)
 }
 
@@ -125,8 +125,8 @@ func (c *Context) PlaceOrder(req *OrderRequest) (*Order, error) {
 	return c.Trader.PlaceOrder(c.Ctx, req)
 }
 
-func (c *Context) CancelOrder(orderID string) error {
-	return c.Trader.CancelOrder(c.Ctx, orderID)
+func (c *Context) CancelOrder(exchange, symbol, orderID string) error {
+	return c.Trader.CancelOrder(c.Ctx, exchange, symbol, orderID)
 }
 
 // Callbacks

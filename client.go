@@ -263,8 +263,8 @@ func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.O
 	return s.adapter.PlaceOrder(ctx, req)
 }
 
-func (s *SDK) CancelOrder(ctx context.Context, id string) error {
-	return s.adapter.CancelOrder(ctx, id)
+func (s *SDK) CancelOrder(ctx context.Context, exchange, symbol, id string) error {
+	return s.adapter.CancelOrder(ctx, exchange, symbol, id)
 }
 
 func (s *SDK) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {

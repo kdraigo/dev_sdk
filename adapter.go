@@ -17,8 +17,8 @@ type Adapter interface {
 	// PlaceOrder translates the generic SDK request into exchange-specific API calls.
 	PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error)
 
-	// CancelOrder aborts a live order.
-	CancelOrder(ctx context.Context, orderID string) error
+	// CancelOrder aborts an open order. exchange and symbol are required by most exchanges.
+	CancelOrder(ctx context.Context, exchange, symbol, orderID string) error
 
 	// GetAccount fetches the current balance for an asset.
 	GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error)
