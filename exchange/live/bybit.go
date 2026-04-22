@@ -36,13 +36,13 @@ func (b *BybitClient) PrepareSession(ctx context.Context, cfg *types.Config) err
 func (b *BybitClient) ConnectStream(ctx context.Context, candleChan chan<- *types.Candle, orderChan chan<- *types.Order) error {
 	log.Println("Bybit: Connecting to WebSocket streams...")
 
-	wsClient := bybit.NewWebsocketClient().WithAuth(b.config.Credentials.APIKey, b.config.Credentials.APISecret)
+	// ── Public kline stream (Spot) ───────────────────────────────────────────
+	pubWsClient := bybit.NewWebsocketClient()
 	if b.config.Environment == types.EnvTestBybit {
-		wsClient = wsClient.WithBaseURL(bybit.TestWebsocketBaseURL)
+		pubWsClient = pubWsClient.WithBaseURL(bybit.TestWebsocketBaseURL)
 	}
 
-	// ── Public kline stream (Spot) ───────────────────────────────────────────
-	pubSrv, err := wsClient.V5().Public(bybit.CategoryV5Spot)
+	pubSrv, err := pubWsClient.V5().Public(bybit.CategoryV5Spot)
 	if err != nil {
 		return fmt.Errorf("failed to initialize bybit public ws: %w", err)
 	}
@@ -98,7 +98,13 @@ func (b *BybitClient) ConnectStream(ctx context.Context, candleChan chan<- *type
 	}()
 
 	// ── Private order stream ─────────────────────────────────────────────────
-	privSrv, err := wsClient.V5().Private()
+	privWsClient := bybit.NewWebsocketClient().
+		WithAuth(b.config.Credentials.APIKey, b.config.Credentials.APISecret)
+	if b.config.Environment == types.EnvTestBybit {
+		privWsClient = privWsClient.WithBaseURL(bybit.TestWebsocketBaseURL)
+	}
+
+	privSrv, err := privWsClient.V5().Private()
 	if err != nil {
 		log.Printf("Bybit: failed to initialize private ws: %v", err)
 	} else {
@@ -246,7 +252,14 @@ func (b *BybitClient) GetAccount(ctx context.Context, exchange string, asset str
 	for _, rawBal := range res.Result.List {
 		for _, coin := range rawBal.Coin {
 			if asset == "" || string(coin.Coin) == asset {
-				free, _ := strconv.ParseFloat(coin.AvailableToWithdraw, 64)
+				valStr := coin.Equity
+				if valStr == "" || valStr == "0" {
+					valStr = coin.WalletBalance
+				}
+				if valStr == "" || valStr == "0" {
+					valStr = coin.AvailableToWithdraw
+				}
+				free, _ := strconv.ParseFloat(valStr, 64)
 				locked, _ := strconv.ParseFloat(coin.Locked, 64)
 				acc.Balances = append(acc.Balances, types.Balance{
 					Asset: string(coin.Coin),
