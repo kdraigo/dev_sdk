@@ -11,6 +11,7 @@ import (
 	"github.com/kdraigo/flow_v1/dev_sdk/exchange/backtest"
 	"github.com/kdraigo/flow_v1/dev_sdk/exchange/live"
 	"github.com/kdraigo/flow_v1/dev_sdk/indicators"
+	"github.com/kdraigo/flow_v1/dev_sdk/telemetry"
 	"github.com/kdraigo/flow_v1/dev_sdk/types"
 )
 
@@ -32,6 +33,8 @@ type SDK struct {
 	// Per-timeframe indicator managers and aggregators.
 	indManagers map[types.Timeframe]indicators.IndicatorManager
 	aggregators map[types.Timeframe]*aggregator.TimeframeAggregator
+
+	publisher telemetry.Publisher
 }
 
 var _ types.Trader = (*SDK)(nil)
@@ -51,11 +54,19 @@ func New(cfg *types.Config) (*SDK, error) {
 		return nil, fmt.Errorf("unsupported environment: %s", cfg.Environment)
 	}
 
+	var pub telemetry.Publisher
+	if cfg.Live != nil && cfg.Live.TelemetryURL != "" {
+		pub = telemetry.NewPublisher("live", cfg.Live.TelemetryURL, cfg.Credentials.KeyID, cfg.Credentials.PrivateKey)
+	} else {
+		pub = telemetry.NoOpPublisher{}
+	}
+
 	return &SDK{
 		config:        cfg,
 		adapter:       adapter,
 		rawCandleChan: make(chan *types.Candle, 100),
 		orderChan:     make(chan *types.Order, 100),
+		publisher:     pub,
 	}, nil
 }
 
@@ -161,6 +172,7 @@ func (s *SDK) Start(ctx context.Context) error {
 		for {
 			select {
 			case order := <-s.orderChan:
+				s.publisher.PublishOrder(order)
 				if s.onOrderUpdate != nil {
 					s.onOrderUpdate(sdkCtx, order)
 				}
@@ -260,7 +272,11 @@ func (s *SDK) Start(ctx context.Context) error {
 // Exposed methods passing through to adapter
 
 func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error) {
-	return s.adapter.PlaceOrder(ctx, req)
+	order, err := s.adapter.PlaceOrder(ctx, req)
+	if err == nil && order != nil {
+		s.publisher.PublishOrder(order)
+	}
+	return order, err
 }
 
 func (s *SDK) CancelOrder(ctx context.Context, exchange, symbol, id string) error {

@@ -63,4 +63,6 @@ type BacktestOptions struct {
 type LiveOptions struct {
 	RequestedExchanges []string // List of real exchanges to connect to (e.g., "binance", "bybit").
 	Assets             []string // Trading pairs requested (e.g., "BTCUSDT", "ETHUSDT"). Note: Binance requires no slashes usually.
+	TelemetryURL       string   // Base URL of the live_trades service (e.g. "http://localhost:5001"). Empty = disabled.
+	TelemetryAPIKey    string   // X-API-Key for live_trades service authentication.
 }
