@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/kdraigo/flow_v1/dev_sdk/aggregator"
 	"github.com/kdraigo/flow_v1/dev_sdk/exchange/backtest"
 	"github.com/kdraigo/flow_v1/dev_sdk/exchange/live"
@@ -56,7 +57,9 @@ func New(cfg *types.Config) (*SDK, error) {
 
 	var pub telemetry.Publisher
 	if cfg.Live != nil && cfg.Live.TelemetryURL != "" {
-		pub = telemetry.NewPublisher("live", cfg.Live.TelemetryURL, cfg.Credentials.KeyID, cfg.Credentials.PrivateKey)
+		sessionID := uuid.New().String()
+		pub = telemetry.NewPublisher(sessionID, cfg.Live.TelemetryURL, cfg.Credentials.KeyID, cfg.Credentials.PrivateKey)
+		log.Printf("SDK: telemetry session_id=%s → %s", sessionID, cfg.Live.TelemetryURL)
 	} else {
 		pub = telemetry.NoOpPublisher{}
 	}
@@ -155,7 +158,12 @@ func (s *SDK) Start(ctx context.Context) error {
 	// that cross a boundary, then signal the ticking loop exactly once per raw tick.
 	// This keeps the pipeline fully sequential and deterministic.
 	go func() {
+		count := 0
 		for rawCandle := range s.rawCandleChan {
+			count++
+			if count%5000 == 0 {
+				log.Printf("DevSDK: processed %d candles... (%s)", count, rawCandle.OpenTime.Format("2006-01-02 15:04"))
+			}
 			for _, tf := range s.config.Timeframes {
 				if closed := s.aggregators[tf].Process(rawCandle); closed != nil {
 					s.indManagers[tf].Update(closed)
@@ -280,7 +288,18 @@ func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.O
 }
 
 func (s *SDK) CancelOrder(ctx context.Context, exchange, symbol, id string) error {
-	return s.adapter.CancelOrder(ctx, exchange, symbol, id)
+	err := s.adapter.CancelOrder(ctx, exchange, symbol, id)
+	if err == nil {
+		// Optimization: Publish a synthetic CANCELED event immediately to telemetry.
+		// This ensures live_trades is updated even if the private WS stream is lagging or auth-failed.
+		s.publisher.PublishOrder(&types.Order{
+			ID:       id,
+			Symbol:   symbol,
+			Exchange: exchange,
+			Status:   types.OrderStatusCanceled,
+		})
+	}
+	return err
 }
 
 func (s *SDK) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {

@@ -53,6 +53,7 @@ func NewEngineClient(cfg *types.Config) *EngineClient {
 
 type startSessionRequestStream struct {
 	SessionID uuid.UUID `json:"sessionID"`
+	Exchange  string    `json:"exchange"`
 	Pair      string    `json:"pair"`
 	Timeframe string    `json:"timeframe"`
 	From      time.Time `json:"from"`
@@ -77,7 +78,7 @@ type sessionResponse struct {
 }
 
 func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) error {
-	log.Printf("Backtest Engine: Preparing Session '%s'...\n", cfg.Backtest.SessionName)
+	log.Printf("Backtest Engine: Preparing Session...\n")
 
 	if cfg.Backtest.Endpoint == "" {
 		cfg.Backtest.Endpoint = "http://localhost:4000"
@@ -91,14 +92,17 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 
 	// Create required streams requests for all requested Exchange-Asset pairs
 	var streams []startSessionRequestStream
-	for _, asset := range cfg.Backtest.Assets {
-		streams = append(streams, startSessionRequestStream{
-			SessionID: uid,
-			Pair:      asset,
-			Timeframe: string(types.Timeframe1m), // SDK aggregates up to requested timeframes client-side.
-			From:      cfg.Backtest.StartTime,
-			To:        cfg.Backtest.EndTime,
-		})
+	for _, ex := range cfg.Backtest.RequestedExchanges {
+		for _, asset := range cfg.Backtest.Assets {
+			streams = append(streams, startSessionRequestStream{
+				SessionID: uid,
+				Exchange:  ex,
+				Pair:      asset,
+				Timeframe: string(types.Timeframe1m), // SDK aggregates up to requested timeframes client-side.
+				From:      cfg.Backtest.StartTime,
+				To:        cfg.Backtest.EndTime,
+			})
+		}
 	}
 
 	// Format wallets
@@ -115,7 +119,10 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 		}
 	}
 
-	payload := newSessionRequestPayload{Streams: streams, InitialWallets: wallets}
+	payload := newSessionRequestPayload{
+		Streams:        streams,
+		InitialWallets: wallets,
+	}
 	body, _ := json.Marshal(payload)
 
 	// 2. Perform HTTP action

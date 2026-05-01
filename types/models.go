@@ -69,6 +69,8 @@ type Order struct {
 	Quantity     float64
 	FilledQty    float64
 	AveragePrice float64
+	Fee          float64
+	FeeAsset     string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }

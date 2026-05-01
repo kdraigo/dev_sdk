@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -12,13 +13,19 @@ import (
 	"github.com/kdraigo/flow_v1/dev_sdk/types"
 )
 
+type symbolInfo struct {
+	tickSize float64 // minimum price increment
+	qtyStep  float64 // minimum quantity increment
+}
+
 type BybitClient struct {
-	config *types.Config
-	client *bybit.Client
+	config  *types.Config
+	client  *bybit.Client
+	symbols map[string]symbolInfo // keyed by uppercase symbol e.g. "BTCUSDT"
 }
 
 func NewBybitClient(cfg *types.Config) *BybitClient {
-	return &BybitClient{config: cfg}
+	return &BybitClient{config: cfg, symbols: make(map[string]symbolInfo)}
 }
 
 func (b *BybitClient) PrepareSession(ctx context.Context, cfg *types.Config) error {
@@ -30,7 +37,60 @@ func (b *BybitClient) PrepareSession(ctx context.Context, cfg *types.Config) err
 		b.client = bybit.NewClient().WithAuth(cfg.Credentials.APIKey, cfg.Credentials.APISecret)
 	}
 
+	if err := b.fetchSymbolInfo(cfg); err != nil {
+		// Non-fatal — log and continue; orders will use raw values.
+		log.Printf("Bybit: failed to fetch instrument info: %v", err)
+	}
+
 	return nil
+}
+
+func (b *BybitClient) fetchSymbolInfo(cfg *types.Config) error {
+	assets := []string{}
+	if cfg.Live != nil {
+		assets = cfg.Live.Assets
+	}
+
+	for _, asset := range assets {
+		sym := strings.ToUpper(strings.ReplaceAll(asset, "/", ""))
+		symV5 := bybit.SymbolV5(sym)
+
+		resp, err := b.client.V5().Market().GetInstrumentsInfo(bybit.V5GetInstrumentsInfoParam{
+			Category: bybit.CategoryV5Spot,
+			Symbol:   &symV5,
+		})
+		if err != nil {
+			log.Printf("Bybit: instrument info fetch failed for %s: %v", sym, err)
+			continue
+		}
+		if resp.Result.Spot == nil || len(resp.Result.Spot.List) == 0 {
+			log.Printf("Bybit: no spot instrument info for %s", sym)
+			continue
+		}
+
+		item := resp.Result.Spot.List[0]
+		tickSize, _ := strconv.ParseFloat(item.PriceFilter.TickSize, 64)
+		qtyStep, _ := strconv.ParseFloat(item.LotSizeFilter.BasePrecision, 64)
+
+		b.symbols[sym] = symbolInfo{tickSize: tickSize, qtyStep: qtyStep}
+		log.Printf("Bybit: %s tickSize=%v qtyStep=%v", sym, tickSize, qtyStep)
+	}
+
+	return nil
+}
+
+// roundToStep floors v to the nearest multiple of step.
+func roundToStep(v, step float64) float64 {
+	if step <= 0 {
+		return v
+	}
+	// Use integer math to avoid floating-point drift.
+	decimals := -math.Round(math.Log10(step))
+	if decimals < 0 {
+		decimals = 0
+	}
+	factor := math.Pow(10, decimals)
+	return math.Floor(v*factor/math.Round(step*factor)) * math.Round(step*factor) / factor
 }
 
 func (b *BybitClient) ConnectStream(ctx context.Context, candleChan chan<- *types.Candle, orderChan chan<- *types.Order) error {
@@ -148,6 +208,7 @@ func mapBybitOrder(d bybit.V5WebsocketPrivateOrderData) *types.Order {
 	qty, _ := strconv.ParseFloat(d.Qty, 64)
 	filledQty, _ := strconv.ParseFloat(d.CumExecQty, 64)
 	avgPrice, _ := strconv.ParseFloat(d.AvgPrice, 64)
+	fee, _ := strconv.ParseFloat(d.CumExecFee, 64)
 
 	return &types.Order{
 		ID:           d.OrderID,
@@ -160,6 +221,8 @@ func mapBybitOrder(d bybit.V5WebsocketPrivateOrderData) *types.Order {
 		Quantity:     qty,
 		FilledQty:    filledQty,
 		AveragePrice: avgPrice,
+		Fee:          fee,
+		FeeAsset:     string("USDT"),
 		CreatedAt:    parseMillis(d.CreatedTime),
 		UpdatedAt:    parseMillis(d.UpdatedTime),
 	}
@@ -198,7 +261,16 @@ func (b *BybitClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) (
 		orderType = bybit.OrderTypeLimit
 	}
 
-	qtyStr := fmt.Sprintf("%f", req.Quantity)
+	price := req.Price
+	qty := req.Quantity
+	if info, ok := b.symbols[sym]; ok {
+		qty = roundToStep(qty, info.qtyStep)
+		if req.Type == types.OrderTypeLimit {
+			price = roundToStep(price, info.tickSize)
+		}
+	}
+
+	qtyStr := strconv.FormatFloat(qty, 'f', -1, 64)
 
 	param := bybit.V5CreateOrderParam{
 		Category:  bybit.CategoryV5Spot,
@@ -209,7 +281,7 @@ func (b *BybitClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) (
 	}
 
 	if req.Type == types.OrderTypeLimit {
-		priceStr := fmt.Sprintf("%f", req.Price)
+		priceStr := strconv.FormatFloat(price, 'f', -1, 64)
 		param.Price = &priceStr
 	}
 

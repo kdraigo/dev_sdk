@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -72,6 +73,8 @@ type orderPayload struct {
 	Qty           float64   `json:"qty"`
 	FilledQty     float64   `json:"filled_qty"`
 	AvgPrice      float64   `json:"avg_price"`
+	Fee           float64   `json:"fee"`
+	FeeAsset      string    `json:"fee_asset"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
@@ -98,6 +101,8 @@ func (p *httpPublisher) PublishOrder(order *types.Order) {
 			Qty:       order.Quantity,
 			FilledQty: order.FilledQty,
 			AvgPrice:  order.AveragePrice,
+			Fee:       order.Fee,
+			FeeAsset:  order.FeeAsset,
 			CreatedAt: order.CreatedAt,
 			UpdatedAt: order.UpdatedAt,
 		},
@@ -143,7 +148,6 @@ func (p *httpPublisher) send(payload *telemetryPayload) {
 
 	// Kdraigo Signature
 	if p.keyID != "" && p.privateKey != "" {
-		canonical := fmt.Sprintf("%s\n%s\n%s\n%s", method, path, timestamp, string(body))
 		privKeyBytes, err := hex.DecodeString(p.privateKey)
 		if err == nil && len(privKeyBytes) == ed25519.PrivateKeySize {
 			sig := ed25519.Sign(privKeyBytes, []byte(canonical))
@@ -158,8 +162,9 @@ func (p *httpPublisher) send(payload *telemetryPayload) {
 		log.Printf("[telemetry] POST error: %v", err)
 		return
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		log.Printf("[telemetry] POST %s returned %d", req.URL, resp.StatusCode)
+		b, _ := io.ReadAll(resp.Body)
+		log.Printf("[telemetry] POST %s returned %d: %s", req.URL, resp.StatusCode, string(b))
 	}
 }

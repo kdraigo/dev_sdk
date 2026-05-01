@@ -1,6 +1,6 @@
 module github.com/kdraigo/flow_v1/dev_sdk
 
-go 1.25.0
+go 1.25.9
 
 require (
 	github.com/adshao/go-binance/v2 v2.8.11
