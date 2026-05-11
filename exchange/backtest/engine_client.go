@@ -372,7 +372,11 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 					} `json:"orders"`
 				}
 				json.Unmarshal(resp.Data, &dataStruct)
-				if dataStruct.Tick != nil {
+				// When done:true the engine sends a sentinel zero-value tick.
+				// Skip it — the zero candle would otherwise pollute the SDK
+				// pipeline (advance clock backwards by no-op, fire OnCandle
+				// with empty data, etc.). The done flag itself is enough.
+				if dataStruct.Tick != nil && !dataStruct.Done && !dataStruct.Tick.Candle.Time.IsZero() {
 					candle := &types.Candle{
 						Symbol:     dataStruct.Tick.Pair,
 						Exchange:   dataStruct.Tick.Exchange,
@@ -386,9 +390,6 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 						Volume:     dataStruct.Tick.Candle.Volume,
 						IsComplete: dataStruct.Tick.Candle.Complete,
 					}
-					// Backtester engine emits only closed historical candles
-					// (no intermediate ticks). Trust the contract — dropping
-					// here would desync the tick loop's syncChan.
 					log.Printf("[WS] Received Candle: %s", candle.OpenTime.Format("2006-01-02 15:04"))
 					candleChan <- candle
 				}
