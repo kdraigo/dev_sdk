@@ -36,6 +36,11 @@ type SDK struct {
 	aggregators map[types.Timeframe]*aggregator.TimeframeAggregator
 
 	publisher telemetry.Publisher
+
+	// clock is the strategy-facing time source. wallClock in live mode,
+	// backtestClock in backtest mode. Backtest clock advances on every
+	// dispatched closed candle (only path that mutates it).
+	clock Clock
 }
 
 var _ types.Trader = (*SDK)(nil)
@@ -44,13 +49,23 @@ var _ types.Trader = (*SDK)(nil)
 func New(cfg *types.Config) (*SDK, error) {
 	// Architecture requires dynamically choosing the adapter:
 	var adapter Adapter
+	var clock Clock
 	switch cfg.Environment {
 	case types.EnvBacktest:
 		adapter = backtest.NewEngineClient(cfg)
+		// Backtest clock starts at session.From so sdk.Now() is meaningful
+		// before the first candle is dispatched (e.g. for warmup history calls).
+		var start time.Time
+		if cfg.Backtest != nil {
+			start = cfg.Backtest.StartTime
+		}
+		clock = newBacktestClock(start)
 	case types.EnvRealBinance, types.EnvTestBinance:
 		adapter = live.NewBinanceClient(cfg)
+		clock = wallClock{}
 	case types.EnvRealBybit, types.EnvTestBybit:
 		adapter = live.NewBybitClient(cfg)
+		clock = wallClock{}
 	default:
 		return nil, fmt.Errorf("unsupported environment: %s", cfg.Environment)
 	}
@@ -70,7 +85,19 @@ func New(cfg *types.Config) (*SDK, error) {
 		rawCandleChan: make(chan *types.Candle, 100),
 		orderChan:     make(chan *types.Order, 100),
 		publisher:     pub,
+		clock:         clock,
 	}, nil
+}
+
+// Now returns the current time in the strategy's frame of reference.
+// In live mode this is wall time; in backtest mode it is the simulated clock
+// (close time of the last dispatched candle, or the configured session start
+// before any candle has been dispatched).
+func (s *SDK) Now() time.Time {
+	if s.clock == nil {
+		return time.Now()
+	}
+	return s.clock.Now()
 }
 
 // SetOnCandle registers a catch-all callback that fires whenever any subscribed timeframe closes.
@@ -119,6 +146,7 @@ func (s *SDK) Start(ctx context.Context) error {
 		Cancel: cancel,
 		Config: s.config,
 		Trader: s,
+		Clock:  s.clock,
 	}
 
 	// 2. Start internal processing pipelines
@@ -161,8 +189,13 @@ func (s *SDK) Start(ctx context.Context) error {
 		count := 0
 		for rawCandle := range s.rawCandleChan {
 			count++
-			if count%5000 == 0 {
+			if count%1000 == 0 {
 				log.Printf("DevSDK: processed %d candles... (%s)", count, rawCandle.OpenTime.Format("2006-01-02 15:04"))
+			}
+			// Advance the simulated clock for backtest. In live the clock is a
+			// wallClock and Advance is a no-op (interface check below).
+			if bc, ok := s.clock.(*backtestClock); ok && rawCandle != nil {
+				bc.Advance(rawCandle.CloseTime)
 			}
 			for _, tf := range s.config.Timeframes {
 				if closed := s.aggregators[tf].Process(rawCandle); closed != nil {
@@ -304,6 +337,32 @@ func (s *SDK) CancelOrder(ctx context.Context, exchange, symbol, id string) erro
 
 func (s *SDK) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {
 	return s.adapter.GetAccount(ctx, exchange, asset)
+}
+
+// GetCandles returns the last `count` closed candles for the given timeframe,
+// ending at sdk.Now(). In live mode "now" is wall time; in backtest "now" is
+// the close time of the most recent dispatched candle (or the configured
+// session start before any candle has been dispatched).
+//
+// Equivalent to GetCandlesFromTo(s.Now() - count*tfDuration, s.Now(), tf).
+func (s *SDK) GetCandles(ctx context.Context, exchange, symbol string, count int, tf types.Timeframe) ([]*types.Candle, error) {
+	if count <= 0 {
+		return nil, fmt.Errorf("count must be positive, got %d", count)
+	}
+	tfDur := aggregator.ExtractDuration(tf)
+	to := s.Now()
+	from := to.Add(-time.Duration(count) * tfDur)
+	return s.GetCandlesFromTo(ctx, exchange, symbol, from, to, tf)
+}
+
+// GetCandlesFromTo returns closed candles in [from, to] for the given
+// timeframe. In backtest mode the engine rejects requests with `to` past the
+// simulated playhead to prevent lookahead leak.
+func (s *SDK) GetCandlesFromTo(ctx context.Context, exchange, symbol string, from, to time.Time, tf types.Timeframe) ([]*types.Candle, error) {
+	if s.adapter == nil {
+		return nil, fmt.Errorf("sdk has no adapter")
+	}
+	return s.adapter.GetHistoricalCandles(ctx, exchange, symbol, from, to, tf)
 }
 
 // IndicatorManagerFor returns the indicator manager scoped to the given timeframe.

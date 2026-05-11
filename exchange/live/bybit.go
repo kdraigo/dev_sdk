@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hirokisan/bybit/v2"
+	"github.com/kdraigo/flow_v1/dev_sdk/aggregator"
 	"github.com/kdraigo/flow_v1/dev_sdk/types"
 )
 
@@ -123,6 +124,12 @@ func (b *BybitClient) ConnectStream(ctx context.Context, candleChan chan<- *type
 			Symbol:   sym,
 		}, func(response bybit.V5WebsocketPublicKlineResponse) error {
 			for _, k := range response.Data {
+				// Drop in-progress klines. Bybit pushes ~one update per second
+				// while a candle is forming and sets Confirm=true only on the
+				// final tick. Strategies expect one OnCandle per close.
+				if !k.Confirm {
+					continue
+				}
 				open, _ := strconv.ParseFloat(k.Open, 64)
 				high, _ := strconv.ParseFloat(k.High, 64)
 				low, _ := strconv.ParseFloat(k.Low, 64)
@@ -347,4 +354,138 @@ func (b *BybitClient) GetAccount(ctx context.Context, exchange string, asset str
 
 func (b *BybitClient) Next(ctx context.Context) error {
 	return nil
+}
+
+// bybitInterval maps SDK timeframes to the Bybit V5 kline interval enum.
+func bybitInterval(tf types.Timeframe) (bybit.Interval, error) {
+	switch tf {
+	case types.Timeframe1m:
+		return bybit.Interval1, nil
+	case types.Timeframe3m:
+		return bybit.Interval3, nil
+	case types.Timeframe5m:
+		return bybit.Interval5, nil
+	case types.Timeframe15m:
+		return bybit.Interval15, nil
+	case types.Timeframe30m:
+		return bybit.Interval30, nil
+	case types.Timeframe1h:
+		return bybit.Interval60, nil
+	case types.Timeframe2h:
+		return bybit.Interval120, nil
+	case types.Timeframe4h:
+		return bybit.Interval240, nil
+	case types.Timeframe1d:
+		return bybit.IntervalD, nil
+	default:
+		return "", fmt.Errorf("bybit: unsupported timeframe %q", tf)
+	}
+}
+
+// GetHistoricalCandles pages backwards through Bybit's V5 spot kline REST,
+// returning closed candles in [from, to] sorted oldest-first. The client
+// requires no authentication for this endpoint, but b.client is reused
+// for connection pooling.
+func (b *BybitClient) GetHistoricalCandles(ctx context.Context, exchange, symbol string, from, to time.Time, tf types.Timeframe) ([]*types.Candle, error) {
+	if b.client == nil {
+		// Allow callers to fetch history before PrepareSession (e.g. for
+		// quick scripts). Build a default unauthenticated client here.
+		if b.config != nil && b.config.Environment == types.EnvTestBybit {
+			b.client = bybit.NewTestClient().Client
+		} else {
+			b.client = bybit.NewClient()
+		}
+	}
+	if from.After(to) {
+		return nil, fmt.Errorf("bybit: from %s is after to %s", from, to)
+	}
+	interval, err := bybitInterval(tf)
+	if err != nil {
+		return nil, err
+	}
+
+	sym := bybit.SymbolV5(strings.ToUpper(strings.ReplaceAll(symbol, "/", "")))
+	tfDur := aggregator.ExtractDuration(tf)
+	durationMs := tfDur.Milliseconds()
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
+
+	const pageLimit = 200
+	var all []*types.Candle
+	end := toMs
+
+	for end >= fromMs {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		startParam := fromMs
+		endParam := end
+		limit := pageLimit
+		resp, err := b.client.V5().Market().GetKline(bybit.V5GetKlineParam{
+			Category: bybit.CategoryV5Spot,
+			Symbol:   sym,
+			Interval: interval,
+			Start:    &startParam,
+			End:      &endParam,
+			Limit:    &limit,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("bybit kline fetch: %w", err)
+		}
+		if len(resp.Result.List) == 0 {
+			break
+		}
+
+		// Bybit returns klines newest-first. Convert and reverse so the page
+		// is oldest-first, then prepend the page to the accumulator.
+		page := make([]*types.Candle, 0, len(resp.Result.List))
+		oldestStartMs := end
+		for _, k := range resp.Result.List {
+			startMs, err := strconv.ParseInt(k.StartTime, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("bybit kline parse start time %q: %w", k.StartTime, err)
+			}
+			open, _ := strconv.ParseFloat(k.Open, 64)
+			high, _ := strconv.ParseFloat(k.High, 64)
+			low, _ := strconv.ParseFloat(k.Low, 64)
+			closeVal, _ := strconv.ParseFloat(k.Close, 64)
+			volume, _ := strconv.ParseFloat(k.Volume, 64)
+
+			page = append(page, &types.Candle{
+				Symbol:     symbol,
+				Exchange:   "bybit",
+				Timeframe:  tf,
+				OpenTime:   time.UnixMilli(startMs),
+				CloseTime:  time.UnixMilli(startMs + durationMs),
+				Open:       open,
+				High:       high,
+				Low:        low,
+				Close:      closeVal,
+				Volume:     volume,
+				IsComplete: true,
+			})
+			if startMs < oldestStartMs {
+				oldestStartMs = startMs
+			}
+		}
+		// Reverse page (newest-first → oldest-first) and prepend to result.
+		for i, j := 0, len(page)-1; i < j; i, j = i+1, j-1 {
+			page[i], page[j] = page[j], page[i]
+		}
+		all = append(page, all...)
+
+		if len(resp.Result.List) < pageLimit {
+			break
+		}
+		// Page back: next end is one millisecond before the oldest candle.
+		if oldestStartMs <= fromMs {
+			break
+		}
+		end = oldestStartMs - 1
+	}
+
+	return all, nil
 }

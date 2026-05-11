@@ -136,10 +136,15 @@ func (p *httpPublisher) send(payload *telemetryPayload) {
 	}
 
 	method := http.MethodPost
-	path := "/api/v1/telemetry"
+	sigPath := "/api/v1/telemetry"
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 
-	req, err := http.NewRequest(method, fmt.Sprintf("%s%s", p.baseURL, path), bytes.NewReader(body))
+	reqURL := p.baseURL
+	if reqURL == "https://api.kdraigo.com" || reqURL == "http://localhost:5001" {
+		reqURL = reqURL + sigPath
+	}
+
+	req, err := http.NewRequest(method, reqURL, bytes.NewReader(body))
 	if err != nil {
 		log.Printf("[telemetry] request error: %v", err)
 		return
@@ -150,6 +155,7 @@ func (p *httpPublisher) send(payload *telemetryPayload) {
 	if p.keyID != "" && p.privateKey != "" {
 		privKeyBytes, err := hex.DecodeString(p.privateKey)
 		if err == nil && len(privKeyBytes) == ed25519.PrivateKeySize {
+			canonical := fmt.Sprintf("%s\n%s\n%s\n%s", method, sigPath, timestamp, string(body))
 			sig := ed25519.Sign(privKeyBytes, []byte(canonical))
 			req.Header.Set("X-Key-ID", p.keyID)
 			req.Header.Set("X-Signature", hex.EncodeToString(sig))

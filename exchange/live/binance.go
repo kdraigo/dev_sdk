@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adshao/go-binance/v2"
+	"github.com/kdraigo/flow_v1/dev_sdk/aggregator"
 	"github.com/kdraigo/flow_v1/dev_sdk/types"
 )
 
@@ -30,7 +31,13 @@ func (b *BinanceClient) PrepareSession(ctx context.Context, cfg *types.Config) e
 
 	b.client = binance.NewClient(cfg.Credentials.APIKey, cfg.Credentials.APISecret)
 
-	err := b.client.NewPingService().Do(ctx)
+	// Sync time to prevent -1022 Signature Invalid errors
+	_, err := b.client.NewSetServerTimeService().Do(ctx)
+	if err != nil {
+		log.Printf("Warning: failed to sync Binance server time: %v", err)
+	}
+
+	err = b.client.NewPingService().Do(ctx)
 	if err != nil {
 		return fmt.Errorf("binance connection failed: %w", err)
 	}
@@ -56,6 +63,12 @@ func (b *BinanceClient) ConnectStream(ctx context.Context, candleChan chan<- *ty
 
 		go func(sym, origSym string) {
 			doneC, stopC, err := binance.WsKlineServe(sym, interval, func(event *binance.WsKlineEvent) {
+				// Drop in-progress klines. Binance fires every ~2s while a
+				// candle is forming and sets IsFinal=true only on close.
+				// Strategies expect one OnCandle per close.
+				if !event.Kline.IsFinal {
+					return
+				}
 				open, _ := strconv.ParseFloat(event.Kline.Open, 64)
 				high, _ := strconv.ParseFloat(event.Kline.High, 64)
 				low, _ := strconv.ParseFloat(event.Kline.Low, 64)
@@ -184,4 +197,118 @@ func (b *BinanceClient) GetAccount(ctx context.Context, exchange string, asset s
 
 func (b *BinanceClient) Next(ctx context.Context) error {
 	return nil
+}
+
+// binanceInterval maps SDK timeframes to Binance kline interval strings.
+func binanceInterval(tf types.Timeframe) (string, error) {
+	switch tf {
+	case types.Timeframe1m:
+		return "1m", nil
+	case types.Timeframe3m:
+		return "3m", nil
+	case types.Timeframe5m:
+		return "5m", nil
+	case types.Timeframe15m:
+		return "15m", nil
+	case types.Timeframe30m:
+		return "30m", nil
+	case types.Timeframe1h:
+		return "1h", nil
+	case types.Timeframe2h:
+		return "2h", nil
+	case types.Timeframe4h:
+		return "4h", nil
+	case types.Timeframe1d:
+		return "1d", nil
+	default:
+		return "", fmt.Errorf("binance: unsupported timeframe %q", tf)
+	}
+}
+
+// GetHistoricalCandles pages forward through Binance's kline REST API,
+// returning closed candles in [from, to] sorted oldest-first.
+func (b *BinanceClient) GetHistoricalCandles(ctx context.Context, exchange, symbol string, from, to time.Time, tf types.Timeframe) ([]*types.Candle, error) {
+	if b.client == nil {
+		// Allow callers to fetch history before PrepareSession.
+		if b.config != nil && b.config.Environment == types.EnvTestBinance {
+			binance.UseTestnet = true
+		}
+		b.client = binance.NewClient(
+			b.config.Credentials.APIKey,
+			b.config.Credentials.APISecret,
+		)
+	}
+	if from.After(to) {
+		return nil, fmt.Errorf("binance: from %s is after to %s", from, to)
+	}
+	interval, err := binanceInterval(tf)
+	if err != nil {
+		return nil, err
+	}
+
+	sym := strings.ToUpper(strings.ReplaceAll(symbol, "/", ""))
+	tfDur := aggregator.ExtractDuration(tf)
+	durationMs := tfDur.Milliseconds()
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
+
+	const pageLimit = 1000
+	var all []*types.Candle
+	cursor := fromMs
+
+	for cursor <= toMs {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		page, err := b.client.NewKlinesService().
+			Symbol(sym).
+			Interval(interval).
+			StartTime(cursor).
+			EndTime(toMs).
+			Limit(pageLimit).
+			Do(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("binance kline fetch: %w", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+
+		var lastOpenMs int64
+		for _, k := range page {
+			open, _ := strconv.ParseFloat(k.Open, 64)
+			high, _ := strconv.ParseFloat(k.High, 64)
+			low, _ := strconv.ParseFloat(k.Low, 64)
+			closeVal, _ := strconv.ParseFloat(k.Close, 64)
+			volume, _ := strconv.ParseFloat(k.Volume, 64)
+
+			all = append(all, &types.Candle{
+				Symbol:     symbol,
+				Exchange:   "binance",
+				Timeframe:  tf,
+				OpenTime:   time.UnixMilli(k.OpenTime),
+				CloseTime:  time.UnixMilli(k.OpenTime + durationMs),
+				Open:       open,
+				High:       high,
+				Low:        low,
+				Close:      closeVal,
+				Volume:     volume,
+				IsComplete: true,
+			})
+			if k.OpenTime > lastOpenMs {
+				lastOpenMs = k.OpenTime
+			}
+		}
+
+		if len(page) < pageLimit {
+			break
+		}
+		// Advance to one millisecond past the most recent candle's open.
+		cursor = lastOpenMs + 1
+	}
+
+	return all, nil
 }

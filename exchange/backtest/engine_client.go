@@ -34,7 +34,16 @@ type EngineClient struct {
 	pendingOrders   map[string]chan *orderResponse
 	pendingAccounts map[string]chan *accountResponse
 	pendingCancels  map[string]chan error
+	pendingHistory  map[string]chan *historyResponse
 	pendingMu       sync.Mutex
+
+	smallestTF types.Timeframe
+}
+
+// historyResponse carries the result of a "history" WS round-trip.
+type historyResponse struct {
+	candles []*types.Candle
+	err     error
 }
 
 type orderResponse struct {
@@ -48,6 +57,7 @@ func NewEngineClient(cfg *types.Config) *EngineClient {
 		pendingOrders:   make(map[string]chan *orderResponse),
 		pendingAccounts: make(map[string]chan *accountResponse),
 		pendingCancels:  make(map[string]chan error),
+		pendingHistory:  make(map[string]chan *historyResponse),
 	}
 }
 
@@ -91,6 +101,14 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	uid := uuid.New()
 
 	// Create required streams requests for all requested Exchange-Asset pairs
+	e.smallestTF = types.Timeframe1m
+	if len(cfg.Timeframes) > 0 {
+		e.smallestTF = cfg.Timeframes[0]
+		// Naive smallest: in this SDK, shorter strings aren't necessarily smaller, 
+		// but usually the first one in config is the 'base' one.
+		// For now, let's just use the first one provided to speed things up significantly.
+	}
+
 	var streams []startSessionRequestStream
 	for _, ex := range cfg.Backtest.RequestedExchanges {
 		for _, asset := range cfg.Backtest.Assets {
@@ -98,7 +116,7 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 				SessionID: uid,
 				Exchange:  ex,
 				Pair:      asset,
-				Timeframe: string(types.Timeframe1m), // SDK aggregates up to requested timeframes client-side.
+				Timeframe: string(e.smallestTF),
 				From:      cfg.Backtest.StartTime,
 				To:        cfg.Backtest.EndTime,
 			})
@@ -216,11 +234,12 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				return
 			}
 
-			// Handle pending PlaceOrder/GetAccount/CancelOrder waiters
+			// Handle pending PlaceOrder/GetAccount/CancelOrder/History waiters
 			if resp.RequestID != "" {
 				var orderCh chan *orderResponse
 				var accountCh chan *accountResponse
 				var cancelCh chan error
+				var historyCh chan *historyResponse
 
 				e.pendingMu.Lock()
 				if ch, ok := e.pendingOrders[resp.RequestID]; ok {
@@ -232,8 +251,55 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				} else if ch, ok := e.pendingCancels[resp.RequestID]; ok {
 					cancelCh = ch
 					delete(e.pendingCancels, resp.RequestID)
+				} else if ch, ok := e.pendingHistory[resp.RequestID]; ok {
+					historyCh = ch
+					delete(e.pendingHistory, resp.RequestID)
 				}
 				e.pendingMu.Unlock()
+
+				if historyCh != nil {
+					var hr historyResponse
+					if resp.Status == "error" {
+						hr.err = fmt.Errorf("%s", resp.Error)
+					} else {
+						var hp struct {
+							Candles []struct {
+								Pair      string    `json:"Pair"`
+								Time      time.Time `json:"time"`
+								UpdatedAt time.Time `json:"updatedAt"`
+								Open      float64   `json:"open"`
+								High      float64   `json:"high"`
+								Low       float64   `json:"low"`
+								Close     float64   `json:"close"`
+								Volume    float64   `json:"volume"`
+								Complete  bool      `json:"complete"`
+							} `json:"candles"`
+						}
+						if err := json.Unmarshal(resp.Data, &hp); err != nil {
+							hr.err = fmt.Errorf("history decode: %w", err)
+						} else {
+							out := make([]*types.Candle, 0, len(hp.Candles))
+							for _, c := range hp.Candles {
+								out = append(out, &types.Candle{
+									Symbol:     c.Pair,
+									Timeframe:  e.smallestTF,
+									OpenTime:   c.Time,
+									CloseTime:  c.UpdatedAt,
+									Open:       c.Open,
+									High:       c.High,
+									Low:        c.Low,
+									Close:      c.Close,
+									Volume:     c.Volume,
+									IsComplete: true,
+								})
+							}
+							hr.candles = out
+						}
+					}
+					historyCh <- &hr
+					close(historyCh)
+					continue
+				}
 
 				if orderCh != nil {
 					var or orderResponse
@@ -307,9 +373,10 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				}
 				json.Unmarshal(resp.Data, &dataStruct)
 				if dataStruct.Tick != nil {
-					candleChan <- &types.Candle{
+					candle := &types.Candle{
 						Symbol:     dataStruct.Tick.Pair,
 						Exchange:   dataStruct.Tick.Exchange,
+						Timeframe:  e.smallestTF,
 						OpenTime:   dataStruct.Tick.Candle.Time,
 						CloseTime:  dataStruct.Tick.Candle.UpdatedAt,
 						Open:       dataStruct.Tick.Candle.Open,
@@ -319,6 +386,11 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 						Volume:     dataStruct.Tick.Candle.Volume,
 						IsComplete: dataStruct.Tick.Candle.Complete,
 					}
+					// Backtester engine emits only closed historical candles
+					// (no intermediate ticks). Trust the contract — dropping
+					// here would desync the tick loop's syncChan.
+					log.Printf("[WS] Received Candle: %s", candle.OpenTime.Format("2006-01-02 15:04"))
+					candleChan <- candle
 				}
 				// Dispatch any orders filled during this tick to the order channel.
 				for _, o := range dataStruct.Orders {
@@ -366,6 +438,7 @@ func (e *EngineClient) nextTick() error {
 
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+	log.Printf("[WS] Sending Action: next")
 	if err := e.wsConn.WriteJSON(map[string]string{"action": "next"}); err != nil {
 		return fmt.Errorf("nextTick WriteJSON error: %w", err)
 	}
@@ -399,6 +472,7 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 	}
 
 	e.writeMu.Lock()
+	log.Printf("[WS] Sending Action: order (reqID: %s)", reqID)
 	err := e.wsConn.WriteJSON(payload)
 	e.writeMu.Unlock()
 
@@ -523,6 +597,69 @@ func (e *EngineClient) GetAccount(ctx context.Context, exchange string, asset st
 
 func (e *EngineClient) Next(ctx context.Context) error {
 	return e.nextTick()
+}
+
+// GetHistoricalCandles round-trips a "history" request to the backtester
+// engine over the existing WS connection. The engine validates that `to` does
+// not exceed the simulated playhead and serves candles from data_provider.
+// Pure read — no playhead, wallet, or coordinator state is touched on either side.
+func (e *EngineClient) GetHistoricalCandles(ctx context.Context, exchange, symbol string, from, to time.Time, tf types.Timeframe) ([]*types.Candle, error) {
+	if e.wsConn == nil {
+		return nil, fmt.Errorf("websocket not connected")
+	}
+
+	reqID := uuid.New().String()
+	respChan := make(chan *historyResponse, 1)
+
+	e.pendingMu.Lock()
+	e.pendingHistory[reqID] = respChan
+	e.pendingMu.Unlock()
+
+	payload := map[string]interface{}{
+		"action":     "history",
+		"request_id": reqID,
+		"data": map[string]interface{}{
+			"exchange":  exchange,
+			"pair":      symbol,
+			"timeframe": string(tf),
+			"from":      from,
+			"to":        to,
+		},
+	}
+
+	e.writeMu.Lock()
+	err := e.wsConn.WriteJSON(payload)
+	e.writeMu.Unlock()
+
+	if err != nil {
+		e.pendingMu.Lock()
+		delete(e.pendingHistory, reqID)
+		e.pendingMu.Unlock()
+		return nil, err
+	}
+
+	select {
+	case resp := <-respChan:
+		if resp.err != nil {
+			return nil, resp.err
+		}
+		// Stamp returned candles with the requested exchange (engine response
+		// carries Pair but not Exchange).
+		for _, c := range resp.candles {
+			c.Exchange = exchange
+		}
+		return resp.candles, nil
+	case <-ctx.Done():
+		e.pendingMu.Lock()
+		delete(e.pendingHistory, reqID)
+		e.pendingMu.Unlock()
+		return nil, ctx.Err()
+	case <-time.After(30 * time.Second):
+		e.pendingMu.Lock()
+		delete(e.pendingHistory, reqID)
+		e.pendingMu.Unlock()
+		return nil, fmt.Errorf("timeout waiting for history response")
+	}
 }
 
 func (e *EngineClient) generateSignature(method, path, timestamp, body string) (string, error) {

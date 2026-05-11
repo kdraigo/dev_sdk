@@ -27,7 +27,7 @@ func (m *mockAdapter) PlaceOrder(ctx context.Context, req *types.OrderRequest) (
 	return nil, nil
 }
 
-func (m *mockAdapter) CancelOrder(ctx context.Context, orderID string) error {
+func (m *mockAdapter) CancelOrder(ctx context.Context, exchange, symbol, orderID string) error {
 	return nil
 }
 
@@ -37,6 +37,10 @@ func (m *mockAdapter) GetAccount(ctx context.Context, exchange string, asset str
 
 func (m *mockAdapter) Next(ctx context.Context) error {
 	return nil
+}
+
+func (m *mockAdapter) GetHistoricalCandles(ctx context.Context, exchange, symbol string, from, to time.Time, tf types.Timeframe) ([]*types.Candle, error) {
+	return nil, nil
 }
 
 func TestNewSDK(t *testing.T) {

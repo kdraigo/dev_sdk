@@ -105,6 +105,14 @@ type Trader interface {
 	GetAccount(ctx context.Context, exchange string, asset string) (*Account, error)
 }
 
+// ClockProvider returns the current time in the strategy's frame of reference.
+// In live mode it returns wall time; in backtest mode it returns the simulated
+// clock (close time of the last dispatched candle, or the session start time
+// before any candle has been dispatched).
+type ClockProvider interface {
+	Now() time.Time
+}
+
 // Context wraps runtime specifics accessible in callback functions.
 // Allows users to query the indicators pre-calculated and manage connection lifecycle.
 type Context struct {
@@ -113,6 +121,7 @@ type Context struct {
 	Config        *Config
 	IndicatorsMap map[string]float64
 	Trader        Trader
+	Clock         ClockProvider
 }
 
 func (c *Context) SetIndicators(in map[string]float64) {
@@ -129,6 +138,16 @@ func (c *Context) PlaceOrder(req *OrderRequest) (*Order, error) {
 
 func (c *Context) CancelOrder(exchange, symbol, orderID string) error {
 	return c.Trader.CancelOrder(c.Ctx, exchange, symbol, orderID)
+}
+
+// Now returns the current time in the strategy's frame of reference.
+// Use this instead of time.Now() so strategy code is portable across live and
+// backtest modes.
+func (c *Context) Now() time.Time {
+	if c.Clock == nil {
+		return time.Now()
+	}
+	return c.Clock.Now()
 }
 
 // Callbacks
