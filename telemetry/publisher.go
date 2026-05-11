@@ -15,14 +15,40 @@ import (
 	"github.com/kdraigo/flow_v1/dev_sdk/types"
 )
 
-// Publisher broadcasts SDK events to an external telemetry service.
-// All methods must be non-blocking — implementations fire goroutines internally.
-type Publisher interface {
-	PublishOrder(order *types.Order)
-	PublishBalance(account *types.Account)
+// Wire-format size caps. Kept in sync with live_trades' server-side
+// validation; the SDK truncates locally to avoid 413s.
+const (
+	MaxReasonBytes    = 4096
+	MaxLogsTotalBytes = 16384
+	MaxLogLineBytes   = 1024
+	MaxLogLineCount   = 32
+)
+
+// HeartbeatMeta is the per-tick payload appended to the 5s heartbeat. Cheap
+// to capture, gives the operator a live view of strategy progress beyond
+// "process alive".
+type HeartbeatMeta struct {
+	UptimeSeconds    int64
+	CandlesProcessed int64
+	OrdersPlaced     int
+	LastOrderID      string
 }
 
-// NewPublisher returns an HTTPPublisher when url is set, otherwise a NoOpPublisher.
+// Publisher broadcasts SDK events to live_trades. All methods must be
+// non-blocking — implementations fire goroutines internally so the strategy
+// callback is never delayed by network I/O.
+type Publisher interface {
+	PublishOrder(order *types.Order, reason map[string]any, logs []string)
+	PublishBalance(account *types.Account)
+	PublishInitialBalance(account *types.Account)
+	PublishHeartbeat(meta HeartbeatMeta)
+	PublishStopped(reason string)
+	// Enabled reports whether telemetry is actually being sent. Heartbeat
+	// goroutines should not start when this is false.
+	Enabled() bool
+}
+
+// NewPublisher returns an httpPublisher when url is set, otherwise a NoOpPublisher.
 func NewPublisher(sessionID, url, keyID, privateKey string) Publisher {
 	if url == "" {
 		return NoOpPublisher{}
@@ -40,43 +66,53 @@ func NewPublisher(sessionID, url, keyID, privateKey string) Publisher {
 
 type NoOpPublisher struct{}
 
-func (NoOpPublisher) PublishOrder(*types.Order)     {}
-func (NoOpPublisher) PublishBalance(*types.Account) {}
+func (NoOpPublisher) PublishOrder(*types.Order, map[string]any, []string) {}
+func (NoOpPublisher) PublishBalance(*types.Account)                       {}
+func (NoOpPublisher) PublishInitialBalance(*types.Account)                {}
+func (NoOpPublisher) PublishHeartbeat(HeartbeatMeta)                      {}
+func (NoOpPublisher) PublishStopped(string)                               {}
+func (NoOpPublisher) Enabled() bool                                       { return false }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
 type httpPublisher struct {
 	sessionID  string
 	baseURL    string
-	apiKey     string
 	keyID      string
 	privateKey string
 	client     *http.Client
 }
 
+func (p *httpPublisher) Enabled() bool { return true }
+
 type telemetryPayload struct {
-	SessionID string          `json:"session_id"`
-	Exchange  string          `json:"exchange"`
-	Symbol    string          `json:"symbol"`
-	EventType string          `json:"event_type"`
-	Order     *orderPayload   `json:"order,omitempty"`
-	Balance   *balancePayload `json:"balance,omitempty"`
+	SessionID string            `json:"session_id"`
+	Exchange  string            `json:"exchange,omitempty"`
+	Symbol    string            `json:"symbol,omitempty"`
+	EventType string            `json:"event_type"`
+	Order     *orderPayload     `json:"order,omitempty"`
+	Balance   *balancePayload   `json:"balance,omitempty"`
+	Balances  []balancePayload  `json:"balances,omitempty"`
+	Heartbeat *heartbeatPayload `json:"heartbeat,omitempty"`
+	Stopped   *stoppedPayload   `json:"stopped,omitempty"`
 }
 
 type orderPayload struct {
-	OrderID       string    `json:"order_id"`
-	ClientOrderID string    `json:"client_order_id"`
-	Side          string    `json:"side"`
-	Type          string    `json:"type"`
-	Status        string    `json:"status"`
-	Price         float64   `json:"price"`
-	Qty           float64   `json:"qty"`
-	FilledQty     float64   `json:"filled_qty"`
-	AvgPrice      float64   `json:"avg_price"`
-	Fee           float64   `json:"fee"`
-	FeeAsset      string    `json:"fee_asset"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	OrderID       string         `json:"order_id"`
+	ClientOrderID string         `json:"client_order_id"`
+	Side          string         `json:"side"`
+	Type          string         `json:"type"`
+	Status        string         `json:"status"`
+	Price         float64        `json:"price"`
+	Qty           float64        `json:"qty"`
+	FilledQty     float64        `json:"filled_qty"`
+	AvgPrice      float64        `json:"avg_price"`
+	Fee           float64        `json:"fee"`
+	FeeAsset      string         `json:"fee_asset"`
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
+	Reason        map[string]any `json:"reason,omitempty"`
+	Logs          []string       `json:"logs,omitempty"`
 }
 
 type balancePayload struct {
@@ -86,7 +122,21 @@ type balancePayload struct {
 	RecordedAt time.Time `json:"recorded_at"`
 }
 
-func (p *httpPublisher) PublishOrder(order *types.Order) {
+type heartbeatPayload struct {
+	RecordedAt       time.Time `json:"recorded_at"`
+	UptimeSeconds    int64     `json:"uptime_seconds"`
+	CandlesProcessed int64     `json:"candles_processed"`
+	OrdersPlaced     int       `json:"orders_placed"`
+	LastOrderID      string    `json:"last_order_id"`
+}
+
+type stoppedPayload struct {
+	Reason     string    `json:"reason"`
+	RecordedAt time.Time `json:"recorded_at"`
+}
+
+func (p *httpPublisher) PublishOrder(order *types.Order, reason map[string]any, logs []string) {
+	reasonOut, logsOut := truncateReasonAndLogs(reason, logs)
 	payload := &telemetryPayload{
 		SessionID: p.sessionID,
 		Exchange:  order.Exchange,
@@ -105,27 +155,107 @@ func (p *httpPublisher) PublishOrder(order *types.Order) {
 			FeeAsset:  order.FeeAsset,
 			CreatedAt: order.CreatedAt,
 			UpdatedAt: order.UpdatedAt,
+			Reason:    reasonOut,
+			Logs:      logsOut,
 		},
 	}
 	go p.send(payload)
 }
 
 func (p *httpPublisher) PublishBalance(account *types.Account) {
+	go p.send(buildBalancesPayload(p.sessionID, account, "balance"))
+}
+
+func (p *httpPublisher) PublishInitialBalance(account *types.Account) {
+	go p.send(buildBalancesPayload(p.sessionID, account, "initial_balance"))
+}
+
+func buildBalancesPayload(sessionID string, account *types.Account, eventType string) *telemetryPayload {
+	now := time.Now().UTC()
+	out := make([]balancePayload, 0, len(account.Balances))
 	for _, b := range account.Balances {
-		b := b
-		payload := &telemetryPayload{
-			SessionID: p.sessionID,
-			Exchange:  account.Exchange,
-			EventType: "balance",
-			Balance: &balancePayload{
-				Asset:      b.Asset,
-				Free:       b.Free,
-				Locked:     b.Lock,
-				RecordedAt: time.Now().UTC(),
-			},
-		}
-		go p.send(payload)
+		out = append(out, balancePayload{
+			Asset:      b.Asset,
+			Free:       b.Free,
+			Locked:     b.Lock,
+			RecordedAt: now,
+		})
 	}
+	return &telemetryPayload{
+		SessionID: sessionID,
+		Exchange:  account.Exchange,
+		EventType: eventType,
+		Balances:  out,
+	}
+}
+
+func (p *httpPublisher) PublishHeartbeat(meta HeartbeatMeta) {
+	go p.send(&telemetryPayload{
+		SessionID: p.sessionID,
+		EventType: "heartbeat",
+		Heartbeat: &heartbeatPayload{
+			RecordedAt:       time.Now().UTC(),
+			UptimeSeconds:    meta.UptimeSeconds,
+			CandlesProcessed: meta.CandlesProcessed,
+			OrdersPlaced:     meta.OrdersPlaced,
+			LastOrderID:      meta.LastOrderID,
+		},
+	})
+}
+
+func (p *httpPublisher) PublishStopped(reason string) {
+	// Send synchronously so the goroutine doesn't get killed mid-flight by
+	// the process exiting after Start() returns. Bounded by client timeout.
+	p.send(&telemetryPayload{
+		SessionID: p.sessionID,
+		EventType: "session_stopped",
+		Stopped: &stoppedPayload{
+			Reason:     reason,
+			RecordedAt: time.Now().UTC(),
+		},
+	})
+}
+
+// truncateReasonAndLogs enforces the same caps as the server but in a
+// best-effort way: instead of failing, it trims and adds a marker. The user's
+// strategy should never see a telemetry failure.
+func truncateReasonAndLogs(reason map[string]any, logs []string) (map[string]any, []string) {
+	var reasonOut map[string]any
+	if reason != nil {
+		// Deep copy so we can mutate without disturbing the caller.
+		reasonOut = make(map[string]any, len(reason)+1)
+		for k, v := range reason {
+			reasonOut[k] = v
+		}
+		if b, err := json.Marshal(reasonOut); err == nil && len(b) > MaxReasonBytes {
+			reasonOut = map[string]any{
+				"_truncated":     true,
+				"_original_size": len(b),
+			}
+		}
+	}
+
+	var logsOut []string
+	if len(logs) > 0 {
+		logsOut = make([]string, 0, len(logs))
+		total := 0
+		truncatedExtra := 0
+		for _, ln := range logs {
+			if len(ln) > MaxLogLineBytes {
+				ln = ln[:MaxLogLineBytes-3] + "..."
+			}
+			if total+len(ln) > MaxLogsTotalBytes || len(logsOut) >= MaxLogLineCount-1 {
+				truncatedExtra = len(logs) - len(logsOut)
+				break
+			}
+			logsOut = append(logsOut, ln)
+			total += len(ln)
+		}
+		if truncatedExtra > 0 {
+			logsOut = append(logsOut, fmt.Sprintf("[truncated %d more lines]", truncatedExtra))
+		}
+	}
+	return reasonOut, logsOut
 }
 
 func (p *httpPublisher) send(payload *telemetryPayload) {

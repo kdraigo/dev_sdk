@@ -23,6 +23,7 @@ basic_bot
 # Go workspace file
 go.work
 go.work.sum
+examples/
 
 # env file
 .env

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,6 +42,12 @@ type SDK struct {
 	// backtestClock in backtest mode. Backtest clock advances on every
 	// dispatched closed candle (only path that mutates it).
 	clock Clock
+
+	// Telemetry counters. Read by the heartbeat goroutine via atomics so the
+	// dispatch goroutine never blocks. Bumped from candle and order paths.
+	candlesProcessed atomic.Int64
+	ordersPlaced     atomic.Int32
+	lastOrderID      atomic.Value // string
 }
 
 var _ types.Trader = (*SDK)(nil)
@@ -189,6 +196,7 @@ func (s *SDK) Start(ctx context.Context) error {
 		count := 0
 		for rawCandle := range s.rawCandleChan {
 			count++
+			s.candlesProcessed.Store(int64(count))
 			if count%1000 == 0 {
 				log.Printf("DevSDK: processed %d candles... (%s)", count, rawCandle.OpenTime.Format("2006-01-02 15:04"))
 			}
@@ -213,9 +221,20 @@ func (s *SDK) Start(ctx context.Context) error {
 		for {
 			select {
 			case order := <-s.orderChan:
-				s.publisher.PublishOrder(order)
+				// Order updates from the exchange/engine stream carry no
+				// strategy-supplied reason — that lives on the original
+				// PlaceOrder call.
+				if s.publisher != nil {
+					s.publisher.PublishOrder(order, nil, nil)
+				}
 				if s.onOrderUpdate != nil {
 					s.onOrderUpdate(sdkCtx, order)
+				}
+				// After a fill, refresh the current-balance snapshot so the
+				// frontend's wallet delta picks up the change without
+				// reconstructing from order history.
+				if order.Status == types.OrderStatusFilled && s.publisher != nil && s.publisher.Enabled() {
+					go s.publishCurrentBalanceFor(sdkCtx.Ctx, order.Exchange, order.Symbol)
 				}
 			case <-sdkCtx.Ctx.Done():
 				return
@@ -248,6 +267,18 @@ func (s *SDK) Start(ctx context.Context) error {
 				}
 			}
 		}
+	}
+
+	// Telemetry side-channel: live mode only. Heartbeat at 5s, initial
+	// wallet snapshot on connect, current wallet snapshot on a 60s fallback
+	// timer (plus the per-fill trigger in the order dispatch loop above),
+	// explicit stopped event on graceful shutdown.
+	if s.publisher != nil && s.publisher.Enabled() && s.config.Environment != types.EnvBacktest && s.config.Live != nil {
+		startedAt := time.Now()
+		s.publishInitialBalances(ctx)
+		go s.heartbeatLoop(sdkCtx.Ctx, startedAt)
+		go s.balanceFallbackLoop(sdkCtx.Ctx)
+		defer s.publisher.PublishStopped("normal_shutdown")
 	}
 
 	// 6. Start the deterministic ticking loop for backtesting
@@ -313,16 +344,25 @@ func (s *SDK) Start(ctx context.Context) error {
 // Exposed methods passing through to adapter
 
 func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error) {
+	// Strip telemetry-only fields before handing the request to the adapter:
+	// the engine and exchanges never see Reason/Logs.
+	reason, logs := req.Reason, req.Logs
+	req.Reason, req.Logs = nil, nil
+
 	order, err := s.adapter.PlaceOrder(ctx, req)
 	if err == nil && order != nil {
-		s.publisher.PublishOrder(order)
+		s.ordersPlaced.Add(1)
+		s.lastOrderID.Store(order.ID)
+		if s.publisher != nil {
+			s.publisher.PublishOrder(order, reason, logs)
+		}
 	}
 	return order, err
 }
 
 func (s *SDK) CancelOrder(ctx context.Context, exchange, symbol, id string) error {
 	err := s.adapter.CancelOrder(ctx, exchange, symbol, id)
-	if err == nil {
+	if err == nil && s.publisher != nil {
 		// Optimization: Publish a synthetic CANCELED event immediately to telemetry.
 		// This ensures live_trades is updated even if the private WS stream is lagging or auth-failed.
 		s.publisher.PublishOrder(&types.Order{
@@ -330,7 +370,7 @@ func (s *SDK) CancelOrder(ctx context.Context, exchange, symbol, id string) erro
 			Symbol:   symbol,
 			Exchange: exchange,
 			Status:   types.OrderStatusCanceled,
-		})
+		}, nil, nil)
 	}
 	return err
 }
@@ -388,6 +428,95 @@ func (s *SDK) dispatchCandle(ctx *types.Context, tf types.Timeframe, candle *typ
 	}
 	if s.onCandleAll != nil {
 		s.onCandleAll(ctx, candle)
+	}
+}
+
+// ── telemetry side-channel helpers (live mode only) ─────────────────────────
+
+// publishInitialBalances fetches the wallet for each configured (exchange,
+// asset) pair once at Start and forwards to telemetry. Server treats the
+// first ever write per session as immutable.
+func (s *SDK) publishInitialBalances(ctx context.Context) {
+	if s.config.Live == nil {
+		return
+	}
+	for _, exch := range s.config.Live.RequestedExchanges {
+		for _, asset := range s.config.Live.Assets {
+			account, err := s.adapter.GetAccount(ctx, exch, "")
+			_ = asset // asset filter not yet uniform across adapters; full Account is fine
+			if err != nil {
+				log.Printf("[telemetry] initial balance fetch %s failed: %v", exch, err)
+				continue
+			}
+			if account != nil {
+				s.publisher.PublishInitialBalance(account)
+			}
+			break // GetAccount returns the whole account; one call per exchange suffices
+		}
+	}
+}
+
+// publishCurrentBalanceFor refreshes the wallet snapshot after a fill. The
+// symbol's quote asset is the most likely thing to have changed; we fetch
+// the whole account anyway so the snapshot is consistent.
+func (s *SDK) publishCurrentBalanceFor(ctx context.Context, exchange, symbol string) {
+	if exchange == "" {
+		return
+	}
+	account, err := s.adapter.GetAccount(ctx, exchange, "")
+	if err != nil {
+		log.Printf("[telemetry] current balance fetch %s failed: %v", exchange, err)
+		return
+	}
+	if account != nil {
+		s.publisher.PublishBalance(account)
+	}
+}
+
+// heartbeatLoop fires a heartbeat every 5s with the latest counters. Exits
+// on ctx.Done — Start's defer-stopped runs after this.
+func (s *SDK) heartbeatLoop(ctx context.Context, startedAt time.Time) {
+	const heartbeatInterval = 5 * time.Second
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			lastID := ""
+			if v := s.lastOrderID.Load(); v != nil {
+				lastID, _ = v.(string)
+			}
+			s.publisher.PublishHeartbeat(telemetry.HeartbeatMeta{
+				UptimeSeconds:    int64(time.Since(startedAt).Seconds()),
+				CandlesProcessed: s.candlesProcessed.Load(),
+				OrdersPlaced:     int(s.ordersPlaced.Load()),
+				LastOrderID:      lastID,
+			})
+		}
+	}
+}
+
+// balanceFallbackLoop refreshes the current-balance snapshot on a slow timer
+// for sessions that don't trade often. The per-fill trigger covers the
+// active case.
+func (s *SDK) balanceFallbackLoop(ctx context.Context) {
+	if s.config.Live == nil {
+		return
+	}
+	const interval = 60 * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, exch := range s.config.Live.RequestedExchanges {
+				s.publishCurrentBalanceFor(ctx, exch, "")
+			}
+		}
 	}
 }
 
