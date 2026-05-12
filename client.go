@@ -80,8 +80,20 @@ func New(cfg *types.Config) (*SDK, error) {
 	var pub telemetry.Publisher
 	if cfg.Live != nil && cfg.Live.TelemetryURL != "" {
 		sessionID := uuid.New().String()
-		pub = telemetry.NewPublisher(sessionID, cfg.Live.TelemetryURL, cfg.Credentials.KeyID, cfg.Credentials.PrivateKey)
-		log.Printf("SDK: telemetry session_id=%s → %s", sessionID, cfg.Live.TelemetryURL)
+		// First configured exchange + symbol become the publisher's defaults.
+		// Heartbeat / initial_balance / balance / session_stopped events use
+		// these so the first ingest creates a properly-populated session row
+		// (otherwise the frontend's chart sits on an empty symbol).
+		defaultExchange := ""
+		defaultSymbol := ""
+		if len(cfg.Live.RequestedExchanges) > 0 {
+			defaultExchange = cfg.Live.RequestedExchanges[0]
+		}
+		if len(cfg.Live.Assets) > 0 {
+			defaultSymbol = cfg.Live.Assets[0]
+		}
+		pub = telemetry.NewPublisher(sessionID, cfg.Live.TelemetryURL, cfg.Credentials.KeyID, cfg.Credentials.PrivateKey, defaultExchange, defaultSymbol)
+		log.Printf("SDK: telemetry session_id=%s → %s (default %s/%s)", sessionID, cfg.Live.TelemetryURL, defaultExchange, defaultSymbol)
 	} else {
 		pub = telemetry.NoOpPublisher{}
 	}
@@ -440,25 +452,26 @@ func (s *SDK) publishInitialBalances(ctx context.Context) {
 	if s.config.Live == nil {
 		return
 	}
+	relevant := extractRelevantAssets(s.config.Live.Assets)
 	for _, exch := range s.config.Live.RequestedExchanges {
-		for _, asset := range s.config.Live.Assets {
-			account, err := s.adapter.GetAccount(ctx, exch, "")
-			_ = asset // asset filter not yet uniform across adapters; full Account is fine
-			if err != nil {
-				log.Printf("[telemetry] initial balance fetch %s failed: %v", exch, err)
-				continue
-			}
-			if account != nil {
-				s.publisher.PublishInitialBalance(account)
-			}
-			break // GetAccount returns the whole account; one call per exchange suffices
+		account, err := s.adapter.GetAccount(ctx, exch, "")
+		if err != nil {
+			log.Printf("[telemetry] initial balance fetch %s failed: %v", exch, err)
+			continue
 		}
+		if account == nil {
+			continue
+		}
+		filtered := filterAccountBalances(account, relevant)
+		s.publisher.PublishInitialBalance(filtered)
 	}
 }
 
 // publishCurrentBalanceFor refreshes the wallet snapshot after a fill. The
 // symbol's quote asset is the most likely thing to have changed; we fetch
-// the whole account anyway so the snapshot is consistent.
+// the whole account anyway so the snapshot is consistent (then filter to the
+// strategy's configured pair so the live_trades JSONB doesn't carry every
+// dust balance on the exchange).
 func (s *SDK) publishCurrentBalanceFor(ctx context.Context, exchange, symbol string) {
 	if exchange == "" {
 		return
@@ -468,9 +481,67 @@ func (s *SDK) publishCurrentBalanceFor(ctx context.Context, exchange, symbol str
 		log.Printf("[telemetry] current balance fetch %s failed: %v", exchange, err)
 		return
 	}
-	if account != nil {
-		s.publisher.PublishBalance(account)
+	if account == nil {
+		return
 	}
+	var relevant map[string]struct{}
+	if s.config.Live != nil {
+		relevant = extractRelevantAssets(s.config.Live.Assets)
+	}
+	s.publisher.PublishBalance(filterAccountBalances(account, relevant))
+}
+
+// extractRelevantAssets returns the union of base+quote assets across the
+// configured trading symbols. Handles both slash ("BTC/USDT") and concat
+// ("BTCUSDT") forms. For concat, suffix-matches a fixed quote-asset list.
+func extractRelevantAssets(symbols []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(symbols)*2)
+	commonQuotes := []string{"USDT", "USDC", "BUSD", "FDUSD", "DAI", "BTC", "ETH", "BNB"}
+	for _, sym := range symbols {
+		if sym == "" {
+			continue
+		}
+		if i := strings.Index(sym, "/"); i >= 0 {
+			out[strings.ToUpper(sym[:i])] = struct{}{}
+			out[strings.ToUpper(sym[i+1:])] = struct{}{}
+			continue
+		}
+		up := strings.ToUpper(sym)
+		matched := false
+		for _, q := range commonQuotes {
+			if strings.HasSuffix(up, q) && len(up) > len(q) {
+				out[up[:len(up)-len(q)]] = struct{}{}
+				out[q] = struct{}{}
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			// Unknown format — keep whole symbol so the operator at least
+			// sees something; better than dropping the snapshot entirely.
+			out[up] = struct{}{}
+		}
+	}
+	return out
+}
+
+// filterAccountBalances returns a shallow copy of the account with only the
+// balances whose asset is in `keep`. If keep is nil/empty, returns the
+// original (no filtering).
+func filterAccountBalances(account *types.Account, keep map[string]struct{}) *types.Account {
+	if account == nil || len(keep) == 0 {
+		return account
+	}
+	out := &types.Account{
+		Exchange: account.Exchange,
+		Balances: make([]types.Balance, 0, len(keep)),
+	}
+	for _, b := range account.Balances {
+		if _, ok := keep[strings.ToUpper(b.Asset)]; ok {
+			out.Balances = append(out.Balances, b)
+		}
+	}
+	return out
 }
 
 // heartbeatLoop fires a heartbeat every 5s with the latest counters. Exits

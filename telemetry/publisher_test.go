@@ -77,7 +77,7 @@ func TestTruncate_NilInputs_NilOutputs(t *testing.T) {
 }
 
 func TestNewPublisher_NoURL_ReturnsNoOp(t *testing.T) {
-	p := NewPublisher("sid", "", "k", "")
+	p := NewPublisher("sid", "", "k", "", "binance", "BTCUSDT")
 	if _, ok := p.(NoOpPublisher); !ok {
 		t.Fatalf("expected NoOpPublisher when URL is empty, got %T", p)
 	}
@@ -87,13 +87,14 @@ func TestNewPublisher_NoURL_ReturnsNoOp(t *testing.T) {
 }
 
 func TestNewPublisher_WithURL_ReturnsHTTP(t *testing.T) {
-	p := NewPublisher("sid", "http://localhost:5001", "k", "")
+	p := NewPublisher("sid", "http://localhost:5001", "k", "", "binance", "BTCUSDT")
 	if !p.Enabled() {
 		t.Fatal("httpPublisher should be enabled when URL is set")
 	}
 }
 
-func TestBuildBalancesPayload_PreservesAssets(t *testing.T) {
+func TestBuildBalancesPayload_PreservesAssetsAndDefaults(t *testing.T) {
+	hp := &httpPublisher{sessionID: "sid", defaultExchange: "binance", defaultSymbol: "ETHUSDT"}
 	account := &types.Account{
 		Exchange: "binance",
 		Balances: []types.Balance{
@@ -101,9 +102,15 @@ func TestBuildBalancesPayload_PreservesAssets(t *testing.T) {
 			{Asset: "BTC", Free: 0.5, Lock: 0},
 		},
 	}
-	got := buildBalancesPayload("sid", account, "initial_balance")
+	got := hp.buildBalancesPayload(account, "initial_balance")
 	if got.EventType != "initial_balance" {
 		t.Fatalf("event_type: %s", got.EventType)
+	}
+	if got.Symbol != "ETHUSDT" {
+		t.Fatalf("symbol must come from publisher default, got %q", got.Symbol)
+	}
+	if got.Exchange != "binance" {
+		t.Fatalf("exchange: %q", got.Exchange)
 	}
 	if len(got.Balances) != 2 {
 		t.Fatalf("expected 2 balances, got %d", len(got.Balances))
@@ -111,5 +118,13 @@ func TestBuildBalancesPayload_PreservesAssets(t *testing.T) {
 	b, _ := json.Marshal(got)
 	if !strings.Contains(string(b), `"asset":"USDT"`) || !strings.Contains(string(b), `"asset":"BTC"`) {
 		t.Fatalf("missing asset keys in payload: %s", string(b))
+	}
+}
+
+func TestBuildBalancesPayload_AccountExchangeWins(t *testing.T) {
+	hp := &httpPublisher{sessionID: "sid", defaultExchange: "binance", defaultSymbol: "BTCUSDT"}
+	got := hp.buildBalancesPayload(&types.Account{Exchange: "bybit"}, "balance")
+	if got.Exchange != "bybit" {
+		t.Fatalf("account exchange should override default, got %q", got.Exchange)
 	}
 }

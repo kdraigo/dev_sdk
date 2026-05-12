@@ -49,16 +49,22 @@ type Publisher interface {
 }
 
 // NewPublisher returns an httpPublisher when url is set, otherwise a NoOpPublisher.
-func NewPublisher(sessionID, url, keyID, privateKey string) Publisher {
+// defaultExchange / defaultSymbol are stamped onto every payload that doesn't
+// carry its own (heartbeat, initial_balance, balance, session_stopped) so the
+// first ingest creates a live_sessions row with the right exchange/symbol —
+// otherwise the frontend's chart sits on an empty symbol forever.
+func NewPublisher(sessionID, url, keyID, privateKey, defaultExchange, defaultSymbol string) Publisher {
 	if url == "" {
 		return NoOpPublisher{}
 	}
 	return &httpPublisher{
-		sessionID:  sessionID,
-		baseURL:    url,
-		keyID:      keyID,
-		privateKey: privateKey,
-		client:     &http.Client{Timeout: 5 * time.Second},
+		sessionID:       sessionID,
+		baseURL:         url,
+		keyID:           keyID,
+		privateKey:      privateKey,
+		defaultExchange: defaultExchange,
+		defaultSymbol:   defaultSymbol,
+		client:          &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
@@ -76,11 +82,13 @@ func (NoOpPublisher) Enabled() bool                                       { retu
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
 type httpPublisher struct {
-	sessionID  string
-	baseURL    string
-	keyID      string
-	privateKey string
-	client     *http.Client
+	sessionID       string
+	baseURL         string
+	keyID           string
+	privateKey      string
+	defaultExchange string
+	defaultSymbol   string
+	client          *http.Client
 }
 
 func (p *httpPublisher) Enabled() bool { return true }
@@ -163,14 +171,18 @@ func (p *httpPublisher) PublishOrder(order *types.Order, reason map[string]any, 
 }
 
 func (p *httpPublisher) PublishBalance(account *types.Account) {
-	go p.send(buildBalancesPayload(p.sessionID, account, "balance"))
+	go p.send(p.buildBalancesPayload(account, "balance"))
 }
 
 func (p *httpPublisher) PublishInitialBalance(account *types.Account) {
-	go p.send(buildBalancesPayload(p.sessionID, account, "initial_balance"))
+	go p.send(p.buildBalancesPayload(account, "initial_balance"))
 }
 
-func buildBalancesPayload(sessionID string, account *types.Account, eventType string) *telemetryPayload {
+// buildBalancesPayload uses the account's exchange when present, falling back
+// to the publisher's configured default. Symbol always comes from the default
+// (balances don't have a symbol of their own; we attach it so the first event
+// can create the session row with the right pair).
+func (p *httpPublisher) buildBalancesPayload(account *types.Account, eventType string) *telemetryPayload {
 	now := time.Now().UTC()
 	out := make([]balancePayload, 0, len(account.Balances))
 	for _, b := range account.Balances {
@@ -181,9 +193,14 @@ func buildBalancesPayload(sessionID string, account *types.Account, eventType st
 			RecordedAt: now,
 		})
 	}
+	exch := account.Exchange
+	if exch == "" {
+		exch = p.defaultExchange
+	}
 	return &telemetryPayload{
-		SessionID: sessionID,
-		Exchange:  account.Exchange,
+		SessionID: p.sessionID,
+		Exchange:  exch,
+		Symbol:    p.defaultSymbol,
 		EventType: eventType,
 		Balances:  out,
 	}
@@ -192,6 +209,8 @@ func buildBalancesPayload(sessionID string, account *types.Account, eventType st
 func (p *httpPublisher) PublishHeartbeat(meta HeartbeatMeta) {
 	go p.send(&telemetryPayload{
 		SessionID: p.sessionID,
+		Exchange:  p.defaultExchange,
+		Symbol:    p.defaultSymbol,
 		EventType: "heartbeat",
 		Heartbeat: &heartbeatPayload{
 			RecordedAt:       time.Now().UTC(),
@@ -208,6 +227,8 @@ func (p *httpPublisher) PublishStopped(reason string) {
 	// the process exiting after Start() returns. Bounded by client timeout.
 	p.send(&telemetryPayload{
 		SessionID: p.sessionID,
+		Exchange:  p.defaultExchange,
+		Symbol:    p.defaultSymbol,
 		EventType: "session_stopped",
 		Stopped: &stoppedPayload{
 			Reason:     reason,
