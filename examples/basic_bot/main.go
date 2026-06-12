@@ -95,11 +95,11 @@ func makeConfig() *types.Config {
 		Environment: types.EnvBacktest,
 		Timeframes:  []types.Timeframe{types.Timeframe15m, types.Timeframe1h},
 		Credentials: types.Credentials{
-			KeyID:      "7b89ece9-97ae-4b76-b938-ce9e5345bfce",
-			PrivateKey: "385d5c080a1b4140a5ed9ee76d0ef3fcd291cabab4ec6759bc178ad3a8ed837148309e3cb2a3a014c93d68b4f20a0ba5978ab300531c844dcec672925eb8d63a",
+			KeyID:      "Y",
+			PrivateKey: "YOUR_PRIVATE_KEY_HEX",
 		},
 		Backtest: &types.BacktestOptions{
-			Endpoint:           "http://localhost:4000",
+			Endpoint:           "THE-KDRAIGO-API-ENDPOINT",
 			SessionName:        "Multi-TF-Test",
 			RequestedExchanges: []string{exchange},
 			Assets:             []string{symbol},

@@ -57,7 +57,7 @@ func TestEngineClient_PrepareSession(t *testing.T) {
 		},
 		Credentials: types.Credentials{
 			KeyID:      "test-key",
-			PrivateKey: "385d5c080a1b4140a5ed9ee76d0ef3fcd291cabab4ec6759bc178ad3a8ed837148309e3cb2a3a014c93d68b4f20a0ba5978ab300531c844dcec672925eb8d63a",
+			PrivateKey: "385d5c080a1b4140a5ed9ee76d0ef3fcd291cabab4ec6759bc178ad3a8ed837148309e3cb2a3a014c93d68b4f20a0ba5978ab300531c844dcec672925eb8d63a", // Dummy test key
 		},
 	}
 

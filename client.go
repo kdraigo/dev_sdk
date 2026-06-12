@@ -356,10 +356,13 @@ func (s *SDK) Start(ctx context.Context) error {
 // Exposed methods passing through to adapter
 
 func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error) {
-	// Strip telemetry-only fields before handing the request to the adapter:
-	// the engine and exchanges never see Reason/Logs.
 	reason, logs := req.Reason, req.Logs
-	req.Reason, req.Logs = nil, nil
+
+	// Strip telemetry fields for live adapters — exchanges never see Reason/Logs.
+	// In backtest mode the fields are forwarded to the engine so it can persist them.
+	if s.config.Environment != types.EnvBacktest {
+		req.Reason, req.Logs = nil, nil
+	}
 
 	order, err := s.adapter.PlaceOrder(ctx, req)
 	if err == nil && order != nil {

@@ -458,18 +458,25 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 	e.pendingOrders[reqID] = respChan
 	e.pendingMu.Unlock()
 
+	orderData := map[string]interface{}{
+		"exchange": req.Exchange,
+		"pair":     req.Symbol, // The engine schema wants Pair instead of Symbol
+		"side":     req.Side,
+		"type":     req.Type,
+		"price":    req.Price,
+		"quantity": req.Quantity,
+		"asset":    strings.Split(req.Symbol, "/")[1], // Assuming symbol like BTC/USDT needs quote asset
+	}
+	if req.Reason != nil {
+		orderData["reason"] = req.Reason
+	}
+	if len(req.Logs) > 0 {
+		orderData["logs"] = req.Logs
+	}
 	payload := map[string]interface{}{
 		"action":     "order",
 		"request_id": reqID,
-		"data": map[string]interface{}{
-			"exchange": req.Exchange,
-			"pair":     req.Symbol, // The engine schema wants Pair instead of Symbol
-			"side":     req.Side,
-			"type":     req.Type,
-			"price":    req.Price,
-			"quantity": req.Quantity,
-			"asset":    strings.Split(req.Symbol, "/")[1], // Assuming symbol like BTC/USDT needs quote asset
-		},
+		"data":       orderData,
 	}
 
 	e.writeMu.Lock()
