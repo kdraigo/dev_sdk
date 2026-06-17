@@ -17,12 +17,13 @@ import (
 var upgrader = websocket.Upgrader{}
 
 type mockEngineServer struct {
-	server      *httptest.Server
-	mu          sync.Mutex
-	nextCalls   int
-	orders      int
-	accountReqs int
-	candlesSent int
+	server       *httptest.Server
+	mu           sync.Mutex
+	nextCalls    int
+	orders       int
+	accountReqs  int
+	candlesSent  int
+	fillReported bool
 }
 
 func newMockEngineServer() *mockEngineServer {
@@ -106,26 +107,45 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 				})
 			} else {
 				m.candlesSent++
+				data := map[string]interface{}{
+					"tick": map[string]interface{}{
+						"Exchange": "binance",
+						"Pair":     "BTC/USDT",
+						"Candle": map[string]interface{}{
+							"time":      time.Now(),
+							"updatedAt": time.Now(),
+							"open":      50000.0,
+							"high":      51000.0,
+							"low":       49000.0,
+							"close":     50500.0,
+							"volume":    1.0,
+							"complete":  true,
+						},
+					},
+					"done": false,
+				}
+				// The engine reports fills during tick processing (not via the
+				// synchronous order ack). Once an order has been placed, surface
+				// it exactly once in the next tick's "orders" array.
+				if m.orders > 0 && !m.fillReported {
+					m.fillReported = true
+					data["orders"] = []map[string]interface{}{
+						{
+							"id":          m.orders,
+							"exchange_id": m.orders,
+							"pair":        "BTC/USDT",
+							"side":        "BUY",
+							"type":        "MARKET",
+							"status":      "FILLED",
+							"price":       50000.0,
+							"quantity":    0.1,
+						},
+					}
+				}
 				conn.WriteJSON(map[string]interface{}{
 					"action": "next",
 					"status": "ok",
-					"data": map[string]interface{}{
-						"tick": map[string]interface{}{
-							"Exchange": "binance",
-							"Pair":     "BTC/USDT",
-							"Candle": map[string]interface{}{
-								"time":      time.Now(),
-								"updatedAt": time.Now(),
-								"open":      50000.0,
-								"high":      51000.0,
-								"low":       49000.0,
-								"close":     50500.0,
-								"volume":    1.0,
-								"complete":  true,
-							},
-						},
-						"done": false,
-					},
+					"data":   data,
 				})
 			}
 		}
