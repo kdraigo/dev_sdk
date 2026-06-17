@@ -9,9 +9,22 @@ import (
 	"time"
 
 	"github.com/adshao/go-binance/v2"
+	"github.com/adshao/go-binance/v2/common"
 	"github.com/kdraigo/flow_v1/dev_sdk/aggregator"
 	"github.com/kdraigo/flow_v1/dev_sdk/types"
 )
+
+// newBinanceClient builds a go-binance client, selecting the signing scheme from
+// the credential shape: an Ed25519 PKCS8 PEM in APISecret switches the client to
+// asymmetric (Ed25519) signing; otherwise it stays HMAC. The API key string in
+// APIKey is always used as-is for the X-MBX-APIKEY header.
+func newBinanceClient(creds types.Credentials) *binance.Client {
+	c := binance.NewClient(creds.APIKey, creds.APISecret)
+	if strings.Contains(creds.APISecret, "BEGIN PRIVATE KEY") {
+		c.KeyType = common.KeyTypeEd25519
+	}
+	return c
+}
 
 type BinanceClient struct {
 	config *types.Config
@@ -29,7 +42,7 @@ func (b *BinanceClient) PrepareSession(ctx context.Context, cfg *types.Config) e
 		binance.UseTestnet = true
 	}
 
-	b.client = binance.NewClient(cfg.Credentials.APIKey, cfg.Credentials.APISecret)
+	b.client = newBinanceClient(cfg.Credentials)
 
 	// Sync time to prevent -1022 Signature Invalid errors
 	_, err := b.client.NewSetServerTimeService().Do(ctx)
@@ -233,10 +246,7 @@ func (b *BinanceClient) GetHistoricalCandles(ctx context.Context, exchange, symb
 		if b.config != nil && b.config.Environment == types.EnvTestBinance {
 			binance.UseTestnet = true
 		}
-		b.client = binance.NewClient(
-			b.config.Credentials.APIKey,
-			b.config.Credentials.APISecret,
-		)
+		b.client = newBinanceClient(b.config.Credentials)
 	}
 	if from.After(to) {
 		return nil, fmt.Errorf("binance: from %s is after to %s", from, to)

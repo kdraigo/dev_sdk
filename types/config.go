@@ -65,4 +65,5 @@ type LiveOptions struct {
 	Assets             []string // Trading pairs requested (e.g., "BTCUSDT", "ETHUSDT"). Note: Binance requires no slashes usually.
 	TelemetryURL       string   // Base URL of the live_trades service (e.g. "http://localhost:5001"). Empty = disabled.
 	TelemetryAPIKey    string   // X-API-Key for live_trades service authentication.
+	SessionID          string   // Optional fixed telemetry session id. Empty = a new UUID is generated; set to resume/extend an existing session.
 }

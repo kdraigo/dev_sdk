@@ -79,7 +79,12 @@ func New(cfg *types.Config) (*SDK, error) {
 
 	var pub telemetry.Publisher
 	if cfg.Live != nil && cfg.Live.TelemetryURL != "" {
-		sessionID := uuid.New().String()
+		// Reuse a caller-supplied session id when set (resume/extend an existing
+		// session); otherwise mint a fresh one.
+		sessionID := cfg.Live.SessionID
+		if sessionID == "" {
+			sessionID = uuid.New().String()
+		}
 		// First configured exchange + symbol become the publisher's defaults.
 		// Heartbeat / initial_balance / balance / session_stopped events use
 		// these so the first ingest creates a properly-populated session row

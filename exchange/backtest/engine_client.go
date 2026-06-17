@@ -104,7 +104,7 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	e.smallestTF = types.Timeframe1m
 	if len(cfg.Timeframes) > 0 {
 		e.smallestTF = cfg.Timeframes[0]
-		// Naive smallest: in this SDK, shorter strings aren't necessarily smaller, 
+		// Naive smallest: in this SDK, shorter strings aren't necessarily smaller,
 		// but usually the first one in config is the 'base' one.
 		// For now, let's just use the first one provided to speed things up significantly.
 	}
@@ -390,7 +390,7 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 						Volume:     dataStruct.Tick.Candle.Volume,
 						IsComplete: dataStruct.Tick.Candle.Complete,
 					}
-					log.Printf("[WS] Received Candle: %s", candle.OpenTime.Format("2006-01-02 15:04"))
+					// log.Printf("[WS] Received Candle: %s", candle.OpenTime.Format("2006-01-02 15:04"))
 					candleChan <- candle
 				}
 				// Dispatch any orders filled during this tick to the order channel.
@@ -439,7 +439,7 @@ func (e *EngineClient) nextTick() error {
 
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
-	log.Printf("[WS] Sending Action: next")
+	// log.Printf("[WS] Sending Action: next")
 	if err := e.wsConn.WriteJSON(map[string]string{"action": "next"}); err != nil {
 		return fmt.Errorf("nextTick WriteJSON error: %w", err)
 	}
@@ -480,7 +480,7 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 	}
 
 	e.writeMu.Lock()
-	log.Printf("[WS] Sending Action: order (reqID: %s)", reqID)
+	// log.Printf("[WS] Sending Action: order (reqID: %s)", reqID)
 	err := e.wsConn.WriteJSON(payload)
 	e.writeMu.Unlock()
 
