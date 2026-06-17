@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 // Adapter interface standardizes how the SDK interacts with any underlying exchange (Real or Backtest).

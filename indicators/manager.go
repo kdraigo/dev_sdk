@@ -3,7 +3,7 @@ package indicators
 import (
 	"sync"
 
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 type IndicatorsCalculator interface {

@@ -10,8 +10,8 @@ import (
 
 	"github.com/adshao/go-binance/v2"
 	"github.com/adshao/go-binance/v2/common"
-	"github.com/kdraigo/flow_v1/dev_sdk/aggregator"
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/aggregator"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 // newBinanceClient builds a go-binance client, selecting the signing scheme from

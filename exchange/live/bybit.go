@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/hirokisan/bybit/v2"
-	"github.com/kdraigo/flow_v1/dev_sdk/aggregator"
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/aggregator"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 type symbolInfo struct {

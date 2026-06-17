@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 var upgrader = websocket.Upgrader{}

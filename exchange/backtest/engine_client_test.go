@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 func TestEngineClient_PrepareSession(t *testing.T) {

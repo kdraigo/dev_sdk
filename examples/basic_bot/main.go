@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	sdk "github.com/kdraigo/flow_v1/dev_sdk"
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	sdk "github.com/kdraigo/dev_sdk"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 const (

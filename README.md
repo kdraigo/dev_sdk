@@ -15,7 +15,7 @@
 ### Installation
 
 ```bash
-go get github.com/kdraigo/flow_v1/dev_sdk
+go get github.com/kdraigo/dev_sdk
 ```
 
 ### Basic Bot Example
@@ -26,8 +26,8 @@ package main
 import (
 	"context"
 	"log"
-	sdk "github.com/kdraigo/flow_v1/dev_sdk"
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	sdk "github.com/kdraigo/dev_sdk"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 func main() {

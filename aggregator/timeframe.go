@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 // TimeframeAggregator processes high-frequency (e.g. 1m) candle streams

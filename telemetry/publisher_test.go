@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 func TestTruncate_UnderCap_NoChange(t *testing.T) {

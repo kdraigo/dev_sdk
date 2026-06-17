@@ -19,7 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 // EngineClient bridges the SDK dynamically directly into the backtest engine via Backend API and Websocket APIs.

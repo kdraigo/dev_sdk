@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 // Wire-format size caps. Kept in sync with live_trades' server-side

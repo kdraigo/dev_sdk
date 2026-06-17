@@ -1,4 +1,4 @@
-module github.com/kdraigo/flow_v1/dev_sdk
+module github.com/kdraigo/dev_sdk
 
 go 1.25.9
 

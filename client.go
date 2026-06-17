@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/kdraigo/flow_v1/dev_sdk/aggregator"
-	"github.com/kdraigo/flow_v1/dev_sdk/exchange/backtest"
-	"github.com/kdraigo/flow_v1/dev_sdk/exchange/live"
-	"github.com/kdraigo/flow_v1/dev_sdk/indicators"
-	"github.com/kdraigo/flow_v1/dev_sdk/telemetry"
-	"github.com/kdraigo/flow_v1/dev_sdk/types"
+	"github.com/kdraigo/dev_sdk/aggregator"
+	"github.com/kdraigo/dev_sdk/exchange/backtest"
+	"github.com/kdraigo/dev_sdk/exchange/live"
+	"github.com/kdraigo/dev_sdk/indicators"
+	"github.com/kdraigo/dev_sdk/telemetry"
+	"github.com/kdraigo/dev_sdk/types"
 )
 
 // SDK represents the central structure users instantiate to run their bots.
