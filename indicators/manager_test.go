@@ -2,7 +2,57 @@ package indicators
 
 import (
 	"testing"
+
+	"github.com/kdraigo/dev_sdk/types"
 )
+
+func TestIndicatorManager_Prunes(t *testing.T) {
+	const (
+		maxPoints = 100
+		exchange  = "binance"
+		symbol    = "BTC/USDT"
+		fed       = 250 // > 2*maxPoints so at least one prune happens
+	)
+
+	im := NewIndicatorManager([]string{exchange}, []string{symbol}, WithMaxPoints(maxPoints)).(*indicatorManager)
+
+	for i := 0; i < fed; i++ {
+		im.Update(&types.Candle{
+			Exchange: exchange,
+			Symbol:   symbol,
+			Open:     float64(i),
+			High:     float64(i),
+			Low:      float64(i),
+			Close:    float64(i),
+			Volume:   float64(i),
+		})
+	}
+
+	p := im.pairCandlePoints[exchange][symbol]
+
+	// History stays bounded: never below the retention window, never above the
+	// 2x prune trigger.
+	if len(p.Close) < maxPoints || len(p.Close) >= 2*maxPoints {
+		t.Fatalf("Close length %d out of bounds [%d, %d)", len(p.Close), maxPoints, 2*maxPoints)
+	}
+
+	// All series stay index-aligned after pruning.
+	if !(len(p.Open) == len(p.Close) && len(p.High) == len(p.Close) &&
+		len(p.Low) == len(p.Close) && len(p.Volume) == len(p.Close)) {
+		t.Fatalf("series lengths diverged: O=%d H=%d L=%d C=%d V=%d",
+			len(p.Open), len(p.High), len(p.Low), len(p.Close), len(p.Volume))
+	}
+
+	// The most recent candle is preserved (we feed Close=i, so last must be fed-1).
+	if got := p.Close[len(p.Close)-1]; got != float64(fed-1) {
+		t.Fatalf("latest Close = %v, want %v", got, float64(fed-1))
+	}
+
+	// Pruning drops the oldest: the retained head must be newer than candle 0.
+	if got := p.Close[0]; got == 0 {
+		t.Fatalf("oldest point not pruned: Close[0] = %v", got)
+	}
+}
 
 func TestIndicatorManager_Run(t *testing.T) {
 	// requested := []string{"EMA50", "RSI14"}

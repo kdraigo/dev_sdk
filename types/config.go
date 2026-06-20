@@ -30,12 +30,17 @@ const (
 
 // Config is the main configuration object provided by user to initialize the strategy bot SDK.
 type Config struct {
-	Environment Environment      // The environment to connect to.
-	Timeframes  []Timeframe      // One or more aggregate candle sizes the strategy subscribes to (e.g. [15m, 1h]).
-	Indicators  []string         // Formatted indicator names (e.g. "EMA10", "RSI14") to pre-calculate.
-	Credentials Credentials      // API Keys for specific real/testnet exchanges
-	Backtest    *BacktestOptions // Specific settings required when configuring a new backtest engine session.
-	Live        *LiveOptions     // Specific settings required when configuring a real exchange stream.
+	Environment Environment // The environment to connect to.
+	Timeframes  []Timeframe // One or more aggregate candle sizes the strategy subscribes to (e.g. [15m, 1h]).
+	Indicators  []string    // Formatted indicator names (e.g. "EMA10", "RSI14") to pre-calculate.
+	// IndicatorHistory caps the rolling candle history retained per series by the
+	// indicator manager. Bounds memory and per-call compute on long-running
+	// sessions. Default (when 0) is 1500. Raise it only if you request indicator
+	// periods approaching that window.
+	IndicatorHistory int
+	Credentials      Credentials      // API Keys for specific real/testnet exchanges
+	Backtest         *BacktestOptions // Specific settings required when configuring a new backtest engine session.
+	Live             *LiveOptions     // Specific settings required when configuring a real exchange stream.
 }
 
 // Credentials holds sensitive authentication data for exchange APIs and platform access.

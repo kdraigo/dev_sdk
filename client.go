@@ -202,7 +202,7 @@ func (s *SDK) Start(ctx context.Context) error {
 	s.indManagers = make(map[types.Timeframe]indicators.IndicatorManager, len(s.config.Timeframes))
 	s.aggregators = make(map[types.Timeframe]*aggregator.TimeframeAggregator, len(s.config.Timeframes))
 	for _, tf := range s.config.Timeframes {
-		s.indManagers[tf] = indicators.NewIndicatorManager(imExchanges, imAssets)
+		s.indManagers[tf] = indicators.NewIndicatorManager(imExchanges, imAssets, indicators.WithMaxPoints(s.config.IndicatorHistory))
 		s.aggregators[tf] = aggregator.NewTimeframeAggregator(tf)
 	}
 
