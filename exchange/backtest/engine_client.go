@@ -305,6 +305,19 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 					var or orderResponse
 					if resp.Status == "error" {
 						or.err = fmt.Errorf("%s", resp.Error)
+						// If the engine attached structured rejection detail, surface
+						// it explicitly so the strategy can react (e.g. shrink size).
+						var rej struct {
+							Code           string  `json:"code"`
+							RequiredQuote  float64 `json:"required_quote"`
+							AvailableQuote float64 `json:"available_quote"`
+							LockedQuote    float64 `json:"locked_quote"`
+							FeeEstimate    float64 `json:"fee_estimate"`
+						}
+						if len(resp.Data) > 0 && json.Unmarshal(resp.Data, &rej) == nil && rej.Code != "" {
+							or.err = fmt.Errorf("order rejected [%s]: required_quote=%.8f available_quote=%.8f locked_quote=%.8f fee=%.8f",
+								rej.Code, rej.RequiredQuote, rej.AvailableQuote, rej.LockedQuote, rej.FeeEstimate)
+						}
 					} else {
 						var engineOrder struct {
 							ExchangeID int64 `json:"exchange_id"`
@@ -340,6 +353,23 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 
 			if resp.Status != "ok" {
 				log.Printf("Engine WS Error on %s: %s", resp.Action, resp.Error)
+				continue
+			}
+
+			// Server-pushed keepalive/observability frame. Arriving every ~15s, it
+			// also refreshes the read deadline above, which is what keeps long/slow
+			// backtests from being torn down as "disconnected". Just surface it.
+			if resp.Action == "progress" {
+				var p struct {
+					ProcessedCandles int64   `json:"processed_candles"`
+					TotalCandles     int64   `json:"total_candles"`
+					Percent          float64 `json:"percent"`
+					ETASeconds       float64 `json:"eta_seconds"`
+				}
+				if json.Unmarshal(resp.Data, &p) == nil && p.TotalCandles > 0 {
+					log.Printf("Backtest progress: %d/%d candles (%.1f%%), ETA %.0fs",
+						p.ProcessedCandles, p.TotalCandles, p.Percent, p.ETASeconds)
+				}
 				continue
 			}
 
