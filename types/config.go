@@ -6,11 +6,13 @@ import "time"
 type Environment string
 
 const (
-	EnvBacktest    Environment = "backtest"
-	EnvRealBinance Environment = "real_binance"
-	EnvRealBybit   Environment = "real_bybit"
-	EnvTestBinance Environment = "test_binance"
-	EnvTestBybit   Environment = "test_bybit"
+	EnvBacktest        Environment = "backtest"
+	EnvRealBinance     Environment = "real_binance"
+	EnvRealBybit       Environment = "real_bybit"
+	EnvTestBinance     Environment = "test_binance"
+	EnvTestBybit       Environment = "test_bybit"
+	EnvRealHyperliquid Environment = "real_hyperliquid"
+	EnvTestHyperliquid Environment = "test_hyperliquid"
 )
 
 // Timeframe dictates the period of time each candle covers.
@@ -51,6 +53,10 @@ type Credentials struct {
 	// Kdraigo Platform API Key
 	KeyID      string // API Key ID (UUID)
 	PrivateKey string // Ed25519 Private Key (Hex)
+
+	// Hyperliquid (EVM wallet + EIP-712 L1 signing). No API key/secret.
+	WalletAddress   string // Master EVM account address (0x…) that owns the funds being traded.
+	WalletSecretKey string // Private key (hex, with or without 0x) used to SIGN actions. Use an Agent Wallet (trade-only, cannot withdraw) — never your funding wallet's key.
 }
 
 // BacktestOptions contains configuration necessary to prepare the engine session for backtesting.
