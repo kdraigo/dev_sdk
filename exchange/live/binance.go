@@ -87,19 +87,26 @@ func (b *BinanceClient) ConnectStream(ctx context.Context, candleChan chan<- *ty
 				low, _ := strconv.ParseFloat(event.Kline.Low, 64)
 				closeVal, _ := strconv.ParseFloat(event.Kline.Close, 64)
 				volume, _ := strconv.ParseFloat(event.Kline.Volume, 64)
+				quoteVolume, _ := strconv.ParseFloat(event.Kline.QuoteVolume, 64)
+				takerBuyBase, _ := strconv.ParseFloat(event.Kline.ActiveBuyVolume, 64)
+				takerBuyQuote, _ := strconv.ParseFloat(event.Kline.ActiveBuyQuoteVolume, 64)
 
 				candle := &types.Candle{
-					Symbol:     origSym,
-					Exchange:   "binance",
-					Timeframe:  types.Timeframe1m,
-					OpenTime:   time.UnixMilli(event.Kline.StartTime),
-					CloseTime:  time.UnixMilli(event.Kline.EndTime),
-					Open:       open,
-					High:       high,
-					Low:        low,
-					Close:      closeVal,
-					Volume:     volume,
-					IsComplete: event.Kline.IsFinal,
+					Symbol:              origSym,
+					Exchange:            "binance",
+					Timeframe:           types.Timeframe1m,
+					OpenTime:            time.UnixMilli(event.Kline.StartTime),
+					CloseTime:           time.UnixMilli(event.Kline.EndTime),
+					Open:                open,
+					High:                high,
+					Low:                 low,
+					Close:               closeVal,
+					Volume:              volume,
+					IsComplete:          event.Kline.IsFinal,
+					TradeCount:          event.Kline.TradeNum,
+					QuoteVolume:         quoteVolume,
+					TakerBuyBaseVolume:  takerBuyBase,
+					TakerBuyQuoteVolume: takerBuyQuote,
 				}
 				candleChan <- candle
 			}, func(err error) {
@@ -294,19 +301,26 @@ func (b *BinanceClient) GetHistoricalCandles(ctx context.Context, exchange, symb
 			low, _ := strconv.ParseFloat(k.Low, 64)
 			closeVal, _ := strconv.ParseFloat(k.Close, 64)
 			volume, _ := strconv.ParseFloat(k.Volume, 64)
+			quoteVolume, _ := strconv.ParseFloat(k.QuoteAssetVolume, 64)
+			takerBuyBase, _ := strconv.ParseFloat(k.TakerBuyBaseAssetVolume, 64)
+			takerBuyQuote, _ := strconv.ParseFloat(k.TakerBuyQuoteAssetVolume, 64)
 
 			all = append(all, &types.Candle{
-				Symbol:     symbol,
-				Exchange:   "binance",
-				Timeframe:  tf,
-				OpenTime:   time.UnixMilli(k.OpenTime),
-				CloseTime:  time.UnixMilli(k.OpenTime + durationMs),
-				Open:       open,
-				High:       high,
-				Low:        low,
-				Close:      closeVal,
-				Volume:     volume,
-				IsComplete: true,
+				Symbol:              symbol,
+				Exchange:            "binance",
+				Timeframe:           tf,
+				OpenTime:            time.UnixMilli(k.OpenTime),
+				CloseTime:           time.UnixMilli(k.OpenTime + durationMs),
+				Open:                open,
+				High:                high,
+				Low:                 low,
+				Close:               closeVal,
+				Volume:              volume,
+				IsComplete:          true,
+				TradeCount:          k.TradeNum,
+				QuoteVolume:         quoteVolume,
+				TakerBuyBaseVolume:  takerBuyBase,
+				TakerBuyQuoteVolume: takerBuyQuote,
 			})
 			if k.OpenTime > lastOpenMs {
 				lastOpenMs = k.OpenTime

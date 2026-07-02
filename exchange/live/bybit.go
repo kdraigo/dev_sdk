@@ -135,19 +135,23 @@ func (b *BybitClient) ConnectStream(ctx context.Context, candleChan chan<- *type
 				low, _ := strconv.ParseFloat(k.Low, 64)
 				closeVal, _ := strconv.ParseFloat(k.Close, 64)
 				volume, _ := strconv.ParseFloat(k.Volume, 64)
+				// Bybit kline exposes turnover (quote volume) but not trade count
+				// or taker-buy splits, so those stay 0 (documented gap).
+				quoteVolume, _ := strconv.ParseFloat(k.Turnover, 64)
 
 				candleChan <- &types.Candle{
-					Symbol:     origSym,
-					Exchange:   "bybit",
-					Timeframe:  types.Timeframe1m,
-					OpenTime:   time.UnixMilli(k.Start),
-					CloseTime:  time.UnixMilli(k.End),
-					Open:       open,
-					High:       high,
-					Low:        low,
-					Close:      closeVal,
-					Volume:     volume,
-					IsComplete: k.Confirm,
+					Symbol:      origSym,
+					Exchange:    "bybit",
+					Timeframe:   types.Timeframe1m,
+					OpenTime:    time.UnixMilli(k.Start),
+					CloseTime:   time.UnixMilli(k.End),
+					Open:        open,
+					High:        high,
+					Low:         low,
+					Close:       closeVal,
+					Volume:      volume,
+					IsComplete:  k.Confirm,
+					QuoteVolume: quoteVolume,
 				}
 			}
 			return nil
@@ -453,19 +457,21 @@ func (b *BybitClient) GetHistoricalCandles(ctx context.Context, exchange, symbol
 			low, _ := strconv.ParseFloat(k.Low, 64)
 			closeVal, _ := strconv.ParseFloat(k.Close, 64)
 			volume, _ := strconv.ParseFloat(k.Volume, 64)
+			quoteVolume, _ := strconv.ParseFloat(k.Turnover, 64)
 
 			page = append(page, &types.Candle{
-				Symbol:     symbol,
-				Exchange:   "bybit",
-				Timeframe:  tf,
-				OpenTime:   time.UnixMilli(startMs),
-				CloseTime:  time.UnixMilli(startMs + durationMs),
-				Open:       open,
-				High:       high,
-				Low:        low,
-				Close:      closeVal,
-				Volume:     volume,
-				IsComplete: true,
+				Symbol:      symbol,
+				Exchange:    "bybit",
+				Timeframe:   tf,
+				OpenTime:    time.UnixMilli(startMs),
+				CloseTime:   time.UnixMilli(startMs + durationMs),
+				Open:        open,
+				High:        high,
+				Low:         low,
+				Close:       closeVal,
+				Volume:      volume,
+				IsComplete:  true,
+				QuoteVolume: quoteVolume,
 			})
 			if startMs < oldestStartMs {
 				oldestStartMs = startMs

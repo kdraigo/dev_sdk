@@ -264,15 +264,19 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 					} else {
 						var hp struct {
 							Candles []struct {
-								Pair      string    `json:"Pair"`
-								Time      time.Time `json:"time"`
-								UpdatedAt time.Time `json:"updatedAt"`
-								Open      float64   `json:"open"`
-								High      float64   `json:"high"`
-								Low       float64   `json:"low"`
-								Close     float64   `json:"close"`
-								Volume    float64   `json:"volume"`
-								Complete  bool      `json:"complete"`
+								Pair                string    `json:"Pair"`
+								Time                time.Time `json:"time"`
+								UpdatedAt           time.Time `json:"updatedAt"`
+								Open                float64   `json:"open"`
+								High                float64   `json:"high"`
+								Low                 float64   `json:"low"`
+								Close               float64   `json:"close"`
+								Volume              float64   `json:"volume"`
+								Complete            bool      `json:"complete"`
+								TradeCount          int64     `json:"tradeCount"`
+								QuoteVolume         float64   `json:"quoteVolume"`
+								TakerBuyBaseVolume  float64   `json:"takerBuyBaseVolume"`
+								TakerBuyQuoteVolume float64   `json:"takerBuyQuoteVolume"`
 							} `json:"candles"`
 						}
 						if err := json.Unmarshal(resp.Data, &hp); err != nil {
@@ -281,16 +285,20 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 							out := make([]*types.Candle, 0, len(hp.Candles))
 							for _, c := range hp.Candles {
 								out = append(out, &types.Candle{
-									Symbol:     c.Pair,
-									Timeframe:  e.smallestTF,
-									OpenTime:   c.Time,
-									CloseTime:  c.UpdatedAt,
-									Open:       c.Open,
-									High:       c.High,
-									Low:        c.Low,
-									Close:      c.Close,
-									Volume:     c.Volume,
-									IsComplete: true,
+									Symbol:              c.Pair,
+									Timeframe:           e.smallestTF,
+									OpenTime:            c.Time,
+									CloseTime:           c.UpdatedAt,
+									Open:                c.Open,
+									High:                c.High,
+									Low:                 c.Low,
+									Close:               c.Close,
+									Volume:              c.Volume,
+									IsComplete:          true,
+									TradeCount:          c.TradeCount,
+									QuoteVolume:         c.QuoteVolume,
+									TakerBuyBaseVolume:  c.TakerBuyBaseVolume,
+									TakerBuyQuoteVolume: c.TakerBuyQuoteVolume,
 								})
 							}
 							hr.candles = out
@@ -379,14 +387,18 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 						Exchange string `json:"Exchange"`
 						Pair     string `json:"Pair"`
 						Candle   struct {
-							Time      time.Time `json:"time"`
-							UpdatedAt time.Time `json:"updatedAt"`
-							Open      float64   `json:"open"`
-							High      float64   `json:"high"`
-							Low       float64   `json:"low"`
-							Close     float64   `json:"close"`
-							Volume    float64   `json:"volume"`
-							Complete  bool      `json:"complete"`
+							Time                time.Time `json:"time"`
+							UpdatedAt           time.Time `json:"updatedAt"`
+							Open                float64   `json:"open"`
+							High                float64   `json:"high"`
+							Low                 float64   `json:"low"`
+							Close               float64   `json:"close"`
+							Volume              float64   `json:"volume"`
+							Complete            bool      `json:"complete"`
+							TradeCount          int64     `json:"tradeCount"`
+							QuoteVolume         float64   `json:"quoteVolume"`
+							TakerBuyBaseVolume  float64   `json:"takerBuyBaseVolume"`
+							TakerBuyQuoteVolume float64   `json:"takerBuyQuoteVolume"`
 						} `json:"Candle"`
 					} `json:"tick"`
 					Done   bool `json:"done"`
@@ -408,17 +420,21 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				// with empty data, etc.). The done flag itself is enough.
 				if dataStruct.Tick != nil && !dataStruct.Done && !dataStruct.Tick.Candle.Time.IsZero() {
 					candle := &types.Candle{
-						Symbol:     dataStruct.Tick.Pair,
-						Exchange:   dataStruct.Tick.Exchange,
-						Timeframe:  e.smallestTF,
-						OpenTime:   dataStruct.Tick.Candle.Time,
-						CloseTime:  dataStruct.Tick.Candle.UpdatedAt,
-						Open:       dataStruct.Tick.Candle.Open,
-						High:       dataStruct.Tick.Candle.High,
-						Low:        dataStruct.Tick.Candle.Low,
-						Close:      dataStruct.Tick.Candle.Close,
-						Volume:     dataStruct.Tick.Candle.Volume,
-						IsComplete: dataStruct.Tick.Candle.Complete,
+						Symbol:              dataStruct.Tick.Pair,
+						Exchange:            dataStruct.Tick.Exchange,
+						Timeframe:           e.smallestTF,
+						OpenTime:            dataStruct.Tick.Candle.Time,
+						CloseTime:           dataStruct.Tick.Candle.UpdatedAt,
+						Open:                dataStruct.Tick.Candle.Open,
+						High:                dataStruct.Tick.Candle.High,
+						Low:                 dataStruct.Tick.Candle.Low,
+						Close:               dataStruct.Tick.Candle.Close,
+						Volume:              dataStruct.Tick.Candle.Volume,
+						IsComplete:          dataStruct.Tick.Candle.Complete,
+						TradeCount:          dataStruct.Tick.Candle.TradeCount,
+						QuoteVolume:         dataStruct.Tick.Candle.QuoteVolume,
+						TakerBuyBaseVolume:  dataStruct.Tick.Candle.TakerBuyBaseVolume,
+						TakerBuyQuoteVolume: dataStruct.Tick.Candle.TakerBuyQuoteVolume,
 					}
 					// log.Printf("[WS] Received Candle: %s", candle.OpenTime.Format("2006-01-02 15:04"))
 					candleChan <- candle

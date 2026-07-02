@@ -56,6 +56,49 @@ func TestTimeframeAggregator_Process(t *testing.T) {
 	}
 }
 
+func TestTimeframeAggregator_SumsOrderFlowMetrics(t *testing.T) {
+	agg := NewTimeframeAggregator(types.Timeframe5m)
+
+	now := time.Date(2023, 1, 1, 10, 0, 0, 0, time.UTC)
+
+	var aggregated *types.Candle
+	for i := 0; i < 5; i++ {
+		candle := &types.Candle{
+			Symbol:              "BTC/USDT",
+			Exchange:            "binance",
+			Timeframe:           types.Timeframe1m,
+			OpenTime:            now.Add(time.Duration(i) * time.Minute),
+			CloseTime:           now.Add(time.Duration(i+1) * time.Minute),
+			Open:                100,
+			High:                110,
+			Low:                 90,
+			Close:               101,
+			Volume:              10,
+			TradeCount:          3,
+			QuoteVolume:         1000,
+			TakerBuyBaseVolume:  4,
+			TakerBuyQuoteVolume: 400,
+		}
+		aggregated = agg.Process(candle)
+	}
+
+	if aggregated == nil {
+		t.Fatal("Expected an aggregated candle, but got none")
+	}
+	if aggregated.TradeCount != 15 {
+		t.Errorf("Expected TradeCount 15, got %d", aggregated.TradeCount)
+	}
+	if aggregated.QuoteVolume != 5000 {
+		t.Errorf("Expected QuoteVolume 5000, got %f", aggregated.QuoteVolume)
+	}
+	if aggregated.TakerBuyBaseVolume != 20 {
+		t.Errorf("Expected TakerBuyBaseVolume 20, got %f", aggregated.TakerBuyBaseVolume)
+	}
+	if aggregated.TakerBuyQuoteVolume != 2000 {
+		t.Errorf("Expected TakerBuyQuoteVolume 2000, got %f", aggregated.TakerBuyQuoteVolume)
+	}
+}
+
 func TestTimeframeAggregator_SameTimeframe(t *testing.T) {
 	agg := NewTimeframeAggregator(types.Timeframe1m)
 

@@ -59,15 +59,19 @@ func (ta *TimeframeAggregator) aggregate(raw *types.Candle) {
 	if ta.current == nil {
 		duration := extractDuration(ta.targetTimeframe)
 		ta.current = &types.Candle{
-			Symbol:    raw.Symbol,
-			Exchange:  raw.Exchange,
-			Timeframe: ta.targetTimeframe,
-			OpenTime:  raw.OpenTime.Truncate(duration),
-			Open:      raw.Open,
-			High:      raw.High,
-			Low:       raw.Low,
-			Volume:    raw.Volume,
-			Close:     raw.Close,
+			Symbol:              raw.Symbol,
+			Exchange:            raw.Exchange,
+			Timeframe:           ta.targetTimeframe,
+			OpenTime:            raw.OpenTime.Truncate(duration),
+			Open:                raw.Open,
+			High:                raw.High,
+			Low:                 raw.Low,
+			Volume:              raw.Volume,
+			Close:               raw.Close,
+			TradeCount:          raw.TradeCount,
+			QuoteVolume:         raw.QuoteVolume,
+			TakerBuyBaseVolume:  raw.TakerBuyBaseVolume,
+			TakerBuyQuoteVolume: raw.TakerBuyQuoteVolume,
 		}
 		return
 	}
@@ -81,6 +85,10 @@ func (ta *TimeframeAggregator) aggregate(raw *types.Candle) {
 	}
 	ta.current.Close = raw.Close
 	ta.current.Volume += raw.Volume
+	ta.current.TradeCount += raw.TradeCount
+	ta.current.QuoteVolume += raw.QuoteVolume
+	ta.current.TakerBuyBaseVolume += raw.TakerBuyBaseVolume
+	ta.current.TakerBuyQuoteVolume += raw.TakerBuyQuoteVolume
 }
 
 func (ta *TimeframeAggregator) isBoundaryCrossed(raw *types.Candle) bool {

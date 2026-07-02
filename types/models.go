@@ -16,8 +16,16 @@ type Candle struct {
 	High       float64
 	Low        float64
 	Close      float64
-	Volume     float64
-	IsComplete bool // True when the candle has fully closed on its timeframe length.
+	Volume     float64 // Base-asset volume. (There is no separate BaseVolume field: Volume IS the base volume.)
+	IsComplete bool     // True when the candle has fully closed on its timeframe length.
+
+	// Advanced order-flow metrics (Wyckoff / Composite Man analysis).
+	// These are 0 when the source exchange does not provide them
+	// (e.g. Bybit klines expose QuoteVolume but not TradeCount or taker-buy splits).
+	TradeCount          int64   // Number of trades in the candle.
+	QuoteVolume         float64 // Quote-asset volume (turnover).
+	TakerBuyBaseVolume  float64 // Taker buy base-asset volume (aggressive-buy pressure).
+	TakerBuyQuoteVolume float64 // Taker buy quote-asset volume.
 }
 
 // OrderType dictates whether an order is Market, Limit, etc.
