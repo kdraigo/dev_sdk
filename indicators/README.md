@@ -4,6 +4,11 @@ The SDK ships ~95 TA-Lib indicators plus a few helpers. They are exposed per
 timeframe through the indicator manager and computed from the candles the SDK
 has streamed so far.
 
+> **In-depth writeup** (what each indicator is for, how it's calculated, what it
+> signals, and how to pick one) lives in the kdraigo MCP: call the
+> `get_indicator_docs` tool, or read `kdraigo_mcp/internal/tools/indicators.md`.
+> This README is the compact parameter cheat-sheet.
+
 ## Access pattern
 
 ```go
