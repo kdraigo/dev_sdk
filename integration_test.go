@@ -24,6 +24,10 @@ type mockEngineServer struct {
 	accountReqs  int
 	candlesSent  int
 	fillReported bool
+	// truncateAfter, when > 0, makes the WS handler drop the connection abruptly
+	// (without a done:true frame) after this many "next" calls — simulating a
+	// dropped websocket mid-run (D1).
+	truncateAfter int
 }
 
 func newMockEngineServer() *mockEngineServer {
@@ -63,6 +67,38 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 
 		m.mu.Lock()
 		switch req.Action {
+		case "history":
+			// Serve 1m candles in [from, to) so GetCandles has data. The last
+			// generated candle opens at to-1m (== the current-bar open), which the
+			// indicator-feed must drop to avoid double-counting.
+			var hd struct {
+				Data struct {
+					From time.Time `json:"from"`
+					To   time.Time `json:"to"`
+				} `json:"data"`
+			}
+			json.Unmarshal(message, &hd)
+			var candles []map[string]interface{}
+			for t := hd.Data.From; t.Before(hd.Data.To); t = t.Add(time.Minute) {
+				candles = append(candles, map[string]interface{}{
+					"Pair":      "BTC/USDT",
+					"time":      t,
+					"updatedAt": t.Add(time.Minute),
+					"open":      50000.0,
+					"high":      51000.0,
+					"low":       49000.0,
+					"close":     50500.0,
+					"volume":    1.0,
+					"complete":  true,
+				})
+			}
+			conn.WriteJSON(map[string]interface{}{
+				"action":     "history",
+				"request_id": req.RequestID,
+				"status":     "ok",
+				"data":       map[string]interface{}{"candles": candles},
+			})
+
 		case "account":
 			m.accountReqs++
 			resp := map[string]interface{}{
@@ -96,6 +132,12 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 
 		case "next":
 			m.nextCalls++
+			if m.truncateAfter > 0 && m.nextCalls > m.truncateAfter {
+				// Simulate a dropped websocket: close abruptly without a
+				// done:true frame. Return so the deferred conn.Close() fires.
+				m.mu.Unlock()
+				return
+			}
 			if m.nextCalls > 5 {
 				// Finish after 5 candles
 				conn.WriteJSON(map[string]interface{}{

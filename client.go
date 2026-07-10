@@ -26,7 +26,13 @@ type SDK struct {
 	onCandleAll      types.OnCandleFunc                     // Fires on every closed candle regardless of timeframe.
 	onCandleHandlers map[types.Timeframe]types.OnCandleFunc // Per-timeframe callbacks.
 	onOrderUpdate    types.OnOrderUpdateFunc
-	onComplete       func() // Called when a backtest run finishes naturally
+	onComplete       func()      // Called when a backtest run finishes naturally
+	onError          func(error) // Called when a backtest run ends in a terminal error
+
+	// runErr holds a terminal error from the backtest run (e.g. a truncated
+	// stream). Set by the tick loop before cancelling; returned from Start so a
+	// partial run is never mistaken for a clean completion (D1).
+	runErr atomic.Pointer[error]
 
 	// Channels for internal piping
 	rawCandleChan chan *types.Candle
@@ -148,6 +154,14 @@ func (s *SDK) SetOnOrderUpdate(fn types.OnOrderUpdateFunc) {
 // The callback fires before Start() returns, allowing cleanup or result reporting.
 func (s *SDK) SetOnComplete(fn func()) {
 	s.onComplete = fn
+}
+
+// SetOnError registers a callback invoked when a backtest run ends in a terminal
+// error (e.g. a truncated candle stream). When this fires, onComplete does NOT,
+// and Start() returns the same error. Use it to distinguish a partial run from a
+// clean finish (D1).
+func (s *SDK) SetOnError(fn func(error)) {
+	s.onError = fn
 }
 
 // Start launches the architecture pipeline and begins processing stream data.
@@ -319,19 +333,25 @@ func (s *SDK) Start(ctx context.Context) error {
 					return
 				case _, ok := <-syncChan:
 					if !ok {
-						// Aggregator closed syncChan — all candles processed, backtest done.
-						log.Println("DevSDK: Backtest complete.")
-						if s.onComplete != nil {
-							s.onComplete()
+						// Aggregator closed syncChan: either the stream finished
+						// cleanly, or it was truncated (dropped WS). Consult the
+						// adapter — a truncated run must surface as a terminal error
+						// and must NOT invoke onComplete (D1).
+						if err := s.streamErr(); err != nil {
+							log.Printf("DevSDK: backtest ended in error: %v", err)
+							s.finishWithError(err)
+						} else {
+							log.Println("DevSDK: Backtest complete.")
+							if s.onComplete != nil {
+								s.onComplete()
+							}
 						}
 						cancel()
 						return
 					}
 					if err := s.adapter.Next(ctx); err != nil {
 						log.Printf("DevSDK: Next() error: %v", err)
-						if s.onComplete != nil {
-							s.onComplete()
-						}
+						s.finishWithError(err)
 						cancel()
 						return
 					}
@@ -342,9 +362,7 @@ func (s *SDK) Start(ctx context.Context) error {
 					log.Printf("DevSDK: engine silent for %s — re-issuing next", nextTimeout)
 					if err := s.adapter.Next(ctx); err != nil {
 						log.Printf("DevSDK: recovery Next() error: %v", err)
-						if s.onComplete != nil {
-							s.onComplete()
-						}
+						s.finishWithError(err)
 						cancel()
 						return
 					}
@@ -355,7 +373,34 @@ func (s *SDK) Start(ctx context.Context) error {
 
 	// Stay alive until the SDK's own context is canceled (backtest done or user interrupt).
 	<-sdkCtx.Ctx.Done()
+	if p := s.runErr.Load(); p != nil {
+		return *p
+	}
 	return nil
+}
+
+// streamErr returns a terminal stream error from the adapter, if it supports
+// reporting one (backtest EngineClient does). Live adapters do not, so this is a
+// best-effort optional-capability check via type assertion — the same idiom used
+// for the backtestClock above.
+func (s *SDK) streamErr() error {
+	if se, ok := s.adapter.(interface{ StreamErr() error }); ok {
+		return se.StreamErr()
+	}
+	return nil
+}
+
+// finishWithError records a terminal run error (returned by Start) and invokes
+// onError if set. It deliberately does NOT call onComplete — a failed run must be
+// distinguishable from a clean finish (D1).
+func (s *SDK) finishWithError(err error) {
+	if err == nil {
+		return
+	}
+	s.runErr.Store(&err)
+	if s.onError != nil {
+		s.onError(err)
+	}
 }
 
 // Exposed methods passing through to adapter
@@ -415,14 +460,43 @@ func (s *SDK) GetCandles(ctx context.Context, exchange, symbol string, count int
 	return s.GetCandlesFromTo(ctx, exchange, symbol, from, to, tf)
 }
 
-// GetCandlesFromTo returns closed candles in [from, to] for the given
-// timeframe. In backtest mode the engine rejects requests with `to` past the
-// simulated playhead to prevent lookahead leak.
+// GetCandlesFromTo returns closed candles in [from, to] for the given timeframe.
+// In backtest mode this is a pure read: the backtester engine serves the range
+// from data_provider and rejects any `to` past the simulated playhead, so it never
+// advances the session clock or leaks look-ahead.
+//
+// The fetched candles are also fed into the SDK's own indicator manager for `tf`
+// (when that timeframe is configured), so indicators warm up from history without
+// the strategy owning a parallel manager. Candles at or after the current in-flight
+// bar's open are skipped — the stream pipeline already fed that bar — so nothing is
+// double-counted.
 func (s *SDK) GetCandlesFromTo(ctx context.Context, exchange, symbol string, from, to time.Time, tf types.Timeframe) ([]*types.Candle, error) {
 	if s.adapter == nil {
 		return nil, fmt.Errorf("sdk has no adapter")
 	}
-	return s.adapter.GetHistoricalCandles(ctx, exchange, symbol, from, to, tf)
+	candles, err := s.adapter.GetHistoricalCandles(ctx, exchange, symbol, from, to, tf)
+	if err != nil {
+		return nil, err
+	}
+	s.feedIndicators(tf, candles)
+	return candles, nil
+}
+
+// feedIndicators drops fetched history into the SDK's indicator manager for tf.
+// It is a no-op if tf is not configured. The manager keys points by OpenTime and
+// de-duplicates, so feeding overlapping ranges — or a bar already streamed in — is
+// safe and never corrupts the series, no matter how often GetCandles is called.
+func (s *SDK) feedIndicators(tf types.Timeframe, candles []*types.Candle) {
+	im, ok := s.indManagers[tf]
+	if !ok {
+		return
+	}
+	for _, c := range candles {
+		if c == nil {
+			continue
+		}
+		im.Update(c)
+	}
 }
 
 // IndicatorManagerFor returns the indicator manager scoped to the given timeframe.

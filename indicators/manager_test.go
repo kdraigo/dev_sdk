@@ -2,6 +2,7 @@ package indicators
 
 import (
 	"testing"
+	"time"
 
 	"github.com/kdraigo/dev_sdk/types"
 )
@@ -16,10 +17,12 @@ func TestIndicatorManager_Prunes(t *testing.T) {
 
 	im := NewIndicatorManager([]string{exchange}, []string{symbol}, WithMaxPoints(maxPoints)).(*indicatorManager)
 
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < fed; i++ {
 		im.Update(&types.Candle{
 			Exchange: exchange,
 			Symbol:   symbol,
+			OpenTime: base.Add(time.Duration(i) * time.Minute),
 			Open:     float64(i),
 			High:     float64(i),
 			Low:      float64(i),
@@ -51,6 +54,54 @@ func TestIndicatorManager_Prunes(t *testing.T) {
 	// Pruning drops the oldest: the retained head must be newer than candle 0.
 	if got := p.Close[0]; got == 0 {
 		t.Fatalf("oldest point not pruned: Close[0] = %v", got)
+	}
+}
+
+// TestIndicatorManager_Idempotent proves Update never corrupts history when the
+// same bars are fed repeatedly or out of order — the case that matters when
+// GetCandles is called many times with overlapping ranges.
+func TestIndicatorManager_Idempotent(t *testing.T) {
+	const (
+		exchange = "binance"
+		symbol   = "BTC/USDT"
+		n        = 50
+	)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	mk := func(i int) *types.Candle {
+		return &types.Candle{
+			Exchange: exchange, Symbol: symbol,
+			OpenTime: base.Add(time.Duration(i) * time.Minute),
+			Open:     float64(i), High: float64(i), Low: float64(i),
+			Close: float64(i), Volume: float64(i),
+		}
+	}
+
+	im := NewIndicatorManager([]string{exchange}, []string{symbol}).(*indicatorManager)
+
+	// Feed 0..n-1, then feed the whole range again (overlap), then feed an older
+	// sub-range out of order. None of it should grow or reorder the series.
+	for i := 0; i < n; i++ {
+		im.Update(mk(i))
+	}
+	for i := 0; i < n; i++ {
+		im.Update(mk(i))
+	}
+	for i := 10; i < 30; i++ {
+		im.Update(mk(i))
+	}
+
+	p := im.pairCandlePoints[exchange][symbol]
+	if len(p.Close) != n {
+		t.Fatalf("expected %d unique points after overlapping feeds, got %d", n, len(p.Close))
+	}
+	// Series must remain chronological and index-aligned with the timestamps.
+	for i := 0; i < n; i++ {
+		if !p.OpenTime[i].Equal(base.Add(time.Duration(i) * time.Minute)) {
+			t.Fatalf("OpenTime[%d] out of order: %v", i, p.OpenTime[i])
+		}
+		if p.Close[i] != float64(i) {
+			t.Fatalf("Close[%d] = %v, want %v (corrupted/misaligned)", i, p.Close[i], float64(i))
+		}
 	}
 }
 

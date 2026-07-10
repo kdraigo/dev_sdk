@@ -1,7 +1,9 @@
 package indicators
 
 import (
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/kdraigo/dev_sdk/types"
 )
@@ -100,7 +102,11 @@ func (im *indicatorManager) IndicatorsCalculatorRun(
 	}
 }
 
-// Update adds a completed aggregated candle to the indicator history.
+// Update adds a completed aggregated candle to the indicator history, keyed by the
+// candle's OpenTime. Points are kept in chronological order and de-duplicated by
+// OpenTime, so Update is idempotent: replaying a candle (or an overlapping history
+// range fetched via GetCandles) replaces the existing point in place rather than
+// appending a duplicate — no data corruption no matter how often it is called.
 // Must be called before the OnCandle callback so RSI/etc. reflect the new candle.
 func (im *indicatorManager) Update(candle *types.Candle) {
 	im.guard.Lock()
@@ -116,22 +122,57 @@ func (im *indicatorManager) Update(candle *types.Candle) {
 		return
 	}
 
-	pair.High = append(pair.High, candle.High)
-	pair.Low = append(pair.Low, candle.Low)
-	pair.Close = append(pair.Close, candle.Close)
-	pair.Open = append(pair.Open, candle.Open)
-	pair.Volume = append(pair.Volume, candle.Volume)
+	// Locate the chronological slot for this OpenTime. The series is sorted
+	// ascending, so binary-search the first point whose OpenTime is >= this one.
+	// The common case (a newly streamed candle) lands at the end → O(1) append.
+	ot := candle.OpenTime
+	i := sort.Search(len(pair.OpenTime), func(k int) bool { return !pair.OpenTime[k].Before(ot) })
+
+	if i < len(pair.OpenTime) && pair.OpenTime[i].Equal(ot) {
+		// Same bar already present — replace in place (last write wins). No growth,
+		// so no pruning needed.
+		pair.High[i] = candle.High
+		pair.Low[i] = candle.Low
+		pair.Close[i] = candle.Close
+		pair.Open[i] = candle.Open
+		pair.Volume[i] = candle.Volume
+		return
+	}
+
+	pair.OpenTime = insertTime(pair.OpenTime, i, ot)
+	pair.High = insertFloat(pair.High, i, candle.High)
+	pair.Low = insertFloat(pair.Low, i, candle.Low)
+	pair.Close = insertFloat(pair.Close, i, candle.Close)
+	pair.Open = insertFloat(pair.Open, i, candle.Open)
+	pair.Volume = insertFloat(pair.Volume, i, candle.Volume)
 
 	// Prune oldest points once history overflows. Trigger at 2x the window and
 	// trim back to maxPoints so the copy cost amortises to O(1) per candle while
 	// the indicators always retain at least maxPoints of history.
 	if im.maxPoints > 0 && len(pair.Close) >= 2*im.maxPoints {
+		pair.OpenTime = keepLastTime(pair.OpenTime, im.maxPoints)
 		pair.High = keepLast(pair.High, im.maxPoints)
 		pair.Low = keepLast(pair.Low, im.maxPoints)
 		pair.Close = keepLast(pair.Close, im.maxPoints)
 		pair.Open = keepLast(pair.Open, im.maxPoints)
 		pair.Volume = keepLast(pair.Volume, im.maxPoints)
 	}
+}
+
+// insertFloat inserts v at index i, preserving order. Appends when i == len(s).
+func insertFloat(s []float64, i int, v float64) []float64 {
+	s = append(s, 0)
+	copy(s[i+1:], s[i:])
+	s[i] = v
+	return s
+}
+
+// insertTime inserts v at index i, preserving order. Appends when i == len(s).
+func insertTime(s []time.Time, i int, v time.Time) []time.Time {
+	s = append(s, time.Time{})
+	copy(s[i+1:], s[i:])
+	s[i] = v
+	return s
 }
 
 // keepLast returns the last n elements of s in a freshly allocated slice. The
@@ -146,10 +187,23 @@ func keepLast(s []float64, n int) []float64 {
 	return out
 }
 
+// keepLastTime is keepLast for the parallel OpenTime series.
+func keepLastTime(s []time.Time, n int) []time.Time {
+	if len(s) <= n {
+		return s
+	}
+	out := make([]time.Time, n)
+	copy(out, s[len(s)-n:])
+	return out
+}
+
 type pairCandlePoints struct {
-	High   []float64
-	Low    []float64
-	Close  []float64
-	Open   []float64
-	Volume []float64
+	// OpenTime is the chronological key, kept sorted ascending and parallel to the
+	// price/volume series so points can be de-duplicated and inserted in order.
+	OpenTime []time.Time
+	High     []float64
+	Low      []float64
+	Close    []float64
+	Open     []float64
+	Volume   []float64
 }

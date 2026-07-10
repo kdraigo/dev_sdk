@@ -29,7 +29,8 @@ type EngineClient struct {
 	wsConn    *websocket.Conn
 	writeMu   sync.Mutex
 
-	streamDone atomic.Bool // set when the engine sends done:true; nextTick becomes a no-op
+	streamDone atomic.Bool           // set when the engine sends done:true; nextTick becomes a no-op
+	streamErr  atomic.Pointer[error] // set when the WS stream ends before done:true (truncation)
 
 	pendingOrders   map[string]chan *orderResponse
 	pendingAccounts map[string]chan *accountResponse
@@ -49,6 +50,62 @@ type historyResponse struct {
 type orderResponse struct {
 	order *types.Order
 	err   error
+}
+
+// orderWire mirrors the engine's on-the-wire order shape (lib/core.Order). The SDK's
+// public types.Order deliberately carries no json tags, so we unmarshal into this
+// explicit struct and map fields by hand rather than let the engine's wire format
+// shape the public type (D2).
+type orderWire struct {
+	ID         int64   `json:"id"`
+	ExchangeID int64   `json:"exchange_id"`
+	Pair       string  `json:"pair"`
+	Side       string  `json:"side"`
+	Type       string  `json:"type"`
+	Status     string  `json:"status"`
+	Price      float64 `json:"price"`
+	Quantity   float64 `json:"quantity"`
+	Commission float64 `json:"commission"`
+}
+
+// parseOrderAck maps a synchronous PlaceOrder ack into a types.Order. The engine
+// omits average_price/filled_qty on the ack, so for a FILLED order they are derived
+// from the fill price/quantity — market orders fill at the candle close, limit
+// orders at the limit price, both reported in `price` (D2).
+func parseOrderAck(data json.RawMessage) *types.Order {
+	var w orderWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		log.Printf("Backtest Engine: failed to decode order ack: %v", err)
+		return nil
+	}
+
+	id := ""
+	if w.ExchangeID != 0 {
+		id = fmt.Sprintf("%d", w.ExchangeID)
+	} else if w.ID != 0 {
+		id = fmt.Sprintf("%d", w.ID)
+	}
+
+	order := &types.Order{
+		ID:       id,
+		Symbol:   w.Pair,
+		Side:     types.OrderSide(strings.ToUpper(w.Side)),
+		Type:     types.OrderType(strings.ToUpper(w.Type)),
+		Status:   types.OrderStatus(strings.ToUpper(w.Status)),
+		Price:    w.Price,
+		Quantity: w.Quantity,
+		Fee:      w.Commission,
+	}
+
+	// The engine reports a synchronous market/limit fill as already FILLED but does
+	// not echo average_price/filled_qty; derive them from the fill so strategies
+	// that size or book PnL off AveragePrice/FilledQty read real values.
+	if order.Status == types.OrderStatusFilled {
+		order.FilledQty = w.Quantity
+		order.AveragePrice = w.Price
+	}
+
+	return order
 }
 
 func NewEngineClient(cfg *types.Config) *EngineClient {
@@ -229,7 +286,16 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 			}
 			conn.SetReadDeadline(time.Now().Add(readTimeout))
 			if err := conn.ReadJSON(&resp); err != nil {
-				log.Printf("Backtest Engine WS disconnected: %v", err)
+				// A read error after done:true is a normal shutdown; anything before
+				// it is a truncated stream and must be surfaced as a terminal error so
+				// the SDK does not report partial data as a clean completion (D1).
+				if !e.streamDone.Load() {
+					wrapped := fmt.Errorf("backtest stream truncated: %w", err)
+					e.streamErr.Store(&wrapped)
+					log.Printf("Backtest Engine WS disconnected before completion: %v", err)
+				} else {
+					log.Printf("Backtest Engine WS closed after completion: %v", err)
+				}
 				closeCandleChan() // unblock dispatch goroutine so the tick loop can shut down cleanly
 				return
 			}
@@ -327,16 +393,7 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 								rej.Code, rej.RequiredQuote, rej.AvailableQuote, rej.LockedQuote, rej.FeeEstimate)
 						}
 					} else {
-						var engineOrder struct {
-							ExchangeID int64 `json:"exchange_id"`
-						}
-						json.Unmarshal(resp.Data, &engineOrder)
-						json.Unmarshal(resp.Data, &or.order)
-
-						// Map int64 ID to string if it was missing
-						if or.order != nil && or.order.ID == "" && engineOrder.ExchangeID != 0 {
-							or.order.ID = fmt.Sprintf("%d", engineOrder.ExchangeID)
-						}
+						or.order = parseOrderAck(resp.Data)
 					}
 					orderCh <- &or
 					close(orderCh)
@@ -449,15 +506,18 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 						continue
 					}
 					orderChan <- &types.Order{
-						ID:           id,
-						Symbol:       o.Pair,
-						Side:         types.OrderSide(strings.ToUpper(o.Side)),
-						Type:         types.OrderType(strings.ToUpper(o.Type)),
-						Status:       types.OrderStatus(strings.ToUpper(o.Status)),
-						Price:        o.Price,
-						Quantity:     o.Quantity,
-						FilledQty:    o.Quantity, // engine fills fully
-						AveragePrice: o.Price,    // limit order fills at limit price
+						ID:        id,
+						Symbol:    o.Pair,
+						Side:      types.OrderSide(strings.ToUpper(o.Side)),
+						Type:      types.OrderType(strings.ToUpper(o.Type)),
+						Status:    types.OrderStatus(strings.ToUpper(o.Status)),
+						Price:     o.Price,
+						Quantity:  o.Quantity,
+						FilledQty: o.Quantity, // engine fills fully
+						// Fill price for every order type: market orders fill at the
+						// current candle's close, limit orders at the limit price. In
+						// both cases the engine reports it in o.Price.
+						AveragePrice: o.Price,
 					}
 				}
 				if dataStruct.Done {
@@ -470,6 +530,17 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 		}
 	}()
 
+	return nil
+}
+
+// StreamErr reports a terminal error if the candle stream ended before the engine
+// signalled done:true (e.g. a dropped websocket). It returns nil on a clean finish.
+// The SDK consults this when the candle channel closes to distinguish a truncated
+// run from a completed one (D1).
+func (e *EngineClient) StreamErr() error {
+	if p := e.streamErr.Load(); p != nil {
+		return *p
+	}
 	return nil
 }
 
