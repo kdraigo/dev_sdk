@@ -306,6 +306,8 @@ func (s *SDK) Start(ctx context.Context) error {
 	// explicit stopped event on graceful shutdown.
 	if s.publisher != nil && s.publisher.Enabled() && s.config.Environment != types.EnvBacktest && s.config.Live != nil {
 		startedAt := time.Now()
+		// Identity first, so the session row carries a name before any order.
+		s.publishSessionMeta()
 		s.publishInitialBalances(ctx)
 		go s.heartbeatLoop(sdkCtx.Ctx, startedAt)
 		go s.balanceFallbackLoop(sdkCtx.Ctx)
@@ -530,6 +532,15 @@ func (s *SDK) dispatchCandle(ctx *types.Context, tf types.Timeframe, candle *typ
 // publishInitialBalances fetches the wallet for each configured (exchange,
 // asset) pair once at Start and forwards to telemetry. Server treats the
 // first ever write per session as immutable.
+// publishSessionMeta announces the strategy's name and config once at Start, so
+// the console can identify the run by something other than its UUID.
+func (s *SDK) publishSessionMeta() {
+	if s.config.Live == nil || !s.publisher.Enabled() {
+		return
+	}
+	s.publisher.PublishSessionMeta(s.config.Live.StrategyName, s.config.Live.StrategyConfig)
+}
+
 func (s *SDK) publishInitialBalances(ctx context.Context) {
 	if s.config.Live == nil {
 		return

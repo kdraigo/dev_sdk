@@ -43,6 +43,9 @@ type Publisher interface {
 	PublishInitialBalance(account *types.Account)
 	PublishHeartbeat(meta HeartbeatMeta)
 	PublishStopped(reason string)
+	// PublishSessionMeta declares the strategy's identity. Sent once at Start;
+	// the server upserts, so it is safe to re-send on reconnect.
+	PublishSessionMeta(name string, config map[string]any)
 	// Enabled reports whether telemetry is actually being sent. Heartbeat
 	// goroutines should not start when this is false.
 	Enabled() bool
@@ -77,6 +80,7 @@ func (NoOpPublisher) PublishBalance(*types.Account)                       {}
 func (NoOpPublisher) PublishInitialBalance(*types.Account)                {}
 func (NoOpPublisher) PublishHeartbeat(HeartbeatMeta)                      {}
 func (NoOpPublisher) PublishStopped(string)                               {}
+func (NoOpPublisher) PublishSessionMeta(string, map[string]any)           {}
 func (NoOpPublisher) Enabled() bool                                       { return false }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -103,6 +107,12 @@ type telemetryPayload struct {
 	Balances  []balancePayload  `json:"balances,omitempty"`
 	Heartbeat *heartbeatPayload `json:"heartbeat,omitempty"`
 	Stopped   *stoppedPayload   `json:"stopped,omitempty"`
+	Meta      *sessionMetaPayload `json:"meta,omitempty"`
+}
+
+type sessionMetaPayload struct {
+	StrategyName string         `json:"strategy_name"`
+	Config       map[string]any `json:"config,omitempty"`
 }
 
 type orderPayload struct {
@@ -218,6 +228,27 @@ func (p *httpPublisher) PublishHeartbeat(meta HeartbeatMeta) {
 			CandlesProcessed: meta.CandlesProcessed,
 			OrdersPlaced:     meta.OrdersPlaced,
 			LastOrderID:      meta.LastOrderID,
+		},
+	})
+}
+
+// PublishSessionMeta declares the strategy identity for this session.
+//
+// Sent synchronously at Start: it is one small request, and getting it in before
+// the first order means the console never briefly shows the session as a bare
+// UUID. The server upserts, so re-sending on a reconnect is harmless.
+func (p *httpPublisher) PublishSessionMeta(name string, config map[string]any) {
+	if name == "" && len(config) == 0 {
+		return
+	}
+	p.send(&telemetryPayload{
+		SessionID: p.sessionID,
+		Exchange:  p.defaultExchange,
+		Symbol:    p.defaultSymbol,
+		EventType: "session_meta",
+		Meta: &sessionMetaPayload{
+			StrategyName: name,
+			Config:       config,
 		},
 	})
 }

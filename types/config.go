@@ -71,4 +71,13 @@ type LiveOptions struct {
 	TelemetryURL       string   // Base URL of the live_trades service (e.g. "http://localhost:5001"). Empty = disabled.
 	TelemetryAPIKey    string   // X-API-Key for live_trades service authentication.
 	SessionID          string   // Optional fixed telemetry session id. Empty = a new UUID is generated; set to resume/extend an existing session.
+	// StrategyName is a human-readable label for the run, the live counterpart
+	// of BacktestOptions.SessionName. Published once at Start; without it the
+	// console can only identify a session by its UUID.
+	StrategyName string
+	// StrategyConfig is an optional snapshot of the parameters the strategy was
+	// started with (timeframes, thresholds, risk settings...). Stored verbatim
+	// for display — the platform never interprets it. Capped at 8 KB encoded.
+	// Do not put secrets here; it is readable from the console.
+	StrategyConfig map[string]any
 }
