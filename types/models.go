@@ -34,6 +34,18 @@ type OrderType string
 const (
 	OrderTypeMarket OrderType = "MARKET"
 	OrderTypeLimit  OrderType = "LIMIT"
+
+	// OrderTypeStopLoss is market-on-trigger: it books at StopPrice once the
+	// bar trades through it.
+	OrderTypeStopLoss OrderType = "STOP_LOSS"
+
+	// OrderTypeStopLossLimit triggers at StopPrice and books at Price.
+	OrderTypeStopLossLimit OrderType = "STOP_LOSS_LIMIT"
+
+	// OrderTypeTakeProfitLimit is a resting exit at Price. It behaves as a
+	// limit order; the distinct type exists so a run can be read back and the
+	// strategy's intent recovered.
+	OrderTypeTakeProfitLimit OrderType = "TAKE_PROFIT_LIMIT"
 )
 
 // OrderSide specifies buying or selling.
@@ -64,6 +76,11 @@ type OrderRequest struct {
 	Quantity float64
 	Price    float64 // Zero if Market order
 
+	// StopPrice is the trigger for STOP_LOSS and STOP_LOSS_LIMIT orders.
+	// A SELL stop triggers when the bar trades at or below it; a BUY stop when
+	// it trades at or above. It is ignored by other order types.
+	StopPrice float64
+
 	// Reason and Logs are telemetry-only annotations. The SDK strips both
 	// before forwarding to the adapter; only live_trades sees them. Use them
 	// to capture the strategy's decision context ({rsi: 32, signal: "..."})
@@ -90,6 +107,39 @@ type Order struct {
 	FeeAsset     string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+
+	// StopPrice is the trigger price for stop orders, and zero otherwise.
+	// Without it a stop fill is indistinguishable from a limit fill at the
+	// same price when handling OnOrderUpdate.
+	StopPrice float64
+
+	// GroupID links the legs of a bracket. Two orders sharing a non-empty
+	// GroupID are mutually cancelling: when one fills, the other is cancelled.
+	GroupID string
+}
+
+// BracketRequest places a take-profit and a protective stop as a mutually
+// cancelling pair sharing one fund reservation.
+//
+// It is a pair rather than a ladder on purpose. The backtest wallet reserves
+// funds per order, so several independent take-profits against one position
+// cannot be placed at once; a strategy wanting a ladder should re-bracket the
+// remaining quantity after each fill.
+type BracketRequest struct {
+	Symbol   string
+	Exchange string
+	Side     OrderSide
+	Quantity float64
+
+	// TakeProfitPrice is the resting exit; StopPrice is the trigger for the
+	// protective leg. StopLimitPrice is the price that leg books at, and
+	// defaults to StopPrice when zero.
+	TakeProfitPrice float64
+	StopPrice       float64
+	StopLimitPrice  float64
+
+	Reason map[string]any `json:"-"`
+	Logs   []string       `json:"-"`
 }
 
 // Balance represents a single asset's available and locked funds.

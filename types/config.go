@@ -62,6 +62,34 @@ type BacktestOptions struct {
 	Wallets            map[string]float64 // Initial starting balances. Key is asset symbol (e.g. "USDT"), Value is amount.
 	StartTime          time.Time          // Historic start time for data stream.
 	EndTime            time.Time          // Historic end time for data stream.
+
+	// Simulation overrides the engine's execution assumptions. Leave nil for
+	// the defaults, which are the conservative ones.
+	Simulation *SimulationOptions
+}
+
+// SimulationOptions are the execution assumptions a backtest runs under. They
+// are recorded on the session, so a stored result stays interpretable after the
+// defaults change.
+//
+// Every field is optional: a nil pointer means "use the engine default". They
+// are pointers rather than plain values so that asking for zero fees — which is
+// how results produced before fees were charged can be reproduced — is
+// distinguishable from not asking at all.
+type SimulationOptions struct {
+	// FillPolicy decides which order fills first when one candle triggers
+	// several. "pessimistic" (the default) fills the adverse order first;
+	// "optimistic" the favourable one; "creation_order" reproduces the
+	// behaviour from before this option existed.
+	FillPolicy string `json:"fill_policy,omitempty"`
+
+	// GapFills books a stop that gapped through its trigger at the bar's open
+	// rather than at the stop price. Defaults to true.
+	GapFills *bool `json:"gap_fills,omitempty"`
+
+	// Fees as a fraction, e.g. 0.001 for 0.1%. Both default to Binance spot.
+	MakerFee *float64 `json:"maker_fee,omitempty"`
+	TakerFee *float64 `json:"taker_fee,omitempty"`
 }
 
 // LiveOptions contains configuration necessary to hook onto live order books and websocket endpoints.

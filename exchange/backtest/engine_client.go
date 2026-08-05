@@ -33,6 +33,7 @@ type EngineClient struct {
 	streamErr  atomic.Pointer[error] // set when the WS stream ends before done:true (truncation)
 
 	pendingOrders   map[string]chan *orderResponse
+	pendingBrackets map[string]chan *bracketResponse
 	pendingAccounts map[string]chan *accountResponse
 	pendingCancels  map[string]chan error
 	pendingHistory  map[string]chan *historyResponse
@@ -52,6 +53,13 @@ type orderResponse struct {
 	err   error
 }
 
+// bracketResponse carries the two legs of an OCO bracket. It has its own type
+// because the order channel is single-order by design.
+type bracketResponse struct {
+	orders []*types.Order
+	err    error
+}
+
 // orderWire mirrors the engine's on-the-wire order shape (lib/core.Order). The SDK's
 // public types.Order deliberately carries no json tags, so we unmarshal into this
 // explicit struct and map fields by hand rather than let the engine's wire format
@@ -63,9 +71,106 @@ type orderWire struct {
 	Side       string  `json:"side"`
 	Type       string  `json:"type"`
 	Status     string  `json:"status"`
-	Price      float64 `json:"price"`
-	Quantity   float64 `json:"quantity"`
-	Commission float64 `json:"commission"`
+	Price      float64  `json:"price"`
+	Quantity   float64  `json:"quantity"`
+	Commission float64  `json:"commission"`
+	Stop       *float64 `json:"stop"`
+	GroupID    *int64   `json:"group_id"`
+}
+
+// quoteAssetOf extracts the quote side of a BASE/QUOTE symbol.
+//
+// This used to be an unchecked index into strings.Split, which panicked and
+// took the whole strategy process down whenever a symbol arrived without a
+// slash — a plausible typo, not an exceptional condition.
+func quoteAssetOf(symbol string) (string, error) {
+	parts := strings.Split(symbol, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", fmt.Errorf("symbol %q must be in BASE/QUOTE form, e.g. BTC/USDT", symbol)
+	}
+	return parts[1], nil
+}
+
+// PlaceBracket places a take-profit and a protective stop as one mutually
+// cancelling pair. It implements dev_sdk.BracketPlacer.
+func (e *EngineClient) PlaceBracket(ctx context.Context, req *types.BracketRequest) ([]*types.Order, error) {
+	if req == nil {
+		return nil, fmt.Errorf("bracket request must not be nil")
+	}
+	if req.TakeProfitPrice <= 0 || req.StopPrice <= 0 {
+		return nil, fmt.Errorf("bracket requires a positive TakeProfitPrice and StopPrice")
+	}
+
+	quoteAsset, err := quoteAssetOf(req.Symbol)
+	if err != nil {
+		return nil, err
+	}
+
+	reqID := uuid.NewString()
+	respChan := make(chan *bracketResponse, 1)
+
+	e.pendingMu.Lock()
+	e.pendingBrackets[reqID] = respChan
+	e.pendingMu.Unlock()
+
+	cleanup := func() {
+		e.pendingMu.Lock()
+		delete(e.pendingBrackets, reqID)
+		e.pendingMu.Unlock()
+	}
+
+	data := map[string]interface{}{
+		"exchange":          req.Exchange,
+		"asset":             quoteAsset,
+		"pair":              req.Symbol,
+		"side":              req.Side,
+		"quantity":          req.Quantity,
+		"take_profit_price": req.TakeProfitPrice,
+		"stop_price":        req.StopPrice,
+	}
+	if req.StopLimitPrice > 0 {
+		data["stop_limit_price"] = req.StopLimitPrice
+	}
+	if req.Reason != nil {
+		data["reason"] = req.Reason
+	}
+	if len(req.Logs) > 0 {
+		data["logs"] = req.Logs
+	}
+
+	e.writeMu.Lock()
+	err = e.wsConn.WriteJSON(map[string]interface{}{
+		"action":     "order_bracket",
+		"request_id": reqID,
+		"data":       data,
+	})
+	e.writeMu.Unlock()
+
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to send bracket request: %w", err)
+	}
+
+	select {
+	case resp := <-respChan:
+		if resp.err != nil {
+			return nil, resp.err
+		}
+		for _, o := range resp.orders {
+			o.Exchange = req.Exchange
+		}
+		return resp.orders, nil
+
+	case <-ctx.Done():
+		cleanup()
+		return nil, ctx.Err()
+
+	case <-time.After(10 * time.Second):
+		// Matches PlaceOrder's fail-safe: a lost response must not wedge the
+		// strategy loop forever.
+		cleanup()
+		return nil, fmt.Errorf("timeout waiting for bracket response")
+	}
 }
 
 // parseOrderAck maps a synchronous PlaceOrder ack into a types.Order. The engine
@@ -97,6 +202,16 @@ func parseOrderAck(data json.RawMessage) *types.Order {
 		Fee:      w.Commission,
 	}
 
+	// Carry the bracket fields through, so a strategy handling OnOrderUpdate can
+	// tell a stop fill from a limit fill at the same price, and can see which
+	// orders belonged to the same mutually-cancelling pair.
+	if w.Stop != nil {
+		order.StopPrice = *w.Stop
+	}
+	if w.GroupID != nil {
+		order.GroupID = fmt.Sprintf("%d", *w.GroupID)
+	}
+
 	// The engine reports a synchronous market/limit fill as already FILLED but does
 	// not echo average_price/filled_qty; derive them from the fill so strategies
 	// that size or book PnL off AveragePrice/FilledQty read real values.
@@ -114,6 +229,7 @@ func NewEngineClient(cfg *types.Config) *EngineClient {
 		pendingOrders:   make(map[string]chan *orderResponse),
 		pendingAccounts: make(map[string]chan *accountResponse),
 		pendingCancels:  make(map[string]chan error),
+		pendingBrackets: make(map[string]chan *bracketResponse),
 		pendingHistory:  make(map[string]chan *historyResponse),
 	}
 }
@@ -138,6 +254,7 @@ type startSessionRequestWallet struct {
 type newSessionRequestPayload struct {
 	Streams        []startSessionRequestStream `json:"streams"`
 	InitialWallets []startSessionRequestWallet `json:"initial_wallets"`
+	Simulation     *types.SimulationOptions    `json:"simulation,omitempty"`
 }
 
 type sessionResponse struct {
@@ -197,6 +314,7 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	payload := newSessionRequestPayload{
 		Streams:        streams,
 		InitialWallets: wallets,
+		Simulation:     cfg.Backtest.Simulation,
 	}
 	body, _ := json.Marshal(payload)
 
@@ -303,6 +421,7 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 			// Handle pending PlaceOrder/GetAccount/CancelOrder/History waiters
 			if resp.RequestID != "" {
 				var orderCh chan *orderResponse
+				var bracketCh chan *bracketResponse
 				var accountCh chan *accountResponse
 				var cancelCh chan error
 				var historyCh chan *historyResponse
@@ -311,6 +430,9 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				if ch, ok := e.pendingOrders[resp.RequestID]; ok {
 					orderCh = ch
 					delete(e.pendingOrders, resp.RequestID)
+				} else if ch, ok := e.pendingBrackets[resp.RequestID]; ok {
+					bracketCh = ch
+					delete(e.pendingBrackets, resp.RequestID)
 				} else if ch, ok := e.pendingAccounts[resp.RequestID]; ok {
 					accountCh = ch
 					delete(e.pendingAccounts, resp.RequestID)
@@ -322,6 +444,32 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 					delete(e.pendingHistory, resp.RequestID)
 				}
 				e.pendingMu.Unlock()
+
+				if bracketCh != nil {
+					var br bracketResponse
+					if resp.Status == "error" {
+						br.err = fmt.Errorf("%s", resp.Error)
+					} else {
+						var bp struct {
+							Orders []orderWire `json:"orders"`
+						}
+						if err := json.Unmarshal(resp.Data, &bp); err != nil {
+							br.err = fmt.Errorf("bracket decode: %w", err)
+						} else {
+							for i := range bp.Orders {
+								encoded, err := json.Marshal(bp.Orders[i])
+								if err != nil {
+									continue
+								}
+								if order := parseOrderAck(encoded); order != nil {
+									br.orders = append(br.orders, order)
+								}
+							}
+						}
+					}
+					bracketCh <- &br
+					continue
+				}
 
 				if historyCh != nil {
 					var hr historyResponse
@@ -575,6 +723,14 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 	e.pendingOrders[reqID] = respChan
 	e.pendingMu.Unlock()
 
+	quoteAsset, err := quoteAssetOf(req.Symbol)
+	if err != nil {
+		e.pendingMu.Lock()
+		delete(e.pendingOrders, reqID)
+		e.pendingMu.Unlock()
+		return nil, err
+	}
+
 	orderData := map[string]interface{}{
 		"exchange": req.Exchange,
 		"pair":     req.Symbol, // The engine schema wants Pair instead of Symbol
@@ -582,7 +738,10 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 		"type":     req.Type,
 		"price":    req.Price,
 		"quantity": req.Quantity,
-		"asset":    strings.Split(req.Symbol, "/")[1], // Assuming symbol like BTC/USDT needs quote asset
+		"asset":    quoteAsset,
+	}
+	if req.StopPrice > 0 {
+		orderData["stop_price"] = req.StopPrice
 	}
 	if req.Reason != nil {
 		orderData["reason"] = req.Reason
@@ -598,7 +757,7 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 
 	e.writeMu.Lock()
 	// log.Printf("[WS] Sending Action: order (reqID: %s)", reqID)
-	err := e.wsConn.WriteJSON(payload)
+	err = e.wsConn.WriteJSON(payload)
 	e.writeMu.Unlock()
 
 	if err != nil {
