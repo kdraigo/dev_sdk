@@ -7,6 +7,16 @@ import (
 	"github.com/kdraigo/dev_sdk/types"
 )
 
+// BracketPlacer is an optional capability. An adapter that can place a
+// take-profit and a protective stop as one mutually cancelling pair implements
+// it; the rest do not, and callers get ErrUnsupportedByAdapter.
+//
+// It is deliberately separate from Adapter: widening that interface would break
+// every live adapter for a capability only the backtest engine currently has.
+type BracketPlacer interface {
+	PlaceBracket(ctx context.Context, req *types.BracketRequest) ([]*types.Order, error)
+}
+
 // Adapter interface standardizes how the SDK interacts with any underlying exchange (Real or Backtest).
 type Adapter interface {
 	// PrepareSession is called before starting the stream.

@@ -2,6 +2,7 @@ package dev_sdk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -289,7 +290,14 @@ func (s *SDK) Start(ctx context.Context) error {
 	if s.config.Backtest != nil {
 		for _, exchange := range s.config.Backtest.RequestedExchanges {
 			for _, asset := range s.config.Backtest.Assets {
-				quoteAsset := strings.Split(asset, "/")[1]
+				// A malformed asset is a configuration mistake, not a reason to
+				// bring the process down: this used to be an unchecked index.
+				parts := strings.Split(asset, "/")
+				if len(parts) != 2 || parts[1] == "" {
+					log.Printf("Handshake: skipping asset %q — expected BASE/QUOTE form, e.g. BTC/USDT", asset)
+					continue
+				}
+				quoteAsset := parts[1]
 				_, err := s.adapter.GetAccount(ctx, exchange, quoteAsset)
 				if err != nil {
 					log.Printf("Handshake: Failed to fetch initial account for %s-%s: %v", exchange, quoteAsset, err)
@@ -406,6 +414,47 @@ func (s *SDK) finishWithError(err error) {
 }
 
 // Exposed methods passing through to adapter
+
+// ErrUnsupportedByAdapter is returned when a capability is requested from an
+// adapter that does not provide it — for example placing a bracket against a
+// live exchange adapter.
+var ErrUnsupportedByAdapter = errors.New("operation not supported by this adapter")
+
+// PlaceBracket places a take-profit and a protective stop as a mutually
+// cancelling pair sharing one fund reservation, so exactly one can fill.
+//
+// Only adapters implementing BracketPlacer support it; the rest return
+// ErrUnsupportedByAdapter, which a strategy can check to fall back to
+// simulating the exit itself.
+func (s *SDK) PlaceBracket(ctx context.Context, req *types.BracketRequest) ([]*types.Order, error) {
+	placer, ok := s.adapter.(BracketPlacer)
+	if !ok {
+		return nil, ErrUnsupportedByAdapter
+	}
+
+	reason, logs := req.Reason, req.Logs
+	if s.config.Environment != types.EnvBacktest {
+		req.Reason, req.Logs = nil, nil
+	}
+
+	orders, err := placer.PlaceBracket(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, order := range orders {
+		if order == nil {
+			continue
+		}
+		s.ordersPlaced.Add(1)
+		s.lastOrderID.Store(order.ID)
+		if s.publisher != nil {
+			s.publisher.PublishOrder(order, reason, logs)
+		}
+	}
+
+	return orders, nil
+}
 
 func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error) {
 	reason, logs := req.Reason, req.Logs
