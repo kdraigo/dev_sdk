@@ -41,7 +41,7 @@ type SDK struct {
 
 	// Per-timeframe indicator managers and aggregators.
 	indManagers map[types.Timeframe]indicators.IndicatorManager
-	aggregators map[types.Timeframe]*aggregator.TimeframeAggregator
+	aggregators map[types.Timeframe]*aggregator.MultiAggregator
 
 	publisher telemetry.Publisher
 
@@ -215,10 +215,12 @@ func (s *SDK) Start(ctx context.Context) error {
 
 	// Build one indicator manager and one aggregator per requested timeframe.
 	s.indManagers = make(map[types.Timeframe]indicators.IndicatorManager, len(s.config.Timeframes))
-	s.aggregators = make(map[types.Timeframe]*aggregator.TimeframeAggregator, len(s.config.Timeframes))
+	s.aggregators = make(map[types.Timeframe]*aggregator.MultiAggregator, len(s.config.Timeframes))
 	for _, tf := range s.config.Timeframes {
 		s.indManagers[tf] = indicators.NewIndicatorManager(imExchanges, imAssets, indicators.WithMaxPoints(s.config.IndicatorHistory))
-		s.aggregators[tf] = aggregator.NewTimeframeAggregator(tf)
+		// Symbol-partitioned: a multi-symbol session must not fold BTC and ETH
+		// candles into the same bar.
+		s.aggregators[tf] = aggregator.NewMultiAggregator(tf)
 	}
 
 	// Single goroutine: fan out each raw tick to all aggregators, fire callbacks for any

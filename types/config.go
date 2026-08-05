@@ -26,6 +26,11 @@ const (
 	Timeframe2h  Timeframe = "2h"
 	Timeframe4h  Timeframe = "4h"
 	Timeframe1d  Timeframe = "1d"
+
+	// Note the casing: lowercase m is minute, uppercase M is month.
+	Timeframe2m Timeframe = "2m"
+	Timeframe1w Timeframe = "1w"
+	Timeframe1M Timeframe = "1M"
 )
 
 // Config is the main configuration object provided by user to initialize the strategy bot SDK.
@@ -59,7 +64,24 @@ type BacktestOptions struct {
 	SessionName        string             // Human readable name for the backtesting run.
 	RequestedExchanges []string           // List of exchanges to pull historical data against (e.g., "binance").
 	Assets             []string           // Trading pairs requested (e.g., "BTC/USDT", "ETH/USDT").
-	Wallets            map[string]float64 // Initial starting balances. Key is asset symbol (e.g. "USDT"), Value is amount.
+	// Wallets is the starting balance per asset, for a single-exchange session.
+	// Key is the asset symbol (e.g. "USDT"), value is the amount.
+	//
+	// Funds belong to an exchange: money at binance cannot be spent on bybit.
+	// With exactly one requested exchange that is unambiguous, so this shorthand
+	// is fine. With several, use WalletsByExchange — this field previously
+	// applied the same balance to *every* exchange, so a two-exchange session
+	// silently ran with double the intended capital.
+	Wallets map[string]float64
+
+	// WalletsByExchange allocates starting balances per exchange, keyed by
+	// exchange then asset. Total session capital is the sum:
+	//
+	//	{"binance": {"USDT": 10000}, "bybit": {"USDT": 5000}}
+	//
+	// is 15000 overall, of which only 10000 is spendable on binance. Set this
+	// or Wallets, not both.
+	WalletsByExchange map[string]map[string]float64
 	StartTime          time.Time          // Historic start time for data stream.
 	EndTime            time.Time          // Historic end time for data stream.
 
