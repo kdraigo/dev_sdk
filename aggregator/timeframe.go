@@ -11,6 +11,7 @@ import (
 // and aggregates them into the user-requested Timeframe (e.g. 15m), only emitting when complete.
 type TimeframeAggregator struct {
 	targetTimeframe types.Timeframe
+	spec            types.TimeframeSpec
 
 	mu      sync.Mutex
 	current *types.Candle
@@ -18,8 +19,19 @@ type TimeframeAggregator struct {
 
 // NewTimeframeAggregator builds an aggregator for the given target timeframe.
 func NewTimeframeAggregator(tf types.Timeframe) *TimeframeAggregator {
+	// An unknown timeframe falls back to one minute, which makes the aggregator
+	// a passthrough. That is the safe degradation here: the engine validates
+	// timeframes at session creation, so an unknown value cannot reach a live
+	// run, and silently bucketing it wrongly would be worse.
+	spec, err := types.ParseTimeframe(tf)
+	if err != nil {
+		spec, _ = types.ParseTimeframe(types.Timeframe1m)
+		tf = types.Timeframe1m
+	}
+
 	return &TimeframeAggregator{
 		targetTimeframe: tf,
+		spec:            spec,
 	}
 }
 
@@ -57,12 +69,11 @@ func (ta *TimeframeAggregator) Process(raw *types.Candle) *types.Candle {
 
 func (ta *TimeframeAggregator) aggregate(raw *types.Candle) {
 	if ta.current == nil {
-		duration := extractDuration(ta.targetTimeframe)
 		ta.current = &types.Candle{
 			Symbol:              raw.Symbol,
 			Exchange:            raw.Exchange,
 			Timeframe:           ta.targetTimeframe,
-			OpenTime:            raw.OpenTime.Truncate(duration),
+			OpenTime:            ta.spec.BucketStart(raw.OpenTime),
 			Open:                raw.Open,
 			High:                raw.High,
 			Low:                 raw.Low,
@@ -91,43 +102,28 @@ func (ta *TimeframeAggregator) aggregate(raw *types.Candle) {
 	ta.current.TakerBuyQuoteVolume += raw.TakerBuyQuoteVolume
 }
 
+// isBoundaryCrossed reports whether the raw candle completes the current bucket.
+//
+// It compares bucket membership rather than subtracting timestamps, because a
+// fixed duration cannot express a calendar month. (Weeks were already correct
+// under the previous Time.Truncate, which anchors at Go's zero time — year 1,
+// a Monday — rather than at the Unix epoch, a Thursday.)
 func (ta *TimeframeAggregator) isBoundaryCrossed(raw *types.Candle) bool {
-	// For architecture structural purposes:
-	// Calculate if raw.CloseTime signifies the end of the `targetTimeframe` window.
-	// Assume an external math/duration calculation here against Timeframe string.
-	// Returning true will trigger the aggregated candle emit.
-
-	duration := extractDuration(ta.targetTimeframe)
-	// Example boundary check
-	return raw.CloseTime.Sub(ta.current.OpenTime) >= duration
+	return !ta.spec.SameBucket(raw.CloseTime, ta.current.OpenTime)
 }
 
-func extractDuration(tf types.Timeframe) time.Duration {
-	switch tf {
-	case types.Timeframe1m:
-		return time.Minute
-	case types.Timeframe3m:
-		return 3 * time.Minute
-	case types.Timeframe5m:
-		return 5 * time.Minute
-	case types.Timeframe15m:
-		return 15 * time.Minute
-	case types.Timeframe30m:
-		return 30 * time.Minute
-	case types.Timeframe1h:
-		return time.Hour
-	case types.Timeframe2h:
-		return 2 * time.Hour
-	case types.Timeframe4h:
-		return 4 * time.Hour
-	case types.Timeframe1d:
-		return 24 * time.Hour
-	default:
+// ExtractDuration returns the nominal length of a timeframe, for client-side
+// start-time rounding.
+//
+// It replaces a local switch whose default silently returned one minute — the
+// same class of defect that made unsupported timeframes serve 1m data. Unknown
+// values still fall back to a minute here because callers use this only for
+// rounding, but the table now covers every supported timeframe including 2m,
+// 1w and 1M. A calendar month reports a nominal 31 days.
+func ExtractDuration(tf types.Timeframe) time.Duration {
+	spec, err := types.ParseTimeframe(tf)
+	if err != nil {
 		return time.Minute
 	}
-}
-
-// ExtractDuration is the exported version for use in client-side start-time rounding.
-func ExtractDuration(tf types.Timeframe) time.Duration {
-	return extractDuration(tf)
+	return spec.Duration()
 }

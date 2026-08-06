@@ -1,0 +1,65 @@
+{
+  "_comment": "Shared timeframe vocabulary. Checked into both lib and dev_sdk, which maintain independent tables because dev_sdk must not depend on lib. A test on each side asserts its table matches this file, so the two cannot drift apart silently. Casing is significant: 1m is one minute, 1M is one month.",
+  "timeframes": [
+    {
+      "name": "1m",
+      "millis": 60000,
+      "kind": "modulo"
+    },
+    {
+      "name": "2m",
+      "millis": 120000,
+      "kind": "modulo"
+    },
+    {
+      "name": "3m",
+      "millis": 180000,
+      "kind": "modulo"
+    },
+    {
+      "name": "5m",
+      "millis": 300000,
+      "kind": "modulo"
+    },
+    {
+      "name": "15m",
+      "millis": 900000,
+      "kind": "modulo"
+    },
+    {
+      "name": "30m",
+      "millis": 1800000,
+      "kind": "modulo"
+    },
+    {
+      "name": "1h",
+      "millis": 3600000,
+      "kind": "modulo"
+    },
+    {
+      "name": "2h",
+      "millis": 7200000,
+      "kind": "modulo"
+    },
+    {
+      "name": "4h",
+      "millis": 14400000,
+      "kind": "modulo"
+    },
+    {
+      "name": "1d",
+      "millis": 86400000,
+      "kind": "modulo"
+    },
+    {
+      "name": "1w",
+      "millis": 604800000,
+      "kind": "week_monday"
+    },
+    {
+      "name": "1M",
+      "millis": 0,
+      "kind": "calendar_month"
+    }
+  ]
+}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 	"net/http"
 	"strconv"
 	"strings"
@@ -261,6 +262,83 @@ type sessionResponse struct {
 	ID string `json:"id"`
 }
 
+
+// buildWallets turns the configured starting balances into per-exchange wallet
+// requests.
+//
+// Funds belong to an exchange: capital at binance cannot be spent on bybit. The
+// previous form applied every Wallets entry to every requested exchange, so a
+// two-exchange session started with twice the intended capital and reported
+// buying power that never existed.
+func buildWallets(sessionID uuid.UUID, opts *types.BacktestOptions) ([]startSessionRequestWallet, error) {
+	hasFlat := len(opts.Wallets) > 0
+	hasPerExchange := len(opts.WalletsByExchange) > 0
+
+	switch {
+	case hasFlat && hasPerExchange:
+		return nil, fmt.Errorf("set either Wallets or WalletsByExchange, not both")
+
+	case !hasFlat && !hasPerExchange:
+		return nil, fmt.Errorf("no starting balances configured: set Wallets or WalletsByExchange")
+
+	case hasFlat && len(opts.RequestedExchanges) > 1:
+		// Ambiguous rather than wrong: we cannot know how the caller wants the
+		// balance split, and silently duplicating it is what caused the bug.
+		return nil, fmt.Errorf(
+			"Wallets is ambiguous across %d exchanges (%v): use WalletsByExchange to say how much sits at each",
+			len(opts.RequestedExchanges), opts.RequestedExchanges)
+	}
+
+	byExchange := opts.WalletsByExchange
+	if hasFlat {
+		exchange := ""
+		if len(opts.RequestedExchanges) == 1 {
+			exchange = opts.RequestedExchanges[0]
+		}
+		if exchange == "" {
+			return nil, fmt.Errorf("Wallets requires exactly one entry in RequestedExchanges")
+		}
+		byExchange = map[string]map[string]float64{exchange: opts.Wallets}
+	}
+
+	requested := make(map[string]struct{}, len(opts.RequestedExchanges))
+	for _, ex := range opts.RequestedExchanges {
+		requested[ex] = struct{}{}
+	}
+
+	// Deterministic ordering: the session request is signed, so an unstable
+	// wallet order would change the payload between otherwise identical runs.
+	exchanges := make([]string, 0, len(byExchange))
+	for ex := range byExchange {
+		if _, ok := requested[ex]; !ok {
+			return nil, fmt.Errorf("wallet configured for %q, which is not in RequestedExchanges %v", ex, opts.RequestedExchanges)
+		}
+		exchanges = append(exchanges, ex)
+	}
+	sort.Strings(exchanges)
+
+	var wallets []startSessionRequestWallet
+	for _, ex := range exchanges {
+		assets := make([]string, 0, len(byExchange[ex]))
+		for asset := range byExchange[ex] {
+			assets = append(assets, asset)
+		}
+		sort.Strings(assets)
+
+		for _, asset := range assets {
+			wallets = append(wallets, startSessionRequestWallet{
+				SessionID:     sessionID,
+				Exchange:      ex,
+				Asset:         asset,
+				Balance:       byExchange[ex][asset],
+				LockedBalance: 0,
+			})
+		}
+	}
+
+	return wallets, nil
+}
+
 func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) error {
 	log.Printf("Backtest Engine: Preparing Session...\n")
 
@@ -275,12 +353,13 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	uid := uuid.New()
 
 	// Create required streams requests for all requested Exchange-Asset pairs
+	// The session streams at the shortest requested timeframe, because every
+	// longer one is folded up from it. This used to take Timeframes[0], so
+	// declaring []{1h, 5m} streamed at 1h and the 5m callback never fired with
+	// real 5m data. Ordering is by duration, not by name length.
 	e.smallestTF = types.Timeframe1m
-	if len(cfg.Timeframes) > 0 {
-		e.smallestTF = cfg.Timeframes[0]
-		// Naive smallest: in this SDK, shorter strings aren't necessarily smaller,
-		// but usually the first one in config is the 'base' one.
-		// For now, let's just use the first one provided to speed things up significantly.
+	if smallest, ok := types.SmallestTimeframe(cfg.Timeframes); ok {
+		e.smallestTF = smallest
 	}
 
 	var streams []startSessionRequestStream
@@ -298,17 +377,9 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	}
 
 	// Format wallets
-	var wallets []startSessionRequestWallet
-	for _, ex := range cfg.Backtest.RequestedExchanges {
-		for asset, bal := range cfg.Backtest.Wallets {
-			wallets = append(wallets, startSessionRequestWallet{
-				SessionID:     uid,
-				Exchange:      ex,
-				Asset:         asset,
-				Balance:       bal,
-				LockedBalance: 0,
-			})
-		}
+	wallets, err := buildWallets(uid, cfg.Backtest)
+	if err != nil {
+		return err
 	}
 
 	payload := newSessionRequestPayload{
