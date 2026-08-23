@@ -760,3 +760,31 @@ func roundUpToTimeframe(t time.Time, tf types.Timeframe) time.Time {
 	log.Printf("DevSDK: start time rounded up from %s to %s (largest timeframe: %s)", t.UTC().Format(time.RFC3339), rounded.Format(time.RFC3339), tf)
 	return rounded
 }
+
+// SetLeverage sets the leverage for new positions on a pair.
+//
+// Only adapters implementing LeverageSetter support it; the rest return
+// ErrUnsupportedByAdapter, and a spot wallet is refused by the engine rather
+// than silently left at 1x — a strategy that believes it set 10x and is
+// actually unleveraged sizes every position wrong for the whole run.
+func (s *SDK) SetLeverage(ctx context.Context, exchange, pair string, leverage float64) error {
+	setter, ok := s.adapter.(LeverageSetter)
+	if !ok {
+		return ErrUnsupportedByAdapter
+	}
+	return setter.SetLeverage(ctx, exchange, pair, leverage)
+}
+
+// GetPositions returns open futures positions. Pass an empty exchange to read
+// across every futures wallet in the session.
+//
+// A spot-only session returns an empty slice rather than an error: holding no
+// positions is a true answer, unlike leverage where silence would hide a
+// misconfiguration.
+func (s *SDK) GetPositions(ctx context.Context, exchange string) ([]*types.Position, error) {
+	reader, ok := s.adapter.(PositionReader)
+	if !ok {
+		return nil, ErrUnsupportedByAdapter
+	}
+	return reader.GetPositions(ctx, exchange)
+}

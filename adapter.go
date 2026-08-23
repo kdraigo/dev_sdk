@@ -45,3 +45,24 @@ type Adapter interface {
 	// state is mutated.
 	GetHistoricalCandles(ctx context.Context, exchange, symbol string, from, to time.Time, tf types.Timeframe) ([]*types.Candle, error)
 }
+
+// LeverageSetter is an optional capability for adapters that model leverage.
+//
+// Separate from Adapter for the same reason as BracketPlacer: widening that
+// interface would break every live adapter for something only the backtest
+// engine currently does.
+type LeverageSetter interface {
+	// SetLeverage sets the leverage used for new positions on a pair.
+	//
+	// Refused while a position is open — re-levering a live position would
+	// silently rewrite its liquidation price, which is not a thing an exchange
+	// lets you do either.
+	SetLeverage(ctx context.Context, exchange, pair string, leverage float64) error
+}
+
+// PositionReader is an optional capability for adapters that hold positions.
+type PositionReader interface {
+	// GetPositions returns the open positions on an exchange, or across every
+	// futures wallet when exchange is empty.
+	GetPositions(ctx context.Context, exchange string) ([]*types.Position, error)
+}

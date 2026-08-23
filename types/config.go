@@ -60,10 +60,10 @@ type Credentials struct {
 
 // BacktestOptions contains configuration necessary to prepare the engine session for backtesting.
 type BacktestOptions struct {
-	Endpoint           string             // Engine API URL e.g. "http://localhost:8080"
-	SessionName        string             // Human readable name for the backtesting run.
-	RequestedExchanges []string           // List of exchanges to pull historical data against (e.g., "binance").
-	Assets             []string           // Trading pairs requested (e.g., "BTC/USDT", "ETH/USDT").
+	Endpoint           string   // Engine API URL e.g. "http://localhost:8080"
+	SessionName        string   // Human readable name for the backtesting run.
+	RequestedExchanges []string // List of exchanges to pull historical data against (e.g., "binance").
+	Assets             []string // Trading pairs requested (e.g., "BTC/USDT", "ETH/USDT").
 	// Wallets is the starting balance per asset, for a single-exchange session.
 	// Key is the asset symbol (e.g. "USDT"), value is the amount.
 	//
@@ -82,8 +82,21 @@ type BacktestOptions struct {
 	// is 15000 overall, of which only 10000 is spendable on binance. Set this
 	// or Wallets, not both.
 	WalletsByExchange map[string]map[string]float64
-	StartTime          time.Time          // Historic start time for data stream.
-	EndTime            time.Time          // Historic end time for data stream.
+
+	// MarketTypeByExchange selects the execution model per exchange:
+	// "spot" (the default) or "linear_perp" for USDT-margined perpetuals.
+	//
+	// Per exchange rather than per session, so one run can hold spot and
+	// futures side by side — cash-and-carry, or hedging spot with a perp.
+	// An exchange absent from this map is spot.
+	MarketTypeByExchange map[string]string
+
+	// LeverageByExchange sets the starting leverage for a futures wallet.
+	// Absent means the session default (1x, i.e. unleveraged unless asked).
+	// Leverage can also be changed per pair mid-run via Session.SetLeverage.
+	LeverageByExchange map[string]float64
+	StartTime          time.Time // Historic start time for data stream.
+	EndTime            time.Time // Historic end time for data stream.
 
 	// Simulation overrides the engine's execution assumptions. Leave nil for
 	// the defaults, which are the conservative ones.
@@ -112,6 +125,43 @@ type SimulationOptions struct {
 	// Fees as a fraction, e.g. 0.001 for 0.1%. Both default to Binance spot.
 	MakerFee *float64 `json:"maker_fee,omitempty"`
 	TakerFee *float64 `json:"taker_fee,omitempty"`
+
+	// Futures fees, separate from the spot pair above rather than overriding
+	// it: a mixed session runs both schedules at once. Default to Binance
+	// USDⓈ-M, where maker and taker differ by 2.5x — charging one for the
+	// other is a material error, unlike on spot where they usually match.
+	FuturesMakerFee *float64 `json:"futures_maker_fee,omitempty"`
+	FuturesTakerFee *float64 `json:"futures_taker_fee,omitempty"`
+
+	// DefaultLeverage applies to futures wallets that do not set their own.
+	// Defaults to 1: unleveraged unless explicitly asked for.
+	DefaultLeverage *float64 `json:"default_leverage,omitempty"`
+
+	// MarginMode and PositionMode exist to be validated. v1 supports
+	// "isolated" margin and "one_way" positions only; anything else is
+	// rejected at session creation rather than half-supported.
+	MarginMode   string `json:"margin_mode,omitempty"`
+	PositionMode string `json:"position_mode,omitempty"`
+
+	// ContractSpecsVersion pins the maintenance-margin ladder, so a stored
+	// result stays interpretable after the exchange revises its tiers. Empty
+	// means the newest capture the engine has embedded.
+	ContractSpecsVersion string `json:"contract_specs_version,omitempty"`
+
+	// FundingEnabled defaults to true. Turning it off is allowed for isolating
+	// its effect, but it must be a deliberate choice: omitting funding is a
+	// directional bias, not a simplification — it flatters whichever side was
+	// being paid over the window.
+	FundingEnabled *bool `json:"funding_enabled,omitempty"`
+
+	// MarkPriceSource selects what liquidation triggers on: "mark_series"
+	// (the default, and what a real exchange uses) or "trade_close".
+	//
+	// The difference is not academic. Measured on production data the two
+	// series diverge by up to 1.3% at the bar low, and on ~3% of bars the mark
+	// wicks below the trade low — liquidations that trade prices miss
+	// entirely. Runs that fall back are counted and recorded on the session.
+	MarkPriceSource string `json:"mark_price_source,omitempty"`
 }
 
 // LiveOptions contains configuration necessary to hook onto live order books and websocket endpoints.
@@ -131,3 +181,14 @@ type LiveOptions struct {
 	// Do not put secrets here; it is readable from the console.
 	StrategyConfig map[string]any
 }
+
+// Market types for MarketTypeByExchange.
+const (
+	// MarketTypeSpot is the default: cash balances, no leverage, nothing that
+	// liquidates.
+	MarketTypeSpot = "spot"
+
+	// MarketTypeLinearPerp is a USDT-margined perpetual under isolated margin
+	// and one-way positions.
+	MarketTypeLinearPerp = "linear_perp"
+)
