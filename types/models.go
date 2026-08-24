@@ -17,7 +17,7 @@ type Candle struct {
 	Low        float64
 	Close      float64
 	Volume     float64 // Base-asset volume. (There is no separate BaseVolume field: Volume IS the base volume.)
-	IsComplete bool     // True when the candle has fully closed on its timeframe length.
+	IsComplete bool    // True when the candle has fully closed on its timeframe length.
 
 	// Advanced order-flow metrics (Wyckoff / Composite Man analysis).
 	// These are 0 when the source exchange does not provide them
@@ -75,6 +75,18 @@ type OrderRequest struct {
 	Type     OrderType
 	Quantity float64
 	Price    float64 // Zero if Market order
+
+	// ReduceOnly restricts the order to shrinking an open position: it can
+	// never open one, nor flip an existing one to the opposite side.
+	//
+	// This matters most for protective stops. In one-way mode a stop sized
+	// larger than the position — a stale bracket, or sizing computed off
+	// intended rather than filled exposure — does not stop at flat. The
+	// surplus opens a position on the other side, so the strategy ends up with
+	// the same exposure inverted on exactly the bar it wanted none.
+	//
+	// Futures only; a spot wallet rejects it rather than silently ignoring it.
+	ReduceOnly bool
 
 	// StopPrice is the trigger for STOP_LOSS and STOP_LOSS_LIMIT orders.
 	// A SELL stop triggers when the bar trades at or below it; a BUY stop when
@@ -157,10 +169,27 @@ type Account struct {
 
 // Position standardizes an ongoing open position in a trading pair.
 type Position struct {
-	Symbol        string
-	Exchange      string
-	Size          float64
-	EntryPrice    float64
+	Symbol   string
+	Exchange string
+
+	// Side is "LONG" or "SHORT". Size is always positive, so a flat pair is
+	// the absence of a position rather than a zero-size one.
+	Side string
+	Size float64
+
+	// EntryPrice is the size-weighted average entry.
+	EntryPrice float64
+	Leverage   float64
+
+	// IsolatedMargin is the collateral committed to this position, and under
+	// isolated margin it is also the maximum loss.
+	IsolatedMargin float64
+
+	// RealizedPnL accumulates over the position's life, excluding fees.
+	// FundingPaid accumulates signed funding; positive means paid out.
+	RealizedPnL float64
+	FundingPaid float64
+
 	MarkPrice     float64
 	UnrealizedPnL float64
 }

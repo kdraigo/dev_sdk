@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"sort"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,7 +38,13 @@ type EngineClient struct {
 	pendingAccounts map[string]chan *accountResponse
 	pendingCancels  map[string]chan error
 	pendingHistory  map[string]chan *historyResponse
-	pendingMu       sync.Mutex
+
+	// pendingRaw serves actions whose payload the caller decodes itself. One
+	// channel type rather than a typed map per action: the routing below is
+	// already a chain of type-specific branches, and every new action added
+	// another link to it.
+	pendingRaw map[string]chan *rawResponse
+	pendingMu  sync.Mutex
 
 	smallestTF types.Timeframe
 }
@@ -66,12 +72,12 @@ type bracketResponse struct {
 // explicit struct and map fields by hand rather than let the engine's wire format
 // shape the public type (D2).
 type orderWire struct {
-	ID         int64   `json:"id"`
-	ExchangeID int64   `json:"exchange_id"`
-	Pair       string  `json:"pair"`
-	Side       string  `json:"side"`
-	Type       string  `json:"type"`
-	Status     string  `json:"status"`
+	ID         int64    `json:"id"`
+	ExchangeID int64    `json:"exchange_id"`
+	Pair       string   `json:"pair"`
+	Side       string   `json:"side"`
+	Type       string   `json:"type"`
+	Status     string   `json:"status"`
 	Price      float64  `json:"price"`
 	Quantity   float64  `json:"quantity"`
 	Commission float64  `json:"commission"`
@@ -232,6 +238,7 @@ func NewEngineClient(cfg *types.Config) *EngineClient {
 		pendingCancels:  make(map[string]chan error),
 		pendingBrackets: make(map[string]chan *bracketResponse),
 		pendingHistory:  make(map[string]chan *historyResponse),
+		pendingRaw:      make(map[string]chan *rawResponse),
 	}
 }
 
@@ -250,6 +257,12 @@ type startSessionRequestWallet struct {
 	Asset         string    `json:"asset"`
 	Balance       float64   `json:"balance"`
 	LockedBalance float64   `json:"locked_balance"`
+
+	// MarketType is "spot" or "linear_perp"; empty means spot. Leverage
+	// applies only to the latter. Omitted when unset so an older engine sees
+	// exactly the payload it saw before.
+	MarketType string  `json:"market_type,omitempty"`
+	Leverage   float64 `json:"leverage,omitempty"`
 }
 
 type newSessionRequestPayload struct {
@@ -261,7 +274,6 @@ type newSessionRequestPayload struct {
 type sessionResponse struct {
 	ID string `json:"id"`
 }
-
 
 // buildWallets turns the configured starting balances into per-exchange wallet
 // requests.
@@ -325,8 +337,13 @@ func buildWallets(sessionID uuid.UUID, opts *types.BacktestOptions) ([]startSess
 		}
 		sort.Strings(assets)
 
+		marketType := opts.MarketTypeByExchange[ex]
+		leverage := opts.LeverageByExchange[ex]
+
 		for _, asset := range assets {
 			wallets = append(wallets, startSessionRequestWallet{
+				MarketType:    marketType,
+				Leverage:      leverage,
 				SessionID:     sessionID,
 				Exchange:      ex,
 				Asset:         asset,
@@ -496,6 +513,7 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				var accountCh chan *accountResponse
 				var cancelCh chan error
 				var historyCh chan *historyResponse
+				var rawCh chan *rawResponse
 
 				e.pendingMu.Lock()
 				if ch, ok := e.pendingOrders[resp.RequestID]; ok {
@@ -513,8 +531,19 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 				} else if ch, ok := e.pendingHistory[resp.RequestID]; ok {
 					historyCh = ch
 					delete(e.pendingHistory, resp.RequestID)
+				} else if ch, ok := e.pendingRaw[resp.RequestID]; ok {
+					rawCh = ch
+					delete(e.pendingRaw, resp.RequestID)
 				}
 				e.pendingMu.Unlock()
+
+				if rawCh != nil {
+					r := &rawResponse{data: resp.Data}
+					if resp.Status == "error" {
+						r.err = fmt.Errorf("%s", resp.Error)
+					}
+					rawCh <- r
+				}
 
 				if bracketCh != nil {
 					var br bracketResponse
@@ -814,6 +843,9 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 	if req.StopPrice > 0 {
 		orderData["stop_price"] = req.StopPrice
 	}
+	if req.ReduceOnly {
+		orderData["reduce_only"] = true
+	}
 	if req.Reason != nil {
 		orderData["reason"] = req.Reason
 	}
@@ -1039,4 +1071,160 @@ func (e *EngineClient) generateSignature(method, path, timestamp, body string) (
 type accountResponse struct {
 	account *types.Account
 	err     error
+}
+
+// rawResponse carries an action's payload undecoded, for callers that know its
+// shape better than the router does.
+type rawResponse struct {
+	data json.RawMessage
+	err  error
+}
+
+// call sends one request/response action and returns its raw payload.
+//
+// The shape mirrors PlaceOrder — register a channel, write, wait with the same
+// fail-safe timeout — but without a typed pending map per action.
+func (e *EngineClient) call(ctx context.Context, action string, data map[string]interface{}) (json.RawMessage, error) {
+	if e.wsConn == nil {
+		return nil, fmt.Errorf("websocket not connected")
+	}
+
+	reqID := uuid.New().String()
+	respChan := make(chan *rawResponse, 1)
+
+	e.pendingMu.Lock()
+	e.pendingRaw[reqID] = respChan
+	e.pendingMu.Unlock()
+
+	forget := func() {
+		e.pendingMu.Lock()
+		delete(e.pendingRaw, reqID)
+		e.pendingMu.Unlock()
+	}
+
+	e.writeMu.Lock()
+	err := e.wsConn.WriteJSON(map[string]interface{}{
+		"action":     action,
+		"request_id": reqID,
+		"data":       data,
+	})
+	e.writeMu.Unlock()
+
+	if err != nil {
+		forget()
+		return nil, err
+	}
+
+	select {
+	case resp := <-respChan:
+		return resp.data, resp.err
+	case <-ctx.Done():
+		forget()
+		return nil, ctx.Err()
+	case <-time.After(10 * time.Second):
+		forget()
+		return nil, fmt.Errorf("timeout waiting for %s response", action)
+	}
+}
+
+// SetLeverage implements dev_sdk.LeverageSetter.
+func (e *EngineClient) SetLeverage(ctx context.Context, exchange, pair string, leverage float64) error {
+	quoteAsset, err := quoteAssetOf(pair)
+	if err != nil {
+		return err
+	}
+
+	_, err = e.call(ctx, "leverage", map[string]interface{}{
+		"exchange": exchange,
+		"asset":    quoteAsset,
+		"pair":     pair,
+		"leverage": leverage,
+	})
+	return err
+}
+
+// positionWire is the engine's position shape. Decoded here rather than shared,
+// so the engine can add fields without a coordinated SDK release.
+type positionWire struct {
+	Pair           string  `json:"Pair"`
+	Side           string  `json:"Side"`
+	Size           float64 `json:"Size"`
+	EntryPrice     float64 `json:"EntryPrice"`
+	Leverage       float64 `json:"Leverage"`
+	IsolatedMargin float64 `json:"IsolatedMargin"`
+	RealizedPnL    float64 `json:"RealizedPnL"`
+	FundingPaid    float64 `json:"FundingPaid"`
+}
+
+// perpCollateral is the asset every linear perpetual is margined in.
+//
+// Not a guess: linear contracts are USDT-margined by definition, and the engine
+// rejects a linear_perp wallet collateralised in anything else at session
+// creation. That is what lets a position query name its wallet without the
+// caller supplying an asset.
+const perpCollateral = "USDT"
+
+// GetPositions implements dev_sdk.PositionReader.
+//
+// Queries per exchange rather than once for everything, because the engine's
+// position payload does not name the venue it came from — scoping the request
+// is what makes the Exchange field on the result trustworthy.
+func (e *EngineClient) GetPositions(ctx context.Context, exchange string) ([]*types.Position, error) {
+	exchanges := []string{exchange}
+	if exchange == "" {
+		exchanges = e.futuresExchanges()
+	}
+
+	out := make([]*types.Position, 0)
+	for _, ex := range exchanges {
+		raw, err := e.call(ctx, "positions", map[string]interface{}{
+			"exchange": ex,
+			"asset":    perpCollateral,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		var wire []positionWire
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			return nil, fmt.Errorf("positions decode for %s: %w", ex, err)
+		}
+
+		for _, w := range wire {
+			out = append(out, &types.Position{
+				Symbol:         w.Pair,
+				Exchange:       ex,
+				Side:           w.Side,
+				Size:           w.Size,
+				EntryPrice:     w.EntryPrice,
+				Leverage:       w.Leverage,
+				IsolatedMargin: w.IsolatedMargin,
+				RealizedPnL:    w.RealizedPnL,
+				FundingPaid:    w.FundingPaid,
+			})
+		}
+	}
+
+	return out, nil
+}
+
+// futuresExchanges lists the configured exchanges running a perpetual wallet,
+// sorted so repeated calls report in a stable order.
+//
+// Spot exchanges are skipped rather than queried and discarded: they hold no
+// positions by construction, and a round trip per bar to learn that is waste.
+func (e *EngineClient) futuresExchanges() []string {
+	if e.config == nil || e.config.Backtest == nil {
+		return nil
+	}
+
+	var out []string
+	for _, ex := range e.config.Backtest.RequestedExchanges {
+		if e.config.Backtest.MarketTypeByExchange[ex] == types.MarketTypeLinearPerp {
+			out = append(out, ex)
+		}
+	}
+	sort.Strings(out)
+
+	return out
 }
