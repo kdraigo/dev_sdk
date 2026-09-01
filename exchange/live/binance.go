@@ -14,13 +14,22 @@ import (
 	"github.com/kdraigo/dev_sdk/types"
 )
 
-// newBinanceClient builds a go-binance client, selecting the signing scheme from
-// the credential shape: an Ed25519 PKCS8 PEM in APISecret switches the client to
-// asymmetric (Ed25519) signing; otherwise it stays HMAC. The API key string in
-// APIKey is always used as-is for the X-MBX-APIKEY header.
+// isEd25519Secret reports whether a credential secret is an Ed25519 PKCS8 PEM
+// rather than an HMAC shared secret.
+//
+// Shared by the spot and futures clients: both go-binance clients carry the
+// same KeyType field, and duplicating the check would let the two drift so that
+// a key working on one venue mysteriously failed on the other.
+func isEd25519Secret(secret string) bool {
+	return strings.Contains(secret, "BEGIN PRIVATE KEY")
+}
+
+// newBinanceClient builds a go-binance spot client, selecting the signing scheme
+// from the credential shape. The API key string in APIKey is always used as-is
+// for the X-MBX-APIKEY header.
 func newBinanceClient(creds types.Credentials) *binance.Client {
 	c := binance.NewClient(creds.APIKey, creds.APISecret)
-	if strings.Contains(creds.APISecret, "BEGIN PRIVATE KEY") {
+	if isEd25519Secret(creds.APISecret) {
 		c.KeyType = common.KeyTypeEd25519
 	}
 	return c
@@ -29,10 +38,25 @@ func newBinanceClient(creds types.Credentials) *binance.Client {
 type BinanceClient struct {
 	config *types.Config
 	client *binance.Client
+
+	// filters holds each configured instrument's own trading rules, read from
+	// exchangeInfo at PrepareSession. Orders used to go out as
+	// fmt.Sprintf("%f", …) — six decimals whatever the symbol's precision —
+	// which the venue rejects for anything that does not happen to step in
+	// millionths.
+	filters map[string]InstrumentFilter
 }
 
 func NewBinanceClient(cfg *types.Config) *BinanceClient {
-	return &BinanceClient{config: cfg}
+	return &BinanceClient{config: cfg, filters: make(map[string]InstrumentFilter)}
+}
+
+// filterFor returns the instrument's rules, or a zero filter that passes
+// everything through. A missing filter is a degraded state, not a fatal one:
+// the venue still validates, and refusing to trade because exchangeInfo was
+// unreachable would be a worse failure than a possible rejection.
+func (b *BinanceClient) filterFor(symbol string) InstrumentFilter {
+	return b.filters[symbol]
 }
 
 func (b *BinanceClient) PrepareSession(ctx context.Context, cfg *types.Config) error {
@@ -55,7 +79,58 @@ func (b *BinanceClient) PrepareSession(ctx context.Context, cfg *types.Config) e
 		return fmt.Errorf("binance connection failed: %w", err)
 	}
 
+	if err := b.loadFilters(ctx, cfg); err != nil {
+		// Non-fatal: see filterFor. Log loudly so a run that is rounding
+		// nothing is visible in the output rather than only in a rejection.
+		log.Printf("Binance: instrument filters unavailable, orders will be sent unrounded: %v", err)
+	}
+
 	return nil
+}
+
+// loadFilters reads tick size, step size and the notional minimum for every
+// configured symbol.
+func (b *BinanceClient) loadFilters(ctx context.Context, cfg *types.Config) error {
+	if cfg.Live == nil || len(cfg.Live.Assets) == 0 {
+		return nil
+	}
+
+	info, err := b.client.NewExchangeInfoService().Do(ctx)
+	if err != nil {
+		return fmt.Errorf("exchangeInfo: %w", err)
+	}
+
+	want := make(map[string]struct{}, len(cfg.Live.Assets))
+	for _, asset := range cfg.Live.Assets {
+		want[VenueSymbol(asset)] = struct{}{}
+	}
+
+	for i := range info.Symbols {
+		sym := info.Symbols[i]
+		if _, ok := want[sym.Symbol]; !ok {
+			continue
+		}
+		f := InstrumentFilter{}
+		if lot := sym.LotSizeFilter(); lot != nil {
+			f.StepSize = parseFloat(lot.StepSize)
+			f.MinQty = parseFloat(lot.MinQuantity)
+		}
+		if price := sym.PriceFilter(); price != nil {
+			f.TickSize = parseFloat(price.TickSize)
+		}
+		if notional := sym.NotionalFilter(); notional != nil {
+			f.MinNotional = parseFloat(notional.MinNotional)
+		}
+		b.filters[sym.Symbol] = f
+		log.Printf("Binance: %s tick=%v step=%v minQty=%v minNotional=%v",
+			sym.Symbol, f.TickSize, f.StepSize, f.MinQty, f.MinNotional)
+	}
+	return nil
+}
+
+func parseFloat(s string) float64 {
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
 }
 
 func (b *BinanceClient) ConnectStream(ctx context.Context, candleChan chan<- *types.Candle, orderChan chan<- *types.Order) error {
@@ -127,27 +202,67 @@ func (b *BinanceClient) ConnectStream(ctx context.Context, candleChan chan<- *ty
 	return nil
 }
 
-func (b *BinanceClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error) {
-	sym := strings.ToUpper(strings.ReplaceAll(req.Symbol, "/", ""))
+// binanceSpotOrderType translates a venue-neutral intent into Binance spot's
+// own vocabulary.
+//
+// IntentTakeProfitLimit maps to a plain LIMIT rather than Binance's
+// TAKE_PROFIT_LIMIT: the SDK's TAKE_PROFIT_LIMIT is a resting exit at Price
+// (see types.OrderTypeTakeProfitLimit), while Binance's is trigger-based and
+// requires a stopPrice the strategy never supplied. The returned Order keeps
+// the strategy's stated type, so intent is still recoverable from the log.
+func binanceSpotOrderType(t IntentType) (binance.OrderType, error) {
+	switch t {
+	case IntentMarket:
+		return binance.OrderTypeMarket, nil
+	case IntentLimit, IntentTakeProfitLimit:
+		return binance.OrderTypeLimit, nil
+	case IntentStopMarket:
+		return binance.OrderTypeStopLoss, nil
+	case IntentStopLimit:
+		return binance.OrderTypeStopLossLimit, nil
+	default:
+		return "", fmt.Errorf("binance spot: no order type for intent %s", t)
+	}
+}
 
-	side := binance.SideTypeBuy
-	if req.Side == types.OrderSideSell {
-		side = binance.SideTypeSell
+func (b *BinanceClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error) {
+	intent, err := MapOrder(req, MarketSpot)
+	if err != nil {
+		return nil, fmt.Errorf("binance spot: %w", err)
+	}
+	sym := intent.Symbol
+
+	filter := b.filterFor(sym)
+	if err := filter.Apply(intent, 0); err != nil {
+		return nil, fmt.Errorf("binance spot %s: %w", sym, err)
 	}
 
-	orderType := binance.OrderTypeMarket
-	if req.Type == types.OrderTypeLimit {
-		orderType = binance.OrderTypeLimit
+	orderType, err := binanceSpotOrderType(intent.Type)
+	if err != nil {
+		return nil, err
+	}
+
+	side := binance.SideTypeBuy
+	if intent.Side == types.OrderSideSell {
+		side = binance.SideTypeSell
 	}
 
 	srv := b.client.NewCreateOrderService().
 		Symbol(sym).
 		Side(side).
 		Type(orderType).
-		Quantity(fmt.Sprintf("%f", req.Quantity))
+		Quantity(filter.FormatQty(intent.Quantity))
 
-	if req.Type == types.OrderTypeLimit {
-		srv = srv.Price(fmt.Sprintf("%f", req.Price)).TimeInForce(binance.TimeInForceTypeGTC)
+	if intent.Price > 0 {
+		srv = srv.Price(filter.FormatPrice(intent.Price))
+	}
+	if intent.StopPrice > 0 {
+		srv = srv.StopPrice(filter.FormatPrice(intent.StopPrice))
+	}
+	// STOP_LOSS is market-on-trigger and rejects a time-in-force; every other
+	// resting type requires one.
+	if intent.TimeInForce != "" && orderType != binance.OrderTypeStopLoss {
+		srv = srv.TimeInForce(binance.TimeInForceType(intent.TimeInForce))
 	}
 
 	res, err := srv.Do(ctx)
@@ -167,16 +282,20 @@ func (b *BinanceClient) PlaceOrder(ctx context.Context, req *types.OrderRequest)
 	execQty, _ := strconv.ParseFloat(res.ExecutedQuantity, 64)
 
 	return &types.Order{
-		ID:           strconv.FormatInt(res.OrderID, 10),
-		Symbol:       req.Symbol,
-		Exchange:     "binance",
-		Side:         req.Side,
+		ID:       strconv.FormatInt(res.OrderID, 10),
+		Symbol:   req.Symbol,
+		Exchange: "binance",
+		Side:     req.Side,
+		// The strategy's stated type, not the wire type: a
+		// TAKE_PROFIT_LIMIT sent as a LIMIT is still a take-profit as far as
+		// the strategy and the telemetry log are concerned.
 		Type:         req.Type,
 		Status:       status,
 		Price:        price,
 		Quantity:     qty,
 		FilledQty:    execQty,
 		AveragePrice: price,
+		StopPrice:    intent.StopPrice,
 		CreatedAt:    time.UnixMilli(res.TransactTime),
 		UpdatedAt:    time.UnixMilli(res.TransactTime),
 	}, nil

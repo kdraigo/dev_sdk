@@ -337,7 +337,7 @@ func buildWallets(sessionID uuid.UUID, opts *types.BacktestOptions) ([]startSess
 		}
 		sort.Strings(assets)
 
-		marketType := opts.MarketTypeByExchange[ex]
+		marketType := resolveMarketType(ex, opts.MarketTypeByExchange)
 		leverage := opts.LeverageByExchange[ex]
 
 		for _, asset := range assets {
@@ -354,6 +354,27 @@ func buildWallets(sessionID uuid.UUID, opts *types.BacktestOptions) ([]startSess
 	}
 
 	return wallets, nil
+}
+
+// resolveMarketType decides whether an exchange's wallet is spot or a
+// perpetual, defaulting from the exchange's own name when the caller did not
+// say.
+//
+// The platform names perpetual venues with a "_futures" suffix —
+// binance_futures, bybit_futures — in ClickHouse candle tables, contract specs,
+// funding and mark price. Naming one in RequestedExchanges without also setting
+// MarketTypeByExchange used to produce a *spot* wallet running on perpetual
+// data: no error, no warning, and a run whose fees, leverage and liquidation
+// were all wrong. Defaulting from the name closes that, and an explicit entry
+// still wins, so a deliberate spot wallet on a futures feed remains expressible.
+func resolveMarketType(exchange string, byExchange map[string]string) string {
+	if mt, ok := byExchange[exchange]; ok && mt != "" {
+		return mt
+	}
+	if strings.HasSuffix(exchange, "_futures") {
+		return types.MarketTypeLinearPerp
+	}
+	return ""
 }
 
 func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) error {

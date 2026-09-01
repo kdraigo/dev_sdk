@@ -11,7 +11,24 @@ const (
 	EnvRealBybit   Environment = "real_bybit"
 	EnvTestBinance Environment = "test_binance"
 	EnvTestBybit   Environment = "test_bybit"
+
+	// Perpetual futures are their own environments rather than a flag on the
+	// spot ones. The venue is a different API, a different wallet and a
+	// different set of things that can go wrong, and the exchange identifier
+	// "binance_futures" already names it everywhere else on the platform —
+	// ClickHouse candle tables, contract specs, funding and mark price.
+	//
+	// A flag would also mean one misread boolean is the distance between a
+	// spot account holding real funds and a futures one.
+	EnvRealBinanceFutures Environment = "real_binance_futures"
+	EnvTestBinanceFutures Environment = "test_binance_futures"
 )
+
+// ExchangeBinanceFutures is the platform-wide identifier for Binance
+// USDⓈ-M perpetuals. It is the same string data_provider collects under and the
+// backtester keys contract specs by, so a backtest and a live run name the
+// venue identically.
+const ExchangeBinanceFutures = "binance_futures"
 
 // Timeframe dictates the period of time each candle covers.
 type Timeframe string
@@ -180,6 +197,37 @@ type LiveOptions struct {
 	// for display — the platform never interprets it. Capped at 8 KB encoded.
 	// Do not put secrets here; it is readable from the console.
 	StrategyConfig map[string]any
+
+	// ── Perpetual futures ────────────────────────────────────────────────
+	// The fields below apply to the *_binance_futures environments and are
+	// ignored on spot.
+
+	// Leverage is the starting leverage per pair, applied at PrepareSession.
+	// A pair absent from the map keeps whatever the exchange account already
+	// has — the SDK does not guess, because guessing 1x on an account set to
+	// 20x would silently resize every position the strategy opens.
+	Leverage map[string]float64
+
+	// Armed must be set explicitly before any order reaches a mainnet futures
+	// venue. It defaults to false so an unmodified config cannot trade, and it
+	// is only one of the gates: KDRAIGO_LIVE_ARMED=1 must also be present in
+	// the process environment.
+	Armed bool
+
+	// DryRun logs the exact request that would be sent and returns a synthetic
+	// acknowledgement instead of placing anything. This is how a strategy is
+	// exercised against real market data without touching the account.
+	DryRun bool
+
+	// MaxOrderNotional caps a single order's quote-currency value. Required
+	// for futures — there is no default, so forgetting to set one is a refusal
+	// rather than an unlimited cap.
+	MaxOrderNotional float64
+
+	// MaxLeverage caps leverage on any pair, checked both against the Leverage
+	// map at session start and against SetLeverage calls at runtime. Required
+	// for futures, for the same reason as MaxOrderNotional.
+	MaxLeverage float64
 }
 
 // Market types for MarketTypeByExchange.

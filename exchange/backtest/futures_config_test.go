@@ -92,3 +92,56 @@ func TestFuturesExchanges_NoConfigIsEmpty(t *testing.T) {
 	assert.Empty(t, (&EngineClient{}).futuresExchanges())
 	assert.Empty(t, (&EngineClient{config: &types.Config{}}).futuresExchanges())
 }
+
+// TestResolveMarketType_DefaultsFromExchangeName guards the misconfiguration
+// that produced no error: naming binance_futures in RequestedExchanges but
+// forgetting MarketTypeByExchange gave a spot wallet running on perpetual data,
+// with the wrong fees, no leverage and nothing that could liquidate.
+func TestResolveMarketType_DefaultsFromExchangeName(t *testing.T) {
+	cases := []struct {
+		name       string
+		exchange   string
+		byExchange map[string]string
+		want       string
+	}{
+		{
+			name:     "a _futures venue defaults to perpetual",
+			exchange: "binance_futures",
+			want:     types.MarketTypeLinearPerp,
+		},
+		{
+			name:     "so does bybit_futures",
+			exchange: "bybit_futures",
+			want:     types.MarketTypeLinearPerp,
+		},
+		{
+			name:     "a spot venue stays unset, which the engine reads as spot",
+			exchange: "binance",
+			want:     "",
+		},
+		{
+			name:       "an explicit entry always wins",
+			exchange:   "binance_futures",
+			byExchange: map[string]string{"binance_futures": types.MarketTypeSpot},
+			want:       types.MarketTypeSpot,
+		},
+		{
+			name:       "an explicit perp on a spot-named venue is still honoured",
+			exchange:   "binance",
+			byExchange: map[string]string{"binance": types.MarketTypeLinearPerp},
+			want:       types.MarketTypeLinearPerp,
+		},
+		{
+			name:       "an empty explicit entry does not override the default",
+			exchange:   "binance_futures",
+			byExchange: map[string]string{"binance_futures": ""},
+			want:       types.MarketTypeLinearPerp,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, resolveMarketType(tc.exchange, tc.byExchange))
+		})
+	}
+}

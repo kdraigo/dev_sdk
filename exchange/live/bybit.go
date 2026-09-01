@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -14,19 +13,16 @@ import (
 	"github.com/kdraigo/dev_sdk/types"
 )
 
-type symbolInfo struct {
-	tickSize float64 // minimum price increment
-	qtyStep  float64 // minimum quantity increment
-}
-
 type BybitClient struct {
-	config  *types.Config
-	client  *bybit.Client
-	symbols map[string]symbolInfo // keyed by uppercase symbol e.g. "BTCUSDT"
+	config *types.Config
+	client *bybit.Client
+
+	// filters is keyed by uppercase venue symbol, e.g. "BTCUSDT".
+	filters map[string]InstrumentFilter
 }
 
 func NewBybitClient(cfg *types.Config) *BybitClient {
-	return &BybitClient{config: cfg, symbols: make(map[string]symbolInfo)}
+	return &BybitClient{config: cfg, filters: make(map[string]InstrumentFilter)}
 }
 
 func (b *BybitClient) PrepareSession(ctx context.Context, cfg *types.Config) error {
@@ -72,26 +68,19 @@ func (b *BybitClient) fetchSymbolInfo(cfg *types.Config) error {
 		item := resp.Result.Spot.List[0]
 		tickSize, _ := strconv.ParseFloat(item.PriceFilter.TickSize, 64)
 		qtyStep, _ := strconv.ParseFloat(item.LotSizeFilter.BasePrecision, 64)
+		minQty, _ := strconv.ParseFloat(item.LotSizeFilter.MinOrderQty, 64)
+		minNotional, _ := strconv.ParseFloat(item.LotSizeFilter.MinOrderAmt, 64)
 
-		b.symbols[sym] = symbolInfo{tickSize: tickSize, qtyStep: qtyStep}
-		log.Printf("Bybit: %s tickSize=%v qtyStep=%v", sym, tickSize, qtyStep)
+		b.filters[sym] = InstrumentFilter{
+			TickSize:    tickSize,
+			StepSize:    qtyStep,
+			MinQty:      minQty,
+			MinNotional: minNotional,
+		}
+		log.Printf("Bybit: %s tick=%v step=%v minQty=%v minNotional=%v", sym, tickSize, qtyStep, minQty, minNotional)
 	}
 
 	return nil
-}
-
-// roundToStep floors v to the nearest multiple of step.
-func roundToStep(v, step float64) float64 {
-	if step <= 0 {
-		return v
-	}
-	// Use integer math to avoid floating-point drift.
-	decimals := -math.Round(math.Log10(step))
-	if decimals < 0 {
-		decimals = 0
-	}
-	factor := math.Pow(10, decimals)
-	return math.Floor(v*factor/math.Round(step*factor)) * math.Round(step*factor) / factor
 }
 
 func (b *BybitClient) ConnectStream(ctx context.Context, candleChan chan<- *types.Candle, orderChan chan<- *types.Order) error {
@@ -259,41 +248,77 @@ func mapBybitStatus(s bybit.OrderStatus) types.OrderStatus {
 	}
 }
 
+// bybitSpotOrderType translates the venue-neutral intent into Bybit's own
+// vocabulary. Bybit has only Market and Limit as order *types*; a trigger is
+// expressed by setting orderFilter=StopOrder and a triggerPrice alongside,
+// which is why the trigger is handled by the caller rather than folded in here.
+//
+// IntentTakeProfitLimit becomes a plain Limit for the same reason as on
+// Binance: the SDK's TAKE_PROFIT_LIMIT is a resting exit at Price, not a
+// trigger-based order.
+func bybitSpotOrderType(t IntentType) (bybit.OrderType, error) {
+	switch t {
+	case IntentMarket, IntentStopMarket:
+		return bybit.OrderTypeMarket, nil
+	case IntentLimit, IntentStopLimit, IntentTakeProfitLimit:
+		return bybit.OrderTypeLimit, nil
+	default:
+		return "", fmt.Errorf("bybit spot: no order type for intent %s", t)
+	}
+}
+
 func (b *BybitClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error) {
-	sym := strings.ToUpper(strings.ReplaceAll(req.Symbol, "/", ""))
+	intent, err := MapOrder(req, MarketSpot)
+	if err != nil {
+		return nil, fmt.Errorf("bybit spot: %w", err)
+	}
+	sym := intent.Symbol
+
+	filter := b.filters[sym]
+	if err := filter.Apply(intent, 0); err != nil {
+		return nil, fmt.Errorf("bybit spot %s: %w", sym, err)
+	}
+
+	orderType, err := bybitSpotOrderType(intent.Type)
+	if err != nil {
+		return nil, err
+	}
 
 	side := bybit.SideBuy
-	if req.Side == types.OrderSideSell {
+	if intent.Side == types.OrderSideSell {
 		side = bybit.SideSell
 	}
-
-	orderType := bybit.OrderTypeMarket
-	if req.Type == types.OrderTypeLimit {
-		orderType = bybit.OrderTypeLimit
-	}
-
-	price := req.Price
-	qty := req.Quantity
-	if info, ok := b.symbols[sym]; ok {
-		qty = roundToStep(qty, info.qtyStep)
-		if req.Type == types.OrderTypeLimit {
-			price = roundToStep(price, info.tickSize)
-		}
-	}
-
-	qtyStr := strconv.FormatFloat(qty, 'f', -1, 64)
 
 	param := bybit.V5CreateOrderParam{
 		Category:  bybit.CategoryV5Spot,
 		Symbol:    bybit.SymbolV5(sym),
 		Side:      side,
 		OrderType: orderType,
-		Qty:       qtyStr,
+		Qty:       filter.FormatQty(intent.Quantity),
 	}
 
-	if req.Type == types.OrderTypeLimit {
-		priceStr := strconv.FormatFloat(price, 'f', -1, 64)
+	if intent.Price > 0 {
+		priceStr := filter.FormatPrice(intent.Price)
 		param.Price = &priceStr
+	}
+
+	if intent.Type.Triggered() {
+		// A conditional order on spot is a StopOrder with a trigger price.
+		// Without orderFilter Bybit books it immediately, which is precisely
+		// the behaviour being fixed.
+		trigger := filter.FormatPrice(intent.StopPrice)
+		orderFilter := bybit.OrderFilterStopOrder
+		triggerBy := bybit.TriggerByLastPrice
+		// A SELL stop guards a long and triggers on the way down; a BUY stop
+		// guards a short and triggers on the way up. Bybit will not infer this.
+		direction := bybit.TriggerDirectionFall
+		if intent.Side == types.OrderSideBuy {
+			direction = bybit.TriggerDirectionRise
+		}
+		param.TriggerPrice = &trigger
+		param.OrderFilter = &orderFilter
+		param.TriggerBy = &triggerBy
+		param.TriggerDirection = &direction
 	}
 
 	res, err := b.client.V5().Order().CreateOrder(param)
@@ -310,6 +335,7 @@ func (b *BybitClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) (
 		Status:    types.OrderStatusNew,
 		Price:     req.Price,
 		Quantity:  req.Quantity,
+		StopPrice: intent.StopPrice,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}, nil
