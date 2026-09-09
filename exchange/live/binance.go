@@ -455,3 +455,102 @@ func (b *BinanceClient) GetHistoricalCandles(ctx context.Context, exchange, symb
 
 	return all, nil
 }
+
+// OrderFeed: Binance *spot* has no user data stream in this adapter — it
+// subscribes klines only. Until one exists, order updates are reconstructed by
+// the SDK's polling reconciler from ListOpenOrders and GetOrder below.
+//
+// This is the adapter the OrderFeed type was introduced for: SetOnOrderUpdate
+// worked on the backtest engine, on Bybit and on Binance futures, and silently
+// never fired here. Declaring the feed makes that a startup line instead of a
+// discovery.
+func (b *BinanceClient) OrderFeed() types.OrderFeed {
+	const interval = 3 * time.Second
+	return types.OrderFeed{Push: false, PollEvery: interval, Latency: interval}
+}
+
+// ListOpenOrders implements the read half of the SDK's polling order feed.
+func (b *BinanceClient) ListOpenOrders(ctx context.Context, exchange, symbol string) ([]*types.Order, error) {
+	res, err := b.client.NewListOpenOrdersService().Symbol(VenueSymbol(symbol)).Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*types.Order, 0, len(res))
+	for _, o := range res {
+		out = append(out, mapBinanceSpotOrder(o.OrderID, string(o.Side), string(o.Type), string(o.Status),
+			o.Price, o.OrigQuantity, o.ExecutedQuantity, o.StopPrice, symbol, o.UpdateTime))
+	}
+	return out, nil
+}
+
+// GetOrder resolves what became of one order.
+//
+// The open-orders list cannot distinguish a fill from a cancellation — both
+// simply leave it — so the reconciler asks here rather than assuming. Treating
+// a disappearance as a fill would report positions the account never held.
+func (b *BinanceClient) GetOrder(ctx context.Context, exchange, symbol, id string) (*types.Order, error) {
+	orderID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("binance GetOrder: invalid orderID %q: %w", id, err)
+	}
+	o, err := b.client.NewGetOrderService().Symbol(VenueSymbol(symbol)).OrderID(orderID).Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return mapBinanceSpotOrder(o.OrderID, string(o.Side), string(o.Type), string(o.Status),
+		o.Price, o.OrigQuantity, o.ExecutedQuantity, o.StopPrice, symbol, o.UpdateTime), nil
+}
+
+// mapBinanceSpotOrder converts a venue order record into the SDK shape, shared
+// by both reads above so they cannot drift apart.
+func mapBinanceSpotOrder(id int64, side, orderType, status, price, origQty, execQty, stopPrice, symbol string, updateMs int64) *types.Order {
+	s := types.OrderSideBuy
+	if strings.EqualFold(side, "SELL") {
+		s = types.OrderSideSell
+	}
+	return &types.Order{
+		ID:           strconv.FormatInt(id, 10),
+		Symbol:       symbol,
+		Exchange:     "binance",
+		Side:         s,
+		Type:         spotOrderTypeFromVenue(orderType),
+		Status:       spotStatusFromVenue(status),
+		Price:        parseFloat(price),
+		Quantity:     parseFloat(origQty),
+		FilledQty:    parseFloat(execQty),
+		AveragePrice: parseFloat(price),
+		StopPrice:    parseFloat(stopPrice),
+		UpdatedAt:    time.UnixMilli(updateMs),
+		CreatedAt:    time.UnixMilli(updateMs),
+	}
+}
+
+func spotOrderTypeFromVenue(t string) types.OrderType {
+	switch strings.ToUpper(t) {
+	case "LIMIT", "LIMIT_MAKER":
+		return types.OrderTypeLimit
+	case "STOP_LOSS":
+		return types.OrderTypeStopLoss
+	case "STOP_LOSS_LIMIT":
+		return types.OrderTypeStopLossLimit
+	case "TAKE_PROFIT_LIMIT":
+		return types.OrderTypeTakeProfitLimit
+	default:
+		return types.OrderTypeMarket
+	}
+}
+
+func spotStatusFromVenue(s string) types.OrderStatus {
+	switch strings.ToUpper(s) {
+	case "FILLED":
+		return types.OrderStatusFilled
+	case "PARTIALLY_FILLED":
+		return types.OrderStatusPartiallyFilled
+	case "CANCELED", "EXPIRED":
+		return types.OrderStatusCanceled
+	case "REJECTED":
+		return types.OrderStatusRejected
+	default:
+		return types.OrderStatusNew
+	}
+}

@@ -521,3 +521,8 @@ func (b *BybitClient) GetHistoricalCandles(ctx context.Context, exchange, symbol
 
 	return all, nil
 }
+
+// OrderFeed: Bybit pushes order updates over its private v5 stream.
+func (b *BybitClient) OrderFeed() types.OrderFeed {
+	return types.OrderFeed{Push: true, Latency: time.Second}
+}

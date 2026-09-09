@@ -224,7 +224,17 @@ func (f InstrumentFilter) Apply(intent *OrderIntent, refPrice float64) error {
 		return fmt.Errorf("quantity %v is below the instrument minimum %v", intent.Quantity, f.MinQty)
 	}
 
-	if f.MinNotional > 0 {
+	// A reduce-only order is exempt from the notional minimum here, and the
+	// venue is left to decide.
+	//
+	// The minimum exists to stop dust *positions* being opened. A reduce-only
+	// order cannot open one — it only shrinks what is already there — and a
+	// protective stop guarding a small position is legitimately small by
+	// definition. Enforcing the minimum locally would refuse to place that
+	// stop, leaving the position unprotected, which is far worse than letting
+	// Binance reject an order it would have rejected anyway. Refusing to
+	// protect a position is not a safe default.
+	if f.MinNotional > 0 && !intent.ReduceOnly {
 		price := intent.Price
 		if price <= 0 {
 			price = intent.StopPrice

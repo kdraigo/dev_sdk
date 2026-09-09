@@ -226,11 +226,19 @@ func (b *BinanceFuturesClient) assertAccountShape(ctx context.Context) error {
 			continue
 		}
 		if !strings.EqualFold(r.MarginType, "isolated") {
+			// A dry run must not change the account. Skipping the write keeps
+			// that promise, and saying so keeps the run honest about what a
+			// live one would additionally do.
+			if b.guard.DryRun() {
+				log.Printf("Binance futures DRY RUN: would switch %s from %s to isolated margin", r.Symbol, r.MarginType)
+				continue
+			}
 			// Switching margin type is only possible with no position and no
 			// open order on the symbol, so try it and report honestly if not.
 			if err := b.client.NewChangeMarginTypeService().
 				Symbol(r.Symbol).MarginType(futures.MarginTypeIsolated).Do(ctx); err != nil {
-				return fmt.Errorf("binance futures %s is in %s margin and could not be switched to isolated (%w); this SDK models isolated margin only", r.Symbol, r.MarginType, err)
+				return fmt.Errorf("binance futures %s: switching %s margin to isolated: %w",
+					r.Symbol, r.MarginType, explainPermissionError(err, "changeMarginType"))
 			}
 			log.Printf("Binance futures: %s switched from %s to isolated margin", r.Symbol, r.MarginType)
 		}
@@ -249,9 +257,14 @@ func (b *BinanceFuturesClient) applyConfiguredLeverage(ctx context.Context) erro
 	}
 	for pair, lev := range b.config.Live.Leverage {
 		sym := VenueSymbol(pair)
+		if b.guard.DryRun() {
+			log.Printf("Binance futures DRY RUN: would set %s leverage to %vx", sym, lev)
+			continue
+		}
 		if _, err := b.client.NewChangeLeverageService().
 			Symbol(sym).Leverage(int(lev)).Do(ctx); err != nil {
-			return fmt.Errorf("binance futures: setting %vx leverage on %s: %w", lev, sym, err)
+			return fmt.Errorf("binance futures: setting %vx leverage on %s: %w",
+				lev, sym, explainPermissionError(err, "changeLeverage"))
 		}
 		log.Printf("Binance futures: %s leverage set to %vx", sym, lev)
 	}
@@ -319,6 +332,16 @@ func (b *BinanceFuturesClient) place(ctx context.Context, req *types.OrderReques
 		Side(side).
 		Type(orderType).
 		Quantity(filter.FormatQty(intent.Quantity)).
+		// RESULT, not Binance's default ACK.
+		//
+		// ACK returns status=NEW with avgPrice=0 even for a market order that
+		// filled instantly, while the backtest engine returns the order
+		// FILLED with its price. A strategy branching on
+		// `order.Status == FILLED` would therefore work in backtest and
+		// silently never fire live — the same code reading two different
+		// truths. Measured on a mainnet round trip: ACK said NEW/0, Binance
+		// had recorded FILLED at 104.32.
+		NewOrderResponseType(futures.NewOrderRespTypeRESULT).
 		// One-way mode: BOTH is the only valid position side, and stating it
 		// makes a hedge-mode account fail loudly instead of opening a leg.
 		PositionSide(futures.PositionSideTypeBoth)
@@ -705,6 +728,31 @@ func (b *BinanceFuturesClient) forgetBracket(id string) {
 // honest signal is the rejection itself.
 var ErrConditionalOrdersUnavailable = errors.New("this Binance futures environment does not accept conditional (stop / take-profit) orders on /fapi/v1/order")
 
+// ErrFuturesPermissionDenied reports that the key reaches Binance but is not
+// allowed to act. It is separated from every other failure because the fix is
+// entirely different: nothing about the code, the account or the order is
+// wrong, and a message about margin modes or order types would send the reader
+// looking in the wrong place.
+var ErrFuturesPermissionDenied = errors.New("the API key can read Binance futures but not trade it")
+
+// binanceCodePermissionDenied is -2015. Binance returns it for a key without
+// the Futures permission, for an IP outside the key's allow-list, and for a
+// key that is simply wrong, so the text below names all three rather than
+// guessing which one applies.
+const binanceCodePermissionDenied = -2015
+
+// explainPermissionError turns -2015 into something actionable. Read endpoints
+// on /fapi need only "Enable Reading", so a key can list balances and positions
+// perfectly and still be refused on every write — which reads as a bug in the
+// caller until you know it is a checkbox.
+func explainPermissionError(err error, action string) error {
+	var apiErr *common.APIError
+	if errors.As(err, &apiErr) && apiErr.Code == binanceCodePermissionDenied {
+		return fmt.Errorf("%w: %s was refused with -2015. Read endpoints succeed because they need only \"Enable Reading\"; writes need \"Enable Futures\" on the API key. Check, in order: the key has Enable Futures ticked, this host's IP is in the key's allow-list, and the key belongs to the account holding the futures wallet", ErrFuturesPermissionDenied, action)
+	}
+	return err
+}
+
 // binanceCodeConditionalUnsupported is Binance's -4120, whose own message
 // ("Please use the Algo Order API endpoints instead") describes a TWAP/VP
 // service that does not place protective stops.
@@ -714,6 +762,9 @@ const binanceCodeConditionalUnsupported = -4120
 // wrong direction with one that says what actually happened.
 func explainOrderError(err error, intent *OrderIntent) error {
 	var apiErr *common.APIError
+	if errors.As(err, &apiErr) && apiErr.Code == binanceCodePermissionDenied {
+		return explainPermissionError(err, "placing an order")
+	}
 	if errors.As(err, &apiErr) && apiErr.Code == binanceCodeConditionalUnsupported && intent.Type.Triggered() {
 		return fmt.Errorf("%w (venue said: %s). The order was NOT placed and was NOT converted to a market order: a protective stop that executes immediately is worse than one that fails loudly", ErrConditionalOrdersUnavailable, apiErr.Message)
 	}
@@ -759,5 +810,78 @@ func sdkOrderType(t string, hasStop bool) types.OrderType {
 			return types.OrderTypeStopLoss
 		}
 		return types.OrderTypeMarket
+	}
+}
+
+// OrderFeed: Binance futures pushes order updates over the user data stream,
+// so fills, stop triggers and liquidations arrive unprompted in about a
+// second.
+//
+// PollEvery is nevertheless set, as a slow safety net rather than the primary
+// feed. A websocket that drops takes its undelivered events with it: an order
+// that filled during the gap is simply never mentioned again, and the strategy
+// waits forever for a fill that already happened. The push path cannot detect
+// its own silence, so something has to ask. Dedup in the SDK's reconciler
+// means the two sources cost nothing when they agree, which is almost always.
+func (b *BinanceFuturesClient) OrderFeed() types.OrderFeed {
+	return types.OrderFeed{Push: true, PollEvery: 30 * time.Second, Latency: time.Second}
+}
+
+// ListOpenOrders implements the read half of the SDK's order reconciliation.
+func (b *BinanceFuturesClient) ListOpenOrders(ctx context.Context, exchange, symbol string) ([]*types.Order, error) {
+	res, err := b.client.NewListOpenOrdersService().Symbol(VenueSymbol(symbol)).Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*types.Order, 0, len(res))
+	for _, o := range res {
+		out = append(out, mapFuturesOrder(o, symbol))
+	}
+	return out, nil
+}
+
+// GetOrder resolves what became of one order.
+//
+// An order missing from the open list is FILLED or CANCELED, and the list
+// cannot say which. Assuming a fill would report a position the account does
+// not hold; assuming a cancel would hide one it does.
+func (b *BinanceFuturesClient) GetOrder(ctx context.Context, exchange, symbol, id string) (*types.Order, error) {
+	orderID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("binance futures GetOrder: invalid orderID %q: %w", id, err)
+	}
+	o, err := b.client.NewGetOrderService().Symbol(VenueSymbol(symbol)).OrderID(orderID).Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return mapFuturesOrder(o, symbol), nil
+}
+
+// mapFuturesOrder converts a venue order record into the SDK shape. Shared by
+// both reads so they cannot drift apart.
+func mapFuturesOrder(o *futures.Order, symbol string) *types.Order {
+	side := types.OrderSideBuy
+	if o.Side == futures.SideTypeSell {
+		side = types.OrderSideSell
+	}
+	declared := string(o.OrigType)
+	if declared == "" {
+		declared = string(o.Type)
+	}
+	stop := parseFloat(o.StopPrice)
+	return &types.Order{
+		ID:           strconv.FormatInt(o.OrderID, 10),
+		Symbol:       symbol,
+		Exchange:     types.ExchangeBinanceFutures,
+		Side:         side,
+		Type:         sdkOrderType(declared, stop > 0),
+		Status:       mapFuturesStatus(o.Status),
+		Price:        parseFloat(o.Price),
+		Quantity:     parseFloat(o.OrigQuantity),
+		FilledQty:    parseFloat(o.ExecutedQuantity),
+		AveragePrice: parseFloat(o.AvgPrice),
+		StopPrice:    stop,
+		CreatedAt:    time.UnixMilli(o.Time),
+		UpdatedAt:    time.UnixMilli(o.UpdateTime),
 	}
 }

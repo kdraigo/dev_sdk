@@ -66,3 +66,54 @@ type PositionReader interface {
 	// futures wallet when exchange is empty.
 	GetPositions(ctx context.Context, exchange string) ([]*types.Position, error)
 }
+
+// OrderFeedDescriber is an optional capability: an adapter that states how it
+// delivers order updates.
+//
+// Separate from Adapter for the same reason as BracketPlacer — widening that
+// interface would break every adapter at once — and optional so an adapter
+// that has not been audited yet is reported as unknown rather than assumed
+// working. Silence is the failure being designed out, so an adapter that says
+// nothing must not read as an adapter that says "fine".
+type OrderFeedDescriber interface {
+	OrderFeed() types.OrderFeed
+}
+
+// OrderStateReader is what a polling fallback needs from an adapter that
+// cannot push. An adapter providing these two reads earns an order feed for
+// free: the SDK supplies the reconciler.
+//
+// GetOrder is not redundant with ListOpenOrders. An order that has vanished
+// from the open list is either FILLED or CANCELED and the open list cannot say
+// which — resolving that ambiguity requires asking about the order itself.
+// Treating disappearance as a fill would invent positions the account does not
+// hold.
+type OrderStateReader interface {
+	ListOpenOrders(ctx context.Context, exchange, symbol string) ([]*types.Order, error)
+	GetOrder(ctx context.Context, exchange, symbol, id string) (*types.Order, error)
+}
+
+// resolveOrderFeed reports how the given adapter delivers order updates,
+// falling back to the polling reconciler when the adapter cannot push but can
+// be asked.
+func resolveOrderFeed(adapter Adapter) types.OrderFeed {
+	var feed types.OrderFeed
+	if d, ok := adapter.(OrderFeedDescriber); ok {
+		feed = d.OrderFeed()
+	}
+	if !feed.Push && feed.PollEvery == 0 {
+		if _, ok := adapter.(OrderStateReader); ok {
+			// The adapter never declared a feed but can answer questions, so
+			// the SDK can build one. Conservative default: slow enough not to
+			// spend the venue's rate limit, fast enough to be useful.
+			feed.PollEvery = defaultOrderPollInterval
+			feed.Latency = defaultOrderPollInterval
+		}
+	}
+	return feed
+}
+
+// defaultOrderPollInterval is the fallback cadence for an adapter that can be
+// polled but did not say how often. Order polling competes with order
+// placement for the venue's rate limit, so this errs slow.
+const defaultOrderPollInterval = 3 * time.Second

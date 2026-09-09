@@ -279,3 +279,22 @@ func TestFloorAndNearest_NoDriftAcrossASweep(t *testing.T) {
 		assert.False(t, math.IsNaN(got))
 	}
 }
+
+// TestInstrumentFilter_ReduceOnlyIsExemptFromMinNotional
+//
+// Found by the first mainnet dry run: a reduce-only protective stop on a small
+// position was refused locally for being below the instrument's 5 USDT
+// minimum. The minimum exists to stop dust positions being *opened*; a
+// reduce-only order can only shrink one. Refusing it leaves the position with
+// no stop at all, which is the outcome the stop existed to prevent.
+func TestInstrumentFilter_ReduceOnlyIsExemptFromMinNotional(t *testing.T) {
+	f := InstrumentFilter{StepSize: 0.01, TickSize: 0.01, MinNotional: 5}
+
+	entry := &OrderIntent{Type: IntentMarket, Quantity: 0.02}
+	require.Error(t, f.Apply(entry, 100), "an opening order under the minimum is still refused")
+
+	stop := &OrderIntent{Type: IntentStopMarket, Quantity: 0.02, StopPrice: 95, ReduceOnly: true}
+	require.NoError(t, f.Apply(stop, 100),
+		"a reduce-only stop guarding a small position must reach the venue")
+	assert.InDelta(t, 95.0, stop.StopPrice, 1e-9, "and keep its trigger")
+}

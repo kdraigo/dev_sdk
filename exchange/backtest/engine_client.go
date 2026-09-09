@@ -1249,3 +1249,11 @@ func (e *EngineClient) futuresExchanges() []string {
 
 	return out
 }
+
+// OrderFeed: the engine pushes order events over the session websocket, in
+// lockstep with the simulated clock. Latency is zero because there is no wall
+// clock involved — the event is delivered before the next bar is requested,
+// which is what makes a backtest reproducible.
+func (e *EngineClient) OrderFeed() types.OrderFeed {
+	return types.OrderFeed{Push: true}
+}

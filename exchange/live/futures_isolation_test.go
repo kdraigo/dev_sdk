@@ -290,3 +290,54 @@ func TestFuturesAdapterRefusesForeignEnvironments(t *testing.T) {
 		assert.Contains(t, err.Error(), "cannot run environment")
 	}
 }
+
+// TestExplainPermissionError_2015 guards the message, not the mechanism.
+//
+// A -2015 arriving from changeMarginType used to be reported as "SOLUSDT is in
+// cross margin and could not be switched to isolated", which names the wrong
+// problem: the margin mode is incidental, the key simply is not allowed to
+// write. That sends the reader to the Binance margin settings instead of to
+// the API-key permission checkbox that actually fixes it.
+func TestExplainPermissionError_2015(t *testing.T) {
+	err := explainPermissionError(&common.APIError{
+		Code:    -2015,
+		Message: "Invalid API-key, IP, or permissions for action",
+	}, "changeMarginType")
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrFuturesPermissionDenied),
+		"callers must be able to test for it rather than string-match")
+	assert.Contains(t, err.Error(), "Enable Futures",
+		"the message must name the fix")
+	assert.Contains(t, err.Error(), "changeMarginType",
+		"and the action that was refused")
+}
+
+// TestExplainPermissionError_PassesOthersThrough: only -2015 is reinterpreted.
+func TestExplainPermissionError_PassesOthersThrough(t *testing.T) {
+	orig := &common.APIError{Code: -1121, Message: "Invalid symbol"}
+	got := explainPermissionError(orig, "placing an order")
+	assert.Equal(t, error(orig), got)
+	assert.False(t, errors.Is(got, ErrFuturesPermissionDenied))
+}
+
+// TestDryRunPerformsNoAccountWrites: a dry run's whole promise is that the
+// account is untouched. Changing margin mode or leverage is a write like any
+// other, and doing it "just to set up" would break that promise silently.
+func TestDryRunPerformsNoAccountWrites(t *testing.T) {
+	raw, err := os.ReadFile("binance_futures.go")
+	require.NoError(t, err)
+	src := string(raw)
+
+	for _, write := range []string{"NewChangeMarginTypeService", "NewChangeLeverageService"} {
+		idx := strings.Index(src, write)
+		require.Greater(t, idx, 0, "%s should still be called somewhere", write)
+
+		// The guard must appear in the same function, above the call.
+		before := src[:idx]
+		fnStart := strings.LastIndex(before, "\nfunc ")
+		require.Greater(t, fnStart, 0)
+		assert.Contains(t, before[fnStart:], "b.guard.DryRun()",
+			"%s must be skipped under DryRun", write)
+	}
+}

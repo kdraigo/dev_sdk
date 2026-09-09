@@ -254,3 +254,51 @@ type OnCandleFunc func(ctx *Context, candle *Candle)
 
 // OnOrderUpdateFunc is invoked whenever a placed order changes its processing state.
 type OnOrderUpdateFunc func(ctx *Context, order *Order)
+
+// OrderFeed describes how an adapter delivers order state transitions to
+// orderChan, and therefore to SetOnOrderUpdate.
+//
+// It exists because the Adapter contract hands every adapter an orderChan
+// without saying whether anything will ever come out of it. Three of the four
+// adapters push order updates; Binance spot only ever streamed klines, so
+// SetOnOrderUpdate was silently dead there while working everywhere else. The
+// same strategy, no error, no warning.
+//
+// Declaring the feed turns that from a discovery into a startup log line.
+type OrderFeed struct {
+	// Push is true when the venue itself notifies. Fills arrive in
+	// milliseconds and nothing needs to ask.
+	Push bool
+
+	// PollEvery is how often the SDK should ask the venue for order state
+	// when it will not push. Zero means no polling fallback is available, and
+	// an adapter with Push false and PollEvery zero delivers nothing at all —
+	// which the SDK warns about rather than leaving to be found in production.
+	PollEvery time.Duration
+
+	// Latency is the worst-case delay between something happening at the
+	// venue and the strategy hearing about it.
+	//
+	// Deliberately part of the public description rather than hidden. A
+	// three-second polled feed really is different from a fifty-millisecond
+	// pushed one, and papering over that would create exactly the kind of
+	// silent backtest-to-live divergence this type was introduced to end.
+	Latency time.Duration
+}
+
+// Delivers reports whether the feed produces order updates by any means.
+func (f OrderFeed) Delivers() bool { return f.Push || f.PollEvery > 0 }
+
+// Describe renders the feed for a startup log line.
+func (f OrderFeed) Describe() string {
+	switch {
+	case f.Push && f.PollEvery > 0:
+		return "pushed by the venue, reconciled every " + f.PollEvery.String()
+	case f.Push:
+		return "pushed by the venue (latency ~" + f.Latency.String() + ")"
+	case f.PollEvery > 0:
+		return "polled every " + f.PollEvery.String() + " (latency ~" + f.Latency.String() + ")"
+	default:
+		return "NONE — order updates will not be delivered"
+	}
+}
