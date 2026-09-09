@@ -2,6 +2,7 @@ package dev_sdk
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -162,4 +163,41 @@ func TestOrderFeed_PushedAdaptersAlsoGetASafetyNet(t *testing.T) {
 	assert.True(t, askable, "and the adapter must be answerable for the poll to work")
 
 	assert.Contains(t, feed.Describe(), "reconciled every")
+}
+
+// TestIsRateLimited recognises a venue telling us to stop asking.
+func TestIsRateLimited(t *testing.T) {
+	for _, msg := range []string{
+		"<APIError> code=-1003, msg=Way too many requests; IP(1.2.3.4) banned until 1788959337018",
+		"rate limit exceeded",
+		"HTTP 429 Too Many Requests",
+	} {
+		assert.True(t, isRateLimited(errors.New(msg)), msg)
+	}
+	assert.False(t, isRateLimited(errors.New("connection refused")))
+	assert.False(t, isRateLimited(nil))
+}
+
+// TestPollBackoff_RetreatsAndCaps: the loop used to retry on the same cadence
+// forever, which extends an IP ban rather than waiting it out.
+func TestPollBackoff_RetreatsAndCaps(t *testing.T) {
+	d := 2 * time.Second
+	seen := []time.Duration{}
+	for i := 0; i < 8; i++ {
+		d = nextPollBackoff(d)
+		seen = append(seen, d)
+	}
+	assert.Greater(t, seen[1], seen[0], "backoff must actually retreat")
+	assert.Equal(t, maxPollBackoff, seen[len(seen)-1], "and settle at the cap")
+	for _, d := range seen {
+		assert.LessOrEqual(t, d, maxPollBackoff)
+	}
+}
+
+// TestFuturesPollIsSlowerThanTheBanThreshold pins the lesson from the run that
+// got the IP banned: a pushed feed's safety net must be slow.
+func TestFuturesPollIsSlowerThanTheBanThreshold(t *testing.T) {
+	feed := resolveOrderFeed(live.NewBinanceFuturesClient(&types.Config{}))
+	assert.GreaterOrEqual(t, feed.PollEvery, time.Minute,
+		"a 30s safety-net poll earned 30 consecutive -1003 IP bans in one session")
 }

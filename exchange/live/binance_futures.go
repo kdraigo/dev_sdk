@@ -824,7 +824,12 @@ func sdkOrderType(t string, hasStop bool) types.OrderType {
 // its own silence, so something has to ask. Dedup in the SDK's reconciler
 // means the two sources cost nothing when they agree, which is almost always.
 func (b *BinanceFuturesClient) OrderFeed() types.OrderFeed {
-	return types.OrderFeed{Push: true, PollEvery: 30 * time.Second, Latency: time.Second}
+	// Two minutes, not thirty seconds. The first attempt polled every 30s
+	// unconditionally and Binance answered with -1003 and an IP ban, thirty
+	// times in one 32-minute session — its error text says outright to use the
+	// websocket instead. The SDK now also skips the request entirely when
+	// nothing is outstanding, so on a quiet session this costs nothing at all.
+	return types.OrderFeed{Push: true, PollEvery: 2 * time.Minute, Latency: time.Second}
 }
 
 // ListOpenOrders implements the read half of the SDK's order reconciliation.

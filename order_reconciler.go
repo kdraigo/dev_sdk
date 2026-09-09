@@ -2,7 +2,9 @@ package dev_sdk
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -120,20 +122,75 @@ func (s *SDK) pollOrderState(ctx context.Context, reader OrderStateReader) {
 	}
 	log.Printf("DevSDK: polling order state every %s (%v)", interval, symbols)
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
+	// The interval adapts. A venue that answers happily is polled at the
+	// configured cadence; one that is rate-limiting is backed away from, hard.
+	delay := interval
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			s.pollOnce(ctx, reader, exchanges, symbols)
+		case <-time.After(delay):
+		}
+
+		switch err := s.pollOnce(ctx, reader, exchanges, symbols); {
+		case err == nil:
+			delay = interval
+		case isRateLimited(err):
+			// Binance answers a rate-limit breach with an IP ban and says, in
+			// the error itself, to use the websocket instead. Retrying on the
+			// same cadence — which this loop used to do, forever — extends the
+			// ban and fills the log with nothing useful. Measured: 30
+			// consecutive bans in one 32-minute session.
+			delay = nextPollBackoff(delay)
+			log.Printf("DevSDK: order polling rate-limited, backing off to %s: %v", delay, err)
+		default:
+			delay = nextPollBackoff(delay)
+			log.Printf("DevSDK: order polling failed, retrying in %s: %v", delay, err)
 		}
 	}
 }
 
-func (s *SDK) pollOnce(ctx context.Context, reader OrderStateReader, exchanges, symbols []string) {
+// maxPollBackoff caps the retreat. Beyond a few minutes the poll has stopped
+// being a safety net and the push stream is the only feed, which is what the
+// venue is asking for anyway.
+const maxPollBackoff = 5 * time.Minute
+
+func nextPollBackoff(d time.Duration) time.Duration {
+	d *= 4
+	if d > maxPollBackoff {
+		return maxPollBackoff
+	}
+	return d
+}
+
+// isRateLimited recognises a venue telling us to stop asking. Matched on the
+// message rather than a typed code so it holds across venues, since being
+// banned costs the same whoever issued it.
+func isRateLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "-1003") ||
+		strings.Contains(msg, "banned until") ||
+		strings.Contains(msg, "429")
+}
+
+func (s *SDK) pollOnce(ctx context.Context, reader OrderStateReader, exchanges, symbols []string) error {
+	// When the venue pushes and the strategy has nothing outstanding, there is
+	// nothing for a poll to discover: any new order will announce itself on the
+	// stream. Asking anyway is a request per interval per symbol spent on
+	// confirming that nothing is happening, and it is what earns a rate-limit
+	// ban on a quiet session.
+	//
+	// A venue that cannot push is different — there the poll *is* the feed and
+	// must run regardless.
+	if s.orderFeed.Push && len(s.reconciler.openIDs()) == 0 {
+		return nil
+	}
+
 	// Everything currently on the book. Anything the strategy believed was
 	// live and is missing here has reached a terminal state — but the open
 	// list cannot say which one.
@@ -143,8 +200,7 @@ func (s *SDK) pollOnce(ctx context.Context, reader OrderStateReader, exchanges, 
 		for _, sym := range symbols {
 			open, err := reader.ListOpenOrders(ctx, exch, sym)
 			if err != nil {
-				log.Printf("DevSDK: order poll %s %s failed: %v", exch, sym, err)
-				return
+				return fmt.Errorf("%s %s: %w", exch, sym, err)
 			}
 			for _, o := range open {
 				if o == nil {
@@ -188,6 +244,7 @@ func (s *SDK) pollOnce(ctx context.Context, reader OrderStateReader, exchanges, 
 			log.Printf("DevSDK: order %s left the open book but its final state could not be read; not guessing", id)
 		}
 	}
+	return nil
 }
 
 // emitOrder hands a transition to the same channel the push path feeds.
