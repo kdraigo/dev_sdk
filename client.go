@@ -45,6 +45,14 @@ type SDK struct {
 
 	publisher telemetry.Publisher
 
+	// orderFeed records how this adapter delivers order updates, resolved once
+	// at Start and reported to the strategy through OrderFeed().
+	orderFeed types.OrderFeed
+
+	// reconciler dedups order transitions so that push, poll and post-gap
+	// resync can all be live at once without delivering a fill twice.
+	reconciler *orderReconciler
+
 	// clock is the strategy-facing time source. wallClock in live mode,
 	// backtestClock in backtest mode. Backtest clock advances on every
 	// dispatched closed candle (only path that mutates it).
@@ -120,6 +128,7 @@ func New(cfg *types.Config) (*SDK, error) {
 		orderChan:     make(chan *types.Order, 100),
 		publisher:     pub,
 		clock:         clock,
+		reconciler:    newOrderReconciler(),
 	}, nil
 }
 
@@ -248,7 +257,18 @@ func (s *SDK) Start(ctx context.Context) error {
 					s.dispatchCandle(sdkCtx, tf, closed)
 				}
 			}
-			syncChan <- true
+			// Signal the tick loop — but only in backtest, where it exists.
+			//
+			// syncChan is buffered at 1 and its sole reader is the backtest
+			// ticking loop below. In live mode nothing drains it, so the
+			// second send blocked this goroutine forever: a live session
+			// dispatched exactly two candles and then went permanently deaf,
+			// with the websockets still connected and no error anywhere.
+			// Observed on a live futures session — candles=2 for the whole run
+			// while the venue kept sending.
+			if s.config.Environment == types.EnvBacktest {
+				syncChan <- true
+			}
 		}
 		close(syncChan)
 	}()
@@ -258,6 +278,13 @@ func (s *SDK) Start(ctx context.Context) error {
 		for {
 			select {
 			case order := <-s.orderChan:
+				// Push and poll can both be live during a reconnect, and the
+				// backtest engine replays nothing, so dedup happens here for
+				// every source rather than in each adapter. A transition the
+				// strategy has already been told about is dropped.
+				if !s.reconciler.observe(order) {
+					continue
+				}
 				// Order updates from the exchange/engine stream carry no
 				// strategy-supplied reason — that lives on the original
 				// PlaceOrder call.
@@ -284,9 +311,37 @@ func (s *SDK) Start(ctx context.Context) error {
 	// But wait, we need the connection to be up.
 	// The adapter should handle this by ensuring its internal state is ready.
 
+	// Announce how order updates will reach the strategy, before any arrive.
+	//
+	// A strategy branching on SetOnOrderUpdate behaves completely differently
+	// depending on whether the venue pushes fills, and the previous behaviour
+	// was to find that out in production — Binance spot delivered nothing at
+	// all while three other adapters delivered everything.
+	s.orderFeed = resolveOrderFeed(s.adapter)
+	log.Printf("DevSDK: order updates: %s", s.orderFeed.Describe())
+	if !s.orderFeed.Delivers() {
+		log.Printf("DevSDK: WARNING — this adapter delivers no order updates. " +
+			"SetOnOrderUpdate will never fire, so a strategy that waits for a fill will wait forever. " +
+			"Poll GetPositions/GetAccount instead, or use an adapter with an order feed.")
+	}
+
 	// 5. Command the exchange Adapter to begin pumping data into `rawCandleChan` & `orderChan` natives.
 	if err := s.adapter.ConnectStream(ctx, s.rawCandleChan, s.orderChan); err != nil {
 		return fmt.Errorf("failed to connect stream: %w", err)
+	}
+
+	// When the venue cannot push, the SDK reconstructs the same transitions by
+	// asking. The strategy sees one contract either way; only the latency
+	// declared above differs.
+	// Polling runs whenever the feed asks for it. For a venue that cannot push
+	// it is the feed; for one that can, it is the safety net that notices a
+	// websocket which stopped delivering without saying so.
+	if s.orderFeed.PollEvery > 0 {
+		if reader, ok := s.adapter.(OrderStateReader); ok {
+			go s.pollOrderState(cctx, reader)
+		} else if !s.orderFeed.Push {
+			log.Printf("DevSDK: WARNING — this adapter asks to be polled but provides no OrderStateReader; no order updates will be delivered")
+		}
 	}
 
 	// Allow WS connection to fully establish before the handshake.
@@ -474,6 +529,9 @@ func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.O
 	if err == nil && order != nil {
 		s.ordersPlaced.Add(1)
 		s.lastOrderID.Store(order.ID)
+		// Seed the belief from the acknowledgement so the first poll does not
+		// report back as news what PlaceOrder just returned.
+		s.reconciler.track(order)
 		if s.publisher != nil {
 			s.publisher.PublishOrder(order, reason, logs)
 		}
