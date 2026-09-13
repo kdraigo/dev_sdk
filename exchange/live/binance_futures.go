@@ -47,6 +47,25 @@ type BinanceFuturesClient struct {
 	// way the backtest engine does, so the adapter does it.
 	brackets map[string]string
 
+	// algos maps a clientAlgoId we generated onto what the strategy asked for,
+	// so the ordinary order Binance creates when a conditional fires can be
+	// reported as the stop it actually was. Keyed by client id because that is
+	// the only thing the triggered order carries back.
+	algos map[string]algoRef
+
+	// declared remembers the SDK order type behind an ordinary order id.
+	//
+	// TAKE_PROFIT_LIMIT goes out as a plain LIMIT — the SDK's version is a
+	// resting exit at a price, not a trigger — so the venue reports it back as
+	// LIMIT and the same order ends up with two names depending on which path
+	// described it. An order log that disagrees with itself is what makes a
+	// live incident hard to reconstruct.
+	declared map[string]types.OrderType
+
+	// orderOut is the SDK's order channel, held from ConnectStream so that a
+	// conditional placement can announce itself. See emitSynthetic.
+	orderOut chan<- *types.Order
+
 	stopOnce sync.Once
 	stopped  chan struct{}
 }
@@ -67,6 +86,8 @@ func NewBinanceFuturesClient(cfg *types.Config) *BinanceFuturesClient {
 		filters:  make(map[string]InstrumentFilter),
 		marks:    make(map[string]float64),
 		brackets: make(map[string]string),
+		algos:    make(map[string]algoRef),
+		declared: make(map[string]types.OrderType),
 		stopped:  make(chan struct{}),
 	}
 }
@@ -273,25 +294,21 @@ func (b *BinanceFuturesClient) applyConfiguredLeverage(ctx context.Context) erro
 
 // ── orders ───────────────────────────────────────────────────────────────────
 
-// binanceFuturesOrderType translates a venue-neutral intent into Binance
-// futures' vocabulary.
+// binanceFuturesOrderType translates a venue-neutral intent into the ordinary
+// order book's vocabulary.
 //
-// go-binance declares only LIMIT, MARKET and LIQUIDATION as OrderType
-// constants, which does not mean the venue lacks the rest: CreateOrderService
-// passes the type through unvalidated, so the string literals below are the
-// correct and only way to reach STOP_MARKET and friends. Concluding otherwise
-// and falling back to MARKET is exactly the defect this file was written to
-// avoid repeating.
+// Conditional intents are deliberately absent. They used to be sent here as
+// "STOP_MARKET" and "STOP" and the venue now rejects both with -4120, naming
+// the algo endpoint in its own error text. Returning them again would restore
+// that failure silently, so this refuses and says where they belong.
 func binanceFuturesOrderType(t IntentType) (futures.OrderType, error) {
 	switch t {
 	case IntentMarket:
 		return futures.OrderTypeMarket, nil
 	case IntentLimit, IntentTakeProfitLimit:
 		return futures.OrderTypeLimit, nil
-	case IntentStopMarket:
-		return futures.OrderType("STOP_MARKET"), nil
-	case IntentStopLimit:
-		return futures.OrderType("STOP"), nil
+	case IntentStopMarket, IntentStopLimit:
+		return "", fmt.Errorf("binance futures: %s is a conditional order and belongs on /fapi/v1/algoOrder, not /fapi/v1/order (the venue rejects it there with -4120)", t)
 	default:
 		return "", fmt.Errorf("binance futures: no order type for intent %s", t)
 	}
@@ -315,6 +332,12 @@ func (b *BinanceFuturesClient) place(ctx context.Context, req *types.OrderReques
 	}
 	if err := b.guard.CheckOrder(intent, b.markFor(sym)); err != nil {
 		return nil, err
+	}
+
+	// The gates, the rounding and the dry-run check are shared above so that
+	// neither book can be reached without passing them.
+	if intent.Type.Triggered() {
+		return b.placeConditional(ctx, req, intent, filter, groupID)
 	}
 
 	orderType, err := binanceFuturesOrderType(intent.Type)
@@ -375,6 +398,10 @@ func (b *BinanceFuturesClient) place(ctx context.Context, req *types.OrderReques
 		return nil, fmt.Errorf("binance futures %s %s %s: %w", sym, intent.Side, intent.Type, explainOrderError(err, intent))
 	}
 
+	// Remember what the strategy called it, so the stream can describe the
+	// same order the same way.
+	b.rememberDeclared(strconv.FormatInt(res.OrderID, 10), req.Type)
+
 	order := &types.Order{
 		ID:       strconv.FormatInt(res.OrderID, 10),
 		Symbol:   req.Symbol,
@@ -393,6 +420,84 @@ func (b *BinanceFuturesClient) place(ctx context.Context, req *types.OrderReques
 		CreatedAt:    time.UnixMilli(res.UpdateTime),
 		UpdatedAt:    time.UnixMilli(res.UpdateTime),
 	}
+	return order, nil
+}
+
+// placeConditional sends a stop through /fapi/v1/algoOrder.
+//
+// Semantics are kept identical to the ordinary path — reduce-only, one-way
+// BOTH, and the mark price as the trigger series — so that moving endpoints
+// does not quietly change what a stop means. WorkingType matters most: the
+// backtest engine triggers and liquidates on the mark, and the mark and trade
+// series diverge by up to 1.3% at the bar low, so triggering on the contract
+// price here would make live and backtest genuinely disagree about when a stop
+// fires.
+func (b *BinanceFuturesClient) placeConditional(ctx context.Context, req *types.OrderRequest, intent *OrderIntent, filter InstrumentFilter, groupID string) (*types.Order, error) {
+	sym := intent.Symbol
+	algoType, err := binanceAlgoOrderType(intent.Type)
+	if err != nil {
+		return nil, err
+	}
+
+	side := futures.SideTypeBuy
+	if intent.Side == types.OrderSideSell {
+		side = futures.SideTypeSell
+	}
+
+	clientAlgoID := newClientAlgoID()
+
+	srv := b.client.NewCreateAlgoOrderService().
+		AlgoType(futures.OrderAlgoTypeConditional).
+		Type(algoType).
+		Symbol(sym).
+		Side(side).
+		Quantity(filter.FormatQty(intent.Quantity)).
+		TriggerPrice(filter.FormatPrice(intent.StopPrice)).
+		WorkingType(futures.WorkingTypeMarkPrice).
+		PositionSide(futures.PositionSideTypeBoth).
+		ClientAlgoId(clientAlgoID)
+
+	if intent.Type == IntentStopLimit {
+		srv = srv.Price(filter.FormatPrice(intent.Price)).
+			TimeInForce(futures.TimeInForceTypeGTC)
+	}
+	if intent.ReduceOnly {
+		srv = srv.ReduceOnly(true)
+	}
+
+	if b.guard.DryRun() {
+		return b.dryRunAck(req, intent, groupID), nil
+	}
+
+	res, err := srv.Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("binance futures %s %s %s (algo): %w", sym, intent.Side, intent.Type, explainOrderError(err, intent))
+	}
+
+	// Remember what was asked for before returning: the triggered order
+	// carries this client id and nothing else that identifies it as a stop.
+	b.trackAlgo(clientAlgoID, algoRef{
+		algoID:    res.AlgoId,
+		declared:  req.Type,
+		stopPrice: intent.StopPrice,
+		groupID:   groupID,
+	})
+
+	order := &types.Order{
+		ID:        algoOrderID(res.AlgoId),
+		Symbol:    req.Symbol,
+		Exchange:  types.ExchangeBinanceFutures,
+		Side:      req.Side,
+		Type:      req.Type,
+		Status:    mapAlgoStatus(string(res.AlgoStatus), ""),
+		Price:     parseFloat(res.Price),
+		Quantity:  parseFloat(res.Quantity),
+		StopPrice: parseFloat(res.TriggerPrice),
+		GroupID:   groupID,
+		CreatedAt: time.UnixMilli(res.CreateTime),
+		UpdatedAt: time.UnixMilli(res.UpdateTime),
+	}
+	b.emitSynthetic(order)
 	return order, nil
 }
 
@@ -425,14 +530,25 @@ func (b *BinanceFuturesClient) CancelOrder(ctx context.Context, exchange, symbol
 		log.Printf("Binance futures DRY RUN: cancel %s on %s", id, symbol)
 		return nil
 	}
-	orderID, err := strconv.ParseInt(id, 10, 64)
+	venueID, isAlgo, err := parseVenueOrderID(id)
 	if err != nil {
-		return fmt.Errorf("binance futures CancelOrder: invalid orderID %q: %w", id, err)
+		return fmt.Errorf("binance futures CancelOrder: %w", err)
 	}
-	_, err = b.client.NewCancelOrderService().
-		Symbol(VenueSymbol(symbol)).OrderID(orderID).Do(ctx)
-	if err != nil {
-		return err
+
+	// Routing on the id is not a nicety. Cancelling an algo order through the
+	// ordinary endpoint does not error usefully, and a cancel that appears to
+	// succeed while a protective stop stays live is the worst failure this
+	// adapter can produce.
+	if isAlgo {
+		if _, err := b.client.NewCancelAlgoOrderService().AlgoID(venueID).Do(ctx); err != nil {
+			return err
+		}
+		b.forgetAlgoByID(venueID)
+	} else {
+		if _, err := b.client.NewCancelOrderService().
+			Symbol(VenueSymbol(symbol)).OrderID(venueID).Do(ctx); err != nil {
+			return err
+		}
 	}
 	b.forgetBracket(id)
 	return nil
@@ -694,6 +810,178 @@ func (b *BinanceFuturesClient) GetHistoricalCandles(ctx context.Context, exchang
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+// ── conditional orders ───────────────────────────────────────────────────────
+//
+// Binance no longer accepts stop or take-profit types on /fapi/v1/order: it
+// answers -4120, "Order type not supported for this endpoint. Please use the
+// Algo Order API endpoints instead." Verified directly, on mainnet and
+// testnet, with both signing schemes, and with a bare request carrying nothing
+// but symbol/side/type/quantity/stopPrice — while a plain LIMIT on the same
+// endpoint, same second, same key, rested fine. So conditional orders live on
+// /fapi/v1/algoOrder, and that is a separate book with a separate ID space.
+
+// algoIDPrefix marks an id as belonging to the algo book rather than the
+// ordinary one. Both are int64 and could collide, and an id that silently
+// routes to the wrong endpoint fails in the worst possible way: a cancel that
+// reports success while a protective stop stays live.
+const algoIDPrefix = "algo:"
+
+func algoOrderID(id int64) string { return algoIDPrefix + strconv.FormatInt(id, 10) }
+
+// parseVenueOrderID splits an SDK order id back into a venue id and the book
+// that owns it.
+func parseVenueOrderID(id string) (raw int64, isAlgo bool, err error) {
+	trimmed := id
+	if strings.HasPrefix(id, algoIDPrefix) {
+		trimmed, isAlgo = id[len(algoIDPrefix):], true
+	}
+	raw, err = strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return 0, isAlgo, fmt.Errorf("invalid order id %q: %w", id, err)
+	}
+	return raw, isAlgo, nil
+}
+
+// algoRef remembers what the strategy actually asked for, keyed by the
+// clientAlgoId we generate.
+//
+// When a conditional order fires, Binance creates an ordinary order and — this
+// is the useful part, measured rather than assumed — stamps our clientAlgoId
+// onto it as its clientOrderId. But it reports that order as type=MARKET with
+// origType=MARKET, with no trace of having been a stop. Without this mapping a
+// fired protective stop reaches the strategy looking like a market order it
+// never placed, under an id it has never seen.
+type algoRef struct {
+	algoID    int64
+	declared  types.OrderType
+	stopPrice float64
+	groupID   string
+}
+
+// newClientAlgoID mints an identifier for one conditional order. Alphanumeric
+// only: it has to survive being used as a clientOrderId too.
+func newClientAlgoID() string {
+	return fmt.Sprintf("kdraigo%d", time.Now().UnixNano())
+}
+
+func (b *BinanceFuturesClient) trackAlgo(clientAlgoID string, ref algoRef) {
+	b.mu.Lock()
+	b.algos[clientAlgoID] = ref
+	b.mu.Unlock()
+}
+
+// algoByClientID resolves a triggered order back to the conditional order that
+// produced it.
+func (b *BinanceFuturesClient) algoByClientID(clientOrderID string) (algoRef, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	ref, ok := b.algos[clientOrderID]
+	return ref, ok
+}
+
+func (b *BinanceFuturesClient) rememberDeclared(orderID string, t types.OrderType) {
+	if t == "" {
+		return
+	}
+	b.mu.Lock()
+	b.declared[orderID] = t
+	b.mu.Unlock()
+}
+
+// declaredOrderType recovers what the strategy called an ordinary order, or
+// empty when this process did not place it.
+func (b *BinanceFuturesClient) declaredOrderType(orderID string) types.OrderType {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.declared[orderID]
+}
+
+func (b *BinanceFuturesClient) forgetDeclared(orderID string) {
+	b.mu.Lock()
+	delete(b.declared, orderID)
+	b.mu.Unlock()
+}
+
+func (b *BinanceFuturesClient) forgetAlgo(clientAlgoID string) {
+	b.mu.Lock()
+	delete(b.algos, clientAlgoID)
+	b.mu.Unlock()
+}
+
+// forgetAlgoByID drops the tracking entry for a venue algo id, used when a
+// cancel is addressed by id rather than by the client identifier.
+func (b *BinanceFuturesClient) forgetAlgoByID(algoID int64) {
+	b.mu.Lock()
+	for k, v := range b.algos {
+		if v.algoID == algoID {
+			delete(b.algos, k)
+		}
+	}
+	b.mu.Unlock()
+}
+
+// binanceAlgoOrderType maps a triggered intent onto the algo book's vocabulary.
+func binanceAlgoOrderType(t IntentType) (futures.AlgoOrderType, error) {
+	switch t {
+	case IntentStopMarket:
+		return futures.AlgoOrderTypeStopMarket, nil
+	case IntentStopLimit:
+		return futures.AlgoOrderTypeStop, nil
+	default:
+		return "", fmt.Errorf("binance futures: %s is not a conditional order", t)
+	}
+}
+
+// mapAlgoStatus converts an algo order's lifecycle state.
+//
+// FINISHED is the one that matters and the one go-binance does not declare:
+// its AlgoOrderStatusType lists only NEW, CANCELED, REJECTED and EXPIRED, but
+// a conditional order that actually fires comes back FINISHED with its
+// actualOrderId populated. Measured on mainnet. Reading FINISHED as anything
+// else would either report a fill that never happened or miss one that did.
+func mapAlgoStatus(status string, actualOrderID string) types.OrderStatus {
+	switch strings.ToUpper(status) {
+	case "FINISHED":
+		if actualOrderID != "" && actualOrderID != "0" {
+			return types.OrderStatusFilled
+		}
+		// Finished without producing an order is not a fill.
+		return types.OrderStatusCanceled
+	case "CANCELED", "EXPIRED":
+		return types.OrderStatusCanceled
+	case "REJECTED":
+		return types.OrderStatusRejected
+	default:
+		return types.OrderStatusNew
+	}
+}
+
+// emitSynthetic announces an order the venue will not announce for us.
+//
+// A resting conditional order produces no ORDER_TRADE_UPDATE — Binance says
+// nothing until it fires — while the backtest engine emits a NEW event for
+// every order placed. Without this, a strategy that waits for its stop to be
+// acknowledged on SetOnOrderUpdate waits forever in live and returns
+// immediately in backtest: the same code, two behaviours.
+//
+// The SDK's reconciler dedups on (status, filledQty), so this costs nothing if
+// the venue ever starts announcing them itself.
+func (b *BinanceFuturesClient) emitSynthetic(order *types.Order) {
+	b.mu.RLock()
+	out := b.orderOut
+	b.mu.RUnlock()
+	if out == nil || order == nil {
+		return
+	}
+	select {
+	case out <- order:
+	default:
+		// Never block a placement on a slow consumer: the caller already holds
+		// this order as PlaceOrder's return value.
+		log.Printf("Binance futures: order channel full, %s not announced", order.ID)
+	}
+}
+
 func (b *BinanceFuturesClient) markFor(symbol string) float64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -833,16 +1121,79 @@ func (b *BinanceFuturesClient) OrderFeed() types.OrderFeed {
 }
 
 // ListOpenOrders implements the read half of the SDK's order reconciliation.
+//
+// It reads BOTH books. Conditional orders are invisible to /fapi/v1/openOrders
+// — they live on /fapi/v1/openAlgoOrders — so listing only the ordinary one
+// makes every resting stop look as though it were never placed. The SDK's
+// reconciler resolves "absent from the open list" as terminal, which would
+// turn each live stop into a phantom fill or cancel. A probe already proved
+// the blind spot the embarrassing way: it reported "open orders remaining: 0"
+// with a stop still resting on the account.
 func (b *BinanceFuturesClient) ListOpenOrders(ctx context.Context, exchange, symbol string) ([]*types.Order, error) {
-	res, err := b.client.NewListOpenOrdersService().Symbol(VenueSymbol(symbol)).Do(ctx)
+	sym := VenueSymbol(symbol)
+
+	res, err := b.client.NewListOpenOrdersService().Symbol(sym).Do(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]*types.Order, 0, len(res))
+	out := make([]*types.Order, 0, len(res)+2)
 	for _, o := range res {
 		out = append(out, mapFuturesOrder(o, symbol))
 	}
+
+	algos, err := b.client.NewListOpenAlgoOrdersService().
+		AlgoType(futures.OrderAlgoTypeConditional).Symbol(sym).Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("binance futures: listing open conditional orders: %w", err)
+	}
+	for i := range algos {
+		out = append(out, mapAlgoOrder(&algos[i], symbol, b.declaredTypeFor(algos[i].ClientAlgoId)))
+	}
 	return out, nil
+}
+
+// declaredTypeFor recovers the SDK order type the strategy asked for, falling
+// back to the venue's own shape for an order this process did not place (a
+// stop left over from a previous run, say).
+func (b *BinanceFuturesClient) declaredTypeFor(clientAlgoID string) types.OrderType {
+	if ref, ok := b.algoByClientID(clientAlgoID); ok {
+		return ref.declared
+	}
+	return ""
+}
+
+// mapAlgoOrder converts a conditional order into the SDK shape.
+func mapAlgoOrder(a *futures.GetAlgoOrderResp, symbol string, declared types.OrderType) *types.Order {
+	side := types.OrderSideBuy
+	if a.Side == futures.SideTypeSell {
+		side = types.OrderSideSell
+	}
+	if declared == "" {
+		declared = types.OrderTypeStopLoss
+		if a.OrderType == futures.AlgoOrderTypeStop {
+			declared = types.OrderTypeStopLossLimit
+		}
+	}
+	o := &types.Order{
+		ID:        algoOrderID(a.AlgoId),
+		Symbol:    symbol,
+		Exchange:  types.ExchangeBinanceFutures,
+		Side:      side,
+		Type:      declared,
+		Status:    mapAlgoStatus(string(a.AlgoStatus), a.ActualOrderId),
+		Price:     parseFloat(a.Price),
+		Quantity:  parseFloat(a.Quantity),
+		StopPrice: parseFloat(a.TriggerPrice),
+		CreatedAt: time.UnixMilli(a.CreateTime),
+		UpdatedAt: time.UnixMilli(a.UpdateTime),
+	}
+	// A fired conditional produced an ordinary order; its price is the truth
+	// about what the stop actually got.
+	if a.ActualOrderId != "" && a.ActualOrderId != "0" {
+		o.AveragePrice = parseFloat(a.ActualPrice)
+		o.FilledQty = o.Quantity
+	}
+	return o
 }
 
 // GetOrder resolves what became of one order.
@@ -851,11 +1202,18 @@ func (b *BinanceFuturesClient) ListOpenOrders(ctx context.Context, exchange, sym
 // cannot say which. Assuming a fill would report a position the account does
 // not hold; assuming a cancel would hide one it does.
 func (b *BinanceFuturesClient) GetOrder(ctx context.Context, exchange, symbol, id string) (*types.Order, error) {
-	orderID, err := strconv.ParseInt(id, 10, 64)
+	venueID, isAlgo, err := parseVenueOrderID(id)
 	if err != nil {
-		return nil, fmt.Errorf("binance futures GetOrder: invalid orderID %q: %w", id, err)
+		return nil, fmt.Errorf("binance futures GetOrder: %w", err)
 	}
-	o, err := b.client.NewGetOrderService().Symbol(VenueSymbol(symbol)).OrderID(orderID).Do(ctx)
+	if isAlgo {
+		a, err := b.client.NewGetAlgoOrderService().AlgoID(venueID).Do(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return mapAlgoOrder(a, symbol, b.declaredTypeFor(a.ClientAlgoId)), nil
+	}
+	o, err := b.client.NewGetOrderService().Symbol(VenueSymbol(symbol)).OrderID(venueID).Do(ctx)
 	if err != nil {
 		return nil, err
 	}

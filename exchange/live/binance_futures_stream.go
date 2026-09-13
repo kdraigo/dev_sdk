@@ -54,6 +54,12 @@ func (b *BinanceFuturesClient) ConnectStream(ctx context.Context, candleChan cha
 		return nil
 	}
 
+	// Held so a conditional placement can announce itself: the venue stays
+	// silent about a resting stop until it fires.
+	b.mu.Lock()
+	b.orderOut = orderChan
+	b.mu.Unlock()
+
 	go b.superviseMarketStream(ctx, symbols, original, candleChan)
 	go b.superviseMarkStream(ctx, symbols)
 	go b.superviseUserDataStream(ctx, original, orderChan)
@@ -343,6 +349,31 @@ func (b *BinanceFuturesClient) handleOrderUpdate(ctx context.Context, u *futures
 		declared = string(u.Type)
 	}
 
+	// A conditional order that fired arrives here as an ordinary order, and
+	// Binance reports it as type=MARKET origType=MARKET with no trace of
+	// having been a stop — but it does stamp our clientAlgoId onto it as its
+	// clientOrderId. That is the only thread back.
+	//
+	// Without following it the strategy is told a market order it never placed
+	// has filled, under an id it has never seen, while the protective stop it
+	// is actually watching appears to have simply vanished.
+	sdkType := sdkOrderType(declared, stop > 0)
+	// Prefer what the strategy called it over what the venue calls it back.
+	// A TAKE_PROFIT_LIMIT goes out as a plain LIMIT, so the venue can only
+	// ever report LIMIT, and the same order would otherwise carry two names.
+	if d := b.declaredOrderType(id); d != "" {
+		sdkType = d
+	}
+	if ref, ok := b.algoByClientID(u.ClientOrderID); ok {
+		id = algoOrderID(ref.algoID)
+		sdkType = ref.declared
+		if stop == 0 {
+			stop = ref.stopPrice
+		}
+		log.Printf("Binance futures: conditional order %s triggered (venue order %d, %s)",
+			id, u.ID, ref.declared)
+	}
+
 	status := mapFuturesStatus(u.Status)
 	liquidated := strings.EqualFold(string(u.Type), "LIQUIDATION") ||
 		strings.EqualFold(string(u.OriginalType), "LIQUIDATION")
@@ -358,7 +389,7 @@ func (b *BinanceFuturesClient) handleOrderUpdate(ctx context.Context, u *futures
 		Symbol:       symbol,
 		Exchange:     types.ExchangeBinanceFutures,
 		Side:         side,
-		Type:         sdkOrderType(declared, stop > 0),
+		Type:         sdkType,
 		Status:       status,
 		Price:        parseFloat(u.OriginalPrice),
 		Quantity:     parseFloat(u.OriginalQty),
@@ -399,6 +430,11 @@ func (b *BinanceFuturesClient) handleOrderUpdate(ctx context.Context, u *futures
 	}
 	if status == types.OrderStatusFilled || status == types.OrderStatusCanceled || status == types.OrderStatusRejected {
 		b.forgetBracket(id)
+		// A conditional order fires exactly once, so its tracking entry has no
+		// further use and would otherwise accumulate for the life of the
+		// process.
+		b.forgetAlgo(u.ClientOrderID)
+		b.forgetDeclared(strconv.FormatInt(u.ID, 10))
 	}
 }
 

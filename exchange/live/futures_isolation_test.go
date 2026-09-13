@@ -5,8 +5,10 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/adshao/go-binance/v2/common"
+	"github.com/adshao/go-binance/v2/futures"
 
 	"github.com/kdraigo/dev_sdk/types"
 	"github.com/stretchr/testify/assert"
@@ -59,7 +61,7 @@ func TestFuturesAdapterNeverConstructsASpotClient(t *testing.T) {
 // original defect one layer lower down.
 func TestFuturesOrderTypesAreDistinctOnTheWire(t *testing.T) {
 	seen := map[string]IntentType{}
-	for _, intent := range []IntentType{IntentMarket, IntentLimit, IntentStopMarket, IntentStopLimit} {
+	for _, intent := range []IntentType{IntentMarket, IntentLimit} {
 		got, err := binanceFuturesOrderType(intent)
 		require.NoError(t, err, intent)
 		wire := string(got)
@@ -68,11 +70,123 @@ func TestFuturesOrderTypesAreDistinctOnTheWire(t *testing.T) {
 		}
 		seen[wire] = intent
 	}
-
-	assert.Equal(t, "STOP_MARKET", mustWire(t, IntentStopMarket),
-		"go-binance declares no STOP_MARKET constant, but the venue accepts the string; falling back to MARKET here is the bug")
-	assert.Equal(t, "STOP", mustWire(t, IntentStopLimit))
 	assert.Equal(t, "MARKET", mustWire(t, IntentMarket))
+	assert.Equal(t, "LIMIT", mustWire(t, IntentLimit))
+}
+
+// TestConditionalOrdersCannotReachTheOrdinaryEndpoint
+//
+// Stops used to be sent to /fapi/v1/order as "STOP_MARKET" and "STOP". The
+// venue rejects both with -4120 and names the algo endpoint in its own error
+// text — measured on mainnet and testnet, with both signing schemes, and with
+// a request carrying nothing but symbol/side/type/quantity/stopPrice, while a
+// plain LIMIT on the same endpoint in the same second rested fine.
+//
+// Returning a conditional type from here again would restore that failure
+// silently, so the function must refuse and say where they belong.
+func TestConditionalOrdersCannotReachTheOrdinaryEndpoint(t *testing.T) {
+	for _, intent := range []IntentType{IntentStopMarket, IntentStopLimit} {
+		_, err := binanceFuturesOrderType(intent)
+		require.Error(t, err, "%s must not be routable to /fapi/v1/order", intent)
+		assert.Contains(t, err.Error(), "algoOrder",
+			"and the error must name the endpoint that does accept it")
+	}
+}
+
+// TestAlgoOrderTypesAreDistinct: the same no-collapsing rule, one book over.
+func TestAlgoOrderTypesAreDistinct(t *testing.T) {
+	stopMarket, err := binanceAlgoOrderType(IntentStopMarket)
+	require.NoError(t, err)
+	stopLimit, err := binanceAlgoOrderType(IntentStopLimit)
+	require.NoError(t, err)
+
+	assert.Equal(t, futures.AlgoOrderTypeStopMarket, stopMarket)
+	assert.Equal(t, futures.AlgoOrderTypeStop, stopLimit)
+	assert.NotEqual(t, stopMarket, stopLimit,
+		"market-on-trigger and rest-at-a-price are different orders")
+
+	// Non-conditional intents have no business on the algo book.
+	for _, intent := range []IntentType{IntentMarket, IntentLimit, IntentTakeProfitLimit} {
+		_, err := binanceAlgoOrderType(intent)
+		assert.Error(t, err, "%s is not a conditional order", intent)
+	}
+}
+
+// TestVenueOrderIDRoundTrip: the two ID spaces are both int64 and can collide.
+// An id that routes to the wrong endpoint produces a cancel that reports
+// success while a protective stop stays live, which is the worst outcome this
+// adapter can produce.
+func TestVenueOrderIDRoundTrip(t *testing.T) {
+	raw, isAlgo, err := parseVenueOrderID(algoOrderID(1000002561356334))
+	require.NoError(t, err)
+	assert.True(t, isAlgo)
+	assert.EqualValues(t, 1000002561356334, raw)
+
+	raw, isAlgo, err = parseVenueOrderID("241352843288")
+	require.NoError(t, err)
+	assert.False(t, isAlgo, "a bare number is an ordinary order")
+	assert.EqualValues(t, 241352843288, raw)
+
+	for _, bad := range []string{"", "algo:", "algo:abc", "not-a-number", "dryrun-123"} {
+		_, _, err := parseVenueOrderID(bad)
+		assert.Error(t, err, "%q must not silently parse", bad)
+	}
+}
+
+// TestMapAlgoStatus_FinishedMeansTriggered
+//
+// go-binance declares AlgoOrderStatusType as NEW / CANCELED / REJECTED /
+// EXPIRED, with no FILLED and no TRIGGERED. A conditional order that actually
+// fires comes back FINISHED with actualOrderId populated — measured on
+// mainnet, algoId 1000002561356334 -> order 241352843288. Reading FINISHED as
+// anything else reports a fill that never happened, or misses one that did.
+func TestMapAlgoStatus_FinishedMeansTriggered(t *testing.T) {
+	assert.Equal(t, types.OrderStatusFilled,
+		mapAlgoStatus("FINISHED", "241352843288"), "fired, and it produced an order")
+
+	assert.Equal(t, types.OrderStatusCanceled,
+		mapAlgoStatus("FINISHED", ""), "finished without producing an order is not a fill")
+
+	assert.Equal(t, types.OrderStatusCanceled, mapAlgoStatus("CANCELED", ""))
+	assert.Equal(t, types.OrderStatusCanceled, mapAlgoStatus("EXPIRED", ""))
+	assert.Equal(t, types.OrderStatusRejected, mapAlgoStatus("REJECTED", ""))
+	assert.Equal(t, types.OrderStatusNew, mapAlgoStatus("NEW", ""))
+}
+
+// TestAlgoTrackingSurvivesUntilTheOrderIsTerminal: the clientAlgoId is the only
+// thread from a fired stop back to the order the strategy placed.
+func TestAlgoTrackingSurvivesUntilTheOrderIsTerminal(t *testing.T) {
+	c := NewBinanceFuturesClient(&types.Config{})
+	c.trackAlgo("kdraigo123", algoRef{
+		algoID: 999, declared: types.OrderTypeStopLoss, stopPrice: 72.5, groupID: "bracket-1",
+	})
+
+	ref, ok := c.algoByClientID("kdraigo123")
+	require.True(t, ok)
+	assert.Equal(t, types.OrderTypeStopLoss, ref.declared,
+		"the venue reports a fired stop as a plain MARKET order; only this remembers otherwise")
+	assert.EqualValues(t, 999, ref.algoID)
+	assert.Equal(t, 72.5, ref.stopPrice)
+
+	_, ok = c.algoByClientID("someone-elses-order")
+	assert.False(t, ok)
+
+	c.forgetAlgoByID(999)
+	_, ok = c.algoByClientID("kdraigo123")
+	assert.False(t, ok, "cancelling by venue id must drop the tracking entry too")
+}
+
+// TestClientAlgoIDIsVenueSafe: it is reused by Binance as the resulting
+// order's clientOrderId, so it has to be acceptable in both roles.
+func TestClientAlgoIDIsVenueSafe(t *testing.T) {
+	id := newClientAlgoID()
+	assert.NotEmpty(t, id)
+	assert.LessOrEqual(t, len(id), 36)
+	for _, r := range id {
+		assert.True(t, (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'),
+			"clientAlgoId must stay alphanumeric, got %q in %q", r, id)
+	}
+	assert.NotEqual(t, id, newClientAlgoID(), "two orders must not share an identifier")
 }
 
 func mustWire(t *testing.T, intent IntentType) string {
@@ -340,4 +454,51 @@ func TestDryRunPerformsNoAccountWrites(t *testing.T) {
 		assert.Contains(t, before[fnStart:], "b.guard.DryRun()",
 			"%s must be skipped under DryRun", write)
 	}
+}
+
+// TestConditionalPlacementIsAnnounced
+//
+// A resting conditional order produces no ORDER_TRADE_UPDATE: Binance says
+// nothing about it until it fires. The backtest engine emits NEW for every
+// order placed, so without a synthetic announcement a strategy waiting for its
+// stop to be acknowledged returns immediately in backtest and hangs forever
+// live — the same code, two behaviours.
+func TestConditionalPlacementIsAnnounced(t *testing.T) {
+	c := NewBinanceFuturesClient(&types.Config{})
+	out := make(chan *types.Order, 4)
+	c.orderOut = out
+
+	want := &types.Order{ID: "algo:99", Status: types.OrderStatusNew, Type: types.OrderTypeStopLoss}
+	c.emitSynthetic(want)
+
+	select {
+	case got := <-out:
+		assert.Equal(t, want.ID, got.ID)
+		assert.Equal(t, types.OrderTypeStopLoss, got.Type)
+	default:
+		t.Fatal("a placed conditional order must reach the order channel")
+	}
+}
+
+// TestEmitSyntheticNeverBlocks: a slow consumer must not wedge a placement.
+// PlaceOrder already returns the order to its caller, so dropping the
+// announcement is the right trade against blocking the trading path.
+func TestEmitSyntheticNeverBlocks(t *testing.T) {
+	c := NewBinanceFuturesClient(&types.Config{})
+	c.orderOut = make(chan *types.Order) // unbuffered, nothing reading
+
+	done := make(chan struct{})
+	go func() {
+		c.emitSynthetic(&types.Order{ID: "algo:1"})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("emitSynthetic blocked on a consumer that was not reading")
+	}
+
+	// And with no stream connected at all it must simply be a no-op.
+	assert.NotPanics(t, func() { NewBinanceFuturesClient(&types.Config{}).emitSynthetic(&types.Order{ID: "x"}) })
 }
