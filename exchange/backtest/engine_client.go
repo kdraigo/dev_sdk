@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,11 +28,37 @@ import (
 type EngineClient struct {
 	config    *types.Config
 	sessionID string
-	wsConn    *websocket.Conn
-	writeMu   sync.Mutex
+
+	// wsConn is swapped by the supervisor on every reconnect while writers are
+	// concurrently sending on it, so it cannot be a plain field. Read it
+	// through conn().
+	wsConn  atomic.Pointer[websocket.Conn]
+	writeMu sync.Mutex
 
 	streamDone atomic.Bool           // set when the engine sends done:true; nextTick becomes a no-op
-	streamErr  atomic.Pointer[error] // set when the WS stream ends before done:true (truncation)
+	streamErr  atomic.Pointer[error] // set when the stream ended unrecoverably before done:true
+
+	// resuming means the caller asked to attach to a session it did not create
+	// in this process, so none of its own state survived.
+	resuming bool
+
+	// reattached marks the current connection as a redial rather than the
+	// first attach, which is what distinguishes a cold resume from one where
+	// indicators and the in-flight bar are still intact.
+	reattached atomic.Bool
+
+	// Tick sequencing. nextSeq is the last sequence allocated; inflightSeq is
+	// the one awaiting a response, or 0 when none is. A retry — whether after
+	// a timeout or across a reconnect — resends inflightSeq rather than
+	// allocating a new one, which is what makes a retry idempotent instead of
+	// stepping the engine twice.
+	nextSeq     atomic.Uint64
+	inflightSeq atomic.Uint64
+
+	// onResume is invoked on every attach to an existing session, before any
+	// candle from that connection is dispatched.
+	onResume   func(*types.SessionState)
+	onResumeMu sync.Mutex
 
 	pendingOrders   map[string]chan *orderResponse
 	pendingBrackets map[string]chan *bracketResponse
@@ -145,13 +172,11 @@ func (e *EngineClient) PlaceBracket(ctx context.Context, req *types.BracketReque
 		data["logs"] = req.Logs
 	}
 
-	e.writeMu.Lock()
-	err = e.wsConn.WriteJSON(map[string]interface{}{
+	err = e.writeJSON(map[string]interface{}{
 		"action":     "order_bracket",
 		"request_id": reqID,
 		"data":       data,
 	})
-	e.writeMu.Unlock()
 
 	if err != nil {
 		cleanup()
@@ -400,6 +425,18 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 		e.smallestTF = smallest
 	}
 
+	// Resuming an existing session: everything above still has to happen —
+	// notably smallestTF, which stamps the timeframe on every streamed candle
+	// and is what the aggregators and indicator managers are keyed by. Skip it
+	// and candles arrive labelled with nothing, match no aggregator, and the
+	// run goes silently deaf. Only the session-creating POST is skipped.
+	if id := cfg.Backtest.SessionID; id != "" {
+		e.sessionID = id
+		e.resuming = true
+		log.Printf("Backtest Engine: resuming existing session %s", id)
+		return nil
+	}
+
 	var streams []startSessionRequestStream
 	for _, ex := range cfg.Backtest.RequestedExchanges {
 		for _, asset := range cfg.Backtest.Assets {
@@ -464,12 +501,154 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	return nil
 }
 
+const (
+	// reconnectBase and reconnectMax bound the wait between reconnect
+	// attempts, matching the live adapter's backoff.
+	reconnectBase = 1 * time.Second
+	reconnectMax  = 30 * time.Second
+
+	// maxReconnectAttempts bounds consecutive failed redials before the run is
+	// declared truncated. It exists to keep D1 intact: a partial run must never
+	// be reported as a clean one, so retrying cannot be unbounded.
+	maxReconnectAttempts = 8
+
+	// readTimeout is how long the client waits for any frame. The engine's
+	// ~15s progress frames refresh it, which is what keeps a slow backtest
+	// from looking like a dead one.
+	readTimeout = 60 * time.Second
+)
+
+// readOutcome is why a reader loop returned.
+type readOutcome int
+
+const (
+	// outcomeDone — the engine signalled done:true. The run is over.
+	outcomeDone readOutcome = iota
+	// outcomeRecoverable — the socket broke. The session is parked engine-side
+	// and can be resumed by redialing.
+	outcomeRecoverable
+	// outcomeFatal — the engine refused to continue this run.
+	outcomeFatal
+)
+
+// ConnectStream drives the session for the life of ctx, redialing across
+// dropped connections.
+//
+// A dropped WebSocket used to end the run: the reader closed the SDK's candle
+// channel, and a closed channel cannot be reopened, so the whole pipeline
+// unwound. The close now belongs to the supervisor below, which owns it for
+// the life of the stream and performs it exactly once — leaving the reader
+// free to return and be replaced.
 func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *types.Candle, orderChan chan<- *types.Order) error {
+	// Block until the first attach resolves. Callers rely on a nil return
+	// meaning "connected", and the tick loop issues its opening tick the
+	// moment this returns — so handing back before the socket exists would
+	// stall every run at startup.
+	ready := make(chan error, 1)
+	go e.supervise(ctx, candleChan, orderChan, ready)
+	return <-ready
+}
+
+// supervise keeps a connection to the session alive until the run finishes,
+// the context ends, or the engine tells us to stop.
+func (e *EngineClient) supervise(ctx context.Context, candleChan chan<- *types.Candle, orderChan chan<- *types.Order, ready chan<- error) {
+	// The single close, for the whole life of the stream.
+	defer close(candleChan)
+
+	var readyOnce sync.Once
+	signal := func(err error) { readyOnce.Do(func() { ready <- err }) }
+	// However this ends, an unreported ConnectStream must never hang.
+	defer signal(errors.New("backtest engine: stream ended before connecting"))
+
+	backoff := reconnectBase
+	attempts := 0
+	first := true
+
+	for {
+		if ctx.Err() != nil {
+			signal(ctx.Err())
+			return
+		}
+
+		conn, err := e.dialOnce(ctx)
+		if err != nil {
+			if !retryableAttach(err) {
+				e.storeStreamErr(err)
+				signal(err)
+				return
+			}
+			attempts++
+			if attempts > maxReconnectAttempts {
+				wrapped := fmt.Errorf("backtest stream truncated: giving up after %d reconnect attempts: %w", attempts-1, err)
+				e.storeStreamErr(wrapped)
+				signal(wrapped)
+				return
+			}
+			log.Printf("Backtest Engine: attach failed, retrying in %s: %v", backoff, err)
+			if !sleepCtx(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff)
+			continue
+		}
+
+		attempts = 0
+		backoff = reconnectBase
+		e.wsConn.Store(conn)
+		signal(nil)
+
+		// Before any candle from this connection reaches the strategy: after a
+		// restart it has no indicator history and no idea what it holds, and
+		// after a reconnect what it holds may have moved on.
+		// Only this process knows whether its own memory survived. A caller
+		// that supplied a SessionID is attaching to a run it did not start, so
+		// everything it held is gone; a redial inside a live run still has its
+		// indicators and its in-flight bar.
+		reattached := !first
+		e.reattached.Store(reattached)
+		first = false
+
+		// If the engine still owes us a tick, ask for it again immediately.
+		// Re-sending the same sequence is a replay request, not a second step,
+		// so this cannot consume a candle. When nothing is in flight the tick
+		// loop owns issuing the next one, and asking here would double-step.
+		if reattached && e.inflightSeq.Load() != 0 {
+			if err := e.nextTick(); err != nil {
+				log.Printf("Backtest Engine: failed to re-issue in-flight tick: %v", err)
+			}
+		}
+
+		outcome := e.readLoop(conn, candleChan, orderChan)
+		e.wsConn.Store(nil)
+		_ = conn.Close()
+		e.failPendingWaiters()
+
+		switch outcome {
+		case outcomeDone:
+			return
+		case outcomeFatal:
+			return
+		}
+
+		log.Printf("Backtest Engine: connection dropped mid-run, resuming session %s in %s", e.sessionID, backoff)
+		if !sleepCtx(ctx, backoff) {
+			// The context ended while we were waiting. The run did not finish,
+			// and saying nothing here would let a partial run pass as clean.
+			e.storeStreamErr(fmt.Errorf("backtest stream truncated: context ended during reconnect"))
+			return
+		}
+		backoff = nextBackoff(backoff)
+	}
+}
+
+// dialOnce opens one authenticated connection and reads the engine's opening
+// session_state frame.
+func (e *EngineClient) dialOnce(ctx context.Context) (*websocket.Conn, error) {
 	log.Printf("Backtest Engine: Establishing WS connection for session %s...", e.sessionID)
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	sig, err := e.generateSignature(http.MethodGet, "/api/v1/dev/session/ws", timestamp, "")
 	if err != nil {
-		return fmt.Errorf("failed to generate signature: %v", err)
+		return nil, fmt.Errorf("failed to generate signature: %v", err)
 	}
 
 	wsEndpoint := strings.Replace(e.config.Backtest.Endpoint, "http", "ws", 1) +
@@ -478,241 +657,123 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 		"&signature=" + sig +
 		"&timestamp=" + timestamp
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsEndpoint, nil)
+	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsEndpoint, nil)
 	if err != nil {
-		return fmt.Errorf("websocket dial failed: %v", err)
+		// The refusal body carries the reason. Without reading it the client
+		// cannot tell "wrong key, fix your config" from "session gone" from
+		// "try again", and would have to guess — which for a backtest means
+		// guessing whether results are a continuation or a fresh run.
+		return nil, classifyDialError(err, resp)
 	}
-	e.wsConn = conn
 
-	// Use gorilla's default ping handler (sends pong automatically, no mutex needed).
-	// Our custom handler was acquiring writeMu inside ReadJSON which could deadlock
-	// if writeMu was held by nextTick() at the same moment.
+	// Gorilla's default ping handler replies automatically. A custom one
+	// acquired writeMu inside ReadJSON, which could deadlock against a
+	// concurrent write.
 	conn.SetPingHandler(nil)
+	_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 
-	// Refresh read deadline after every message so a silent engine is detected quickly.
-	const readTimeout = 60 * time.Second
-	conn.SetReadDeadline(time.Now().Add(readTimeout))
+	return conn, nil
+}
 
-	// 5. Command the exchange Adapter to begin pumping data into `rawCandleChan` & `orderChan` natives.
-	go func() {
-		defer conn.Close()
-		candleClosed := false
-		closeCandleChan := func() {
-			if !candleClosed {
-				candleClosed = true
-				close(candleChan)
-			}
+// readLoop pumps one connection until it ends. It never closes candleChan —
+// that belongs to the supervisor, which may yet replace this connection.
+func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.Candle, orderChan chan<- *types.Order) readOutcome {
+	for {
+		var resp struct {
+			Action    string          `json:"action"`
+			Status    string          `json:"status"`
+			Data      json.RawMessage `json:"data"`
+			Error     string          `json:"error"`
+			Code      string          `json:"code"`
+			RequestID string          `json:"request_id"`
 		}
-		for {
-			var resp struct {
-				Action    string          `json:"action"`
-				Status    string          `json:"status"`
-				Data      json.RawMessage `json:"data"`
-				Error     string          `json:"error"`
-				RequestID string          `json:"request_id"`
+		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
+		if err := conn.ReadJSON(&resp); err != nil {
+			if e.streamDone.Load() {
+				log.Printf("Backtest Engine WS closed after completion: %v", err)
+				return outcomeDone
 			}
-			conn.SetReadDeadline(time.Now().Add(readTimeout))
-			if err := conn.ReadJSON(&resp); err != nil {
-				// A read error after done:true is a normal shutdown; anything before
-				// it is a truncated stream and must be surfaced as a terminal error so
-				// the SDK does not report partial data as a clean completion (D1).
-				if !e.streamDone.Load() {
-					wrapped := fmt.Errorf("backtest stream truncated: %w", err)
-					e.streamErr.Store(&wrapped)
-					log.Printf("Backtest Engine WS disconnected before completion: %v", err)
+			// The run is not over, so this is a dropped transport, not a
+			// truncated stream. The engine parks the session for its resume
+			// window; the supervisor redials into it. Only when redialing is
+			// exhausted does this become the terminal error D1 requires.
+			log.Printf("Backtest Engine WS disconnected before completion: %v", err)
+			return outcomeRecoverable
+		}
+
+		// Handle pending PlaceOrder/GetAccount/CancelOrder/History waiters
+		if resp.RequestID != "" {
+			var orderCh chan *orderResponse
+			var bracketCh chan *bracketResponse
+			var accountCh chan *accountResponse
+			var cancelCh chan error
+			var historyCh chan *historyResponse
+			var rawCh chan *rawResponse
+
+			e.pendingMu.Lock()
+			if ch, ok := e.pendingOrders[resp.RequestID]; ok {
+				orderCh = ch
+				delete(e.pendingOrders, resp.RequestID)
+			} else if ch, ok := e.pendingBrackets[resp.RequestID]; ok {
+				bracketCh = ch
+				delete(e.pendingBrackets, resp.RequestID)
+			} else if ch, ok := e.pendingAccounts[resp.RequestID]; ok {
+				accountCh = ch
+				delete(e.pendingAccounts, resp.RequestID)
+			} else if ch, ok := e.pendingCancels[resp.RequestID]; ok {
+				cancelCh = ch
+				delete(e.pendingCancels, resp.RequestID)
+			} else if ch, ok := e.pendingHistory[resp.RequestID]; ok {
+				historyCh = ch
+				delete(e.pendingHistory, resp.RequestID)
+			} else if ch, ok := e.pendingRaw[resp.RequestID]; ok {
+				rawCh = ch
+				delete(e.pendingRaw, resp.RequestID)
+			}
+			e.pendingMu.Unlock()
+
+			if rawCh != nil {
+				r := &rawResponse{data: resp.Data}
+				if resp.Status == "error" {
+					r.err = fmt.Errorf("%s", resp.Error)
+				}
+				rawCh <- r
+			}
+
+			if bracketCh != nil {
+				var br bracketResponse
+				if resp.Status == "error" {
+					br.err = fmt.Errorf("%s", resp.Error)
 				} else {
-					log.Printf("Backtest Engine WS closed after completion: %v", err)
-				}
-				closeCandleChan() // unblock dispatch goroutine so the tick loop can shut down cleanly
-				return
-			}
-
-			// Handle pending PlaceOrder/GetAccount/CancelOrder/History waiters
-			if resp.RequestID != "" {
-				var orderCh chan *orderResponse
-				var bracketCh chan *bracketResponse
-				var accountCh chan *accountResponse
-				var cancelCh chan error
-				var historyCh chan *historyResponse
-				var rawCh chan *rawResponse
-
-				e.pendingMu.Lock()
-				if ch, ok := e.pendingOrders[resp.RequestID]; ok {
-					orderCh = ch
-					delete(e.pendingOrders, resp.RequestID)
-				} else if ch, ok := e.pendingBrackets[resp.RequestID]; ok {
-					bracketCh = ch
-					delete(e.pendingBrackets, resp.RequestID)
-				} else if ch, ok := e.pendingAccounts[resp.RequestID]; ok {
-					accountCh = ch
-					delete(e.pendingAccounts, resp.RequestID)
-				} else if ch, ok := e.pendingCancels[resp.RequestID]; ok {
-					cancelCh = ch
-					delete(e.pendingCancels, resp.RequestID)
-				} else if ch, ok := e.pendingHistory[resp.RequestID]; ok {
-					historyCh = ch
-					delete(e.pendingHistory, resp.RequestID)
-				} else if ch, ok := e.pendingRaw[resp.RequestID]; ok {
-					rawCh = ch
-					delete(e.pendingRaw, resp.RequestID)
-				}
-				e.pendingMu.Unlock()
-
-				if rawCh != nil {
-					r := &rawResponse{data: resp.Data}
-					if resp.Status == "error" {
-						r.err = fmt.Errorf("%s", resp.Error)
+					var bp struct {
+						Orders []orderWire `json:"orders"`
 					}
-					rawCh <- r
-				}
-
-				if bracketCh != nil {
-					var br bracketResponse
-					if resp.Status == "error" {
-						br.err = fmt.Errorf("%s", resp.Error)
+					if err := json.Unmarshal(resp.Data, &bp); err != nil {
+						br.err = fmt.Errorf("bracket decode: %w", err)
 					} else {
-						var bp struct {
-							Orders []orderWire `json:"orders"`
-						}
-						if err := json.Unmarshal(resp.Data, &bp); err != nil {
-							br.err = fmt.Errorf("bracket decode: %w", err)
-						} else {
-							for i := range bp.Orders {
-								encoded, err := json.Marshal(bp.Orders[i])
-								if err != nil {
-									continue
-								}
-								if order := parseOrderAck(encoded); order != nil {
-									br.orders = append(br.orders, order)
-								}
+						for i := range bp.Orders {
+							encoded, err := json.Marshal(bp.Orders[i])
+							if err != nil {
+								continue
+							}
+							if order := parseOrderAck(encoded); order != nil {
+								br.orders = append(br.orders, order)
 							}
 						}
 					}
-					bracketCh <- &br
-					continue
 				}
-
-				if historyCh != nil {
-					var hr historyResponse
-					if resp.Status == "error" {
-						hr.err = fmt.Errorf("%s", resp.Error)
-					} else {
-						var hp struct {
-							Candles []struct {
-								Pair                string    `json:"Pair"`
-								Time                time.Time `json:"time"`
-								UpdatedAt           time.Time `json:"updatedAt"`
-								Open                float64   `json:"open"`
-								High                float64   `json:"high"`
-								Low                 float64   `json:"low"`
-								Close               float64   `json:"close"`
-								Volume              float64   `json:"volume"`
-								Complete            bool      `json:"complete"`
-								TradeCount          int64     `json:"tradeCount"`
-								QuoteVolume         float64   `json:"quoteVolume"`
-								TakerBuyBaseVolume  float64   `json:"takerBuyBaseVolume"`
-								TakerBuyQuoteVolume float64   `json:"takerBuyQuoteVolume"`
-							} `json:"candles"`
-						}
-						if err := json.Unmarshal(resp.Data, &hp); err != nil {
-							hr.err = fmt.Errorf("history decode: %w", err)
-						} else {
-							out := make([]*types.Candle, 0, len(hp.Candles))
-							for _, c := range hp.Candles {
-								out = append(out, &types.Candle{
-									Symbol:              c.Pair,
-									Timeframe:           e.smallestTF,
-									OpenTime:            c.Time,
-									CloseTime:           c.UpdatedAt,
-									Open:                c.Open,
-									High:                c.High,
-									Low:                 c.Low,
-									Close:               c.Close,
-									Volume:              c.Volume,
-									IsComplete:          true,
-									TradeCount:          c.TradeCount,
-									QuoteVolume:         c.QuoteVolume,
-									TakerBuyBaseVolume:  c.TakerBuyBaseVolume,
-									TakerBuyQuoteVolume: c.TakerBuyQuoteVolume,
-								})
-							}
-							hr.candles = out
-						}
-					}
-					historyCh <- &hr
-					close(historyCh)
-					continue
-				}
-
-				if orderCh != nil {
-					var or orderResponse
-					if resp.Status == "error" {
-						or.err = fmt.Errorf("%s", resp.Error)
-						// If the engine attached structured rejection detail, surface
-						// it explicitly so the strategy can react (e.g. shrink size).
-						var rej struct {
-							Code           string  `json:"code"`
-							RequiredQuote  float64 `json:"required_quote"`
-							AvailableQuote float64 `json:"available_quote"`
-							LockedQuote    float64 `json:"locked_quote"`
-							FeeEstimate    float64 `json:"fee_estimate"`
-						}
-						if len(resp.Data) > 0 && json.Unmarshal(resp.Data, &rej) == nil && rej.Code != "" {
-							or.err = fmt.Errorf("order rejected [%s]: required_quote=%.8f available_quote=%.8f locked_quote=%.8f fee=%.8f",
-								rej.Code, rej.RequiredQuote, rej.AvailableQuote, rej.LockedQuote, rej.FeeEstimate)
-						}
-					} else {
-						or.order = parseOrderAck(resp.Data)
-					}
-					orderCh <- &or
-					close(orderCh)
-				} else if accountCh != nil {
-					var ar accountResponse
-					if resp.Status == "error" {
-						ar.err = fmt.Errorf("%s", resp.Error)
-					} else {
-						json.Unmarshal(resp.Data, &ar.account)
-					}
-					accountCh <- &ar
-					close(accountCh)
-				} else if cancelCh != nil {
-					if resp.Status == "error" {
-						cancelCh <- fmt.Errorf("%s", resp.Error)
-					} else {
-						cancelCh <- nil
-					}
-					close(cancelCh)
-				}
-			}
-
-			if resp.Status != "ok" {
-				log.Printf("Engine WS Error on %s: %s", resp.Action, resp.Error)
+				bracketCh <- &br
 				continue
 			}
 
-			// Server-pushed keepalive/observability frame. Arriving every ~15s, it
-			// also refreshes the read deadline above, which is what keeps long/slow
-			// backtests from being torn down as "disconnected". Just surface it.
-			if resp.Action == "progress" {
-				var p struct {
-					ProcessedCandles int64   `json:"processed_candles"`
-					TotalCandles     int64   `json:"total_candles"`
-					Percent          float64 `json:"percent"`
-					ETASeconds       float64 `json:"eta_seconds"`
-				}
-				if json.Unmarshal(resp.Data, &p) == nil && p.TotalCandles > 0 {
-					log.Printf("Backtest progress: %d/%d candles (%.1f%%), ETA %.0fs",
-						p.ProcessedCandles, p.TotalCandles, p.Percent, p.ETASeconds)
-				}
-				continue
-			}
-
-			if resp.Action == "next" {
-				var dataStruct struct {
-					Tick *struct {
-						Exchange string `json:"Exchange"`
-						Pair     string `json:"Pair"`
-						Candle   struct {
+			if historyCh != nil {
+				var hr historyResponse
+				if resp.Status == "error" {
+					hr.err = fmt.Errorf("%s", resp.Error)
+				} else {
+					var hp struct {
+						Candles []struct {
+							Pair                string    `json:"Pair"`
 							Time                time.Time `json:"time"`
 							UpdatedAt           time.Time `json:"updatedAt"`
 							Open                float64   `json:"open"`
@@ -725,81 +786,274 @@ func (e *EngineClient) ConnectStream(ctx context.Context, candleChan chan<- *typ
 							QuoteVolume         float64   `json:"quoteVolume"`
 							TakerBuyBaseVolume  float64   `json:"takerBuyBaseVolume"`
 							TakerBuyQuoteVolume float64   `json:"takerBuyQuoteVolume"`
-						} `json:"Candle"`
-					} `json:"tick"`
-					Done   bool `json:"done"`
-					Orders []struct {
-						ID         int64   `json:"id"`
-						ExchangeID int64   `json:"exchange_id"`
-						Pair       string  `json:"pair"`
-						Side       string  `json:"side"`
-						Type       string  `json:"type"`
-						Status     string  `json:"status"`
-						Price      float64 `json:"price"`
-						Quantity   float64 `json:"quantity"`
-					} `json:"orders"`
-				}
-				json.Unmarshal(resp.Data, &dataStruct)
-				// When done:true the engine sends a sentinel zero-value tick.
-				// Skip it — the zero candle would otherwise pollute the SDK
-				// pipeline (advance clock backwards by no-op, fire OnCandle
-				// with empty data, etc.). The done flag itself is enough.
-				if dataStruct.Tick != nil && !dataStruct.Done && !dataStruct.Tick.Candle.Time.IsZero() {
-					candle := &types.Candle{
-						Symbol:              dataStruct.Tick.Pair,
-						Exchange:            dataStruct.Tick.Exchange,
-						Timeframe:           e.smallestTF,
-						OpenTime:            dataStruct.Tick.Candle.Time,
-						CloseTime:           dataStruct.Tick.Candle.UpdatedAt,
-						Open:                dataStruct.Tick.Candle.Open,
-						High:                dataStruct.Tick.Candle.High,
-						Low:                 dataStruct.Tick.Candle.Low,
-						Close:               dataStruct.Tick.Candle.Close,
-						Volume:              dataStruct.Tick.Candle.Volume,
-						IsComplete:          dataStruct.Tick.Candle.Complete,
-						TradeCount:          dataStruct.Tick.Candle.TradeCount,
-						QuoteVolume:         dataStruct.Tick.Candle.QuoteVolume,
-						TakerBuyBaseVolume:  dataStruct.Tick.Candle.TakerBuyBaseVolume,
-						TakerBuyQuoteVolume: dataStruct.Tick.Candle.TakerBuyQuoteVolume,
+						} `json:"candles"`
 					}
-					// log.Printf("[WS] Received Candle: %s", candle.OpenTime.Format("2006-01-02 15:04"))
-					candleChan <- candle
-				}
-				// Dispatch any orders filled during this tick to the order channel.
-				for _, o := range dataStruct.Orders {
-					id := fmt.Sprintf("%d", o.ExchangeID)
-					if id == "0" {
-						id = fmt.Sprintf("%d", o.ID)
-					}
-					if id == "0" {
-						continue
-					}
-					orderChan <- &types.Order{
-						ID:        id,
-						Symbol:    o.Pair,
-						Side:      types.OrderSide(strings.ToUpper(o.Side)),
-						Type:      types.OrderType(strings.ToUpper(o.Type)),
-						Status:    types.OrderStatus(strings.ToUpper(o.Status)),
-						Price:     o.Price,
-						Quantity:  o.Quantity,
-						FilledQty: o.Quantity, // engine fills fully
-						// Fill price for every order type: market orders fill at the
-						// current candle's close, limit orders at the limit price. In
-						// both cases the engine reports it in o.Price.
-						AveragePrice: o.Price,
+					if err := json.Unmarshal(resp.Data, &hp); err != nil {
+						hr.err = fmt.Errorf("history decode: %w", err)
+					} else {
+						out := make([]*types.Candle, 0, len(hp.Candles))
+						for _, c := range hp.Candles {
+							out = append(out, &types.Candle{
+								Symbol:              c.Pair,
+								Timeframe:           e.smallestTF,
+								OpenTime:            c.Time,
+								CloseTime:           c.UpdatedAt,
+								Open:                c.Open,
+								High:                c.High,
+								Low:                 c.Low,
+								Close:               c.Close,
+								Volume:              c.Volume,
+								IsComplete:          true,
+								TradeCount:          c.TradeCount,
+								QuoteVolume:         c.QuoteVolume,
+								TakerBuyBaseVolume:  c.TakerBuyBaseVolume,
+								TakerBuyQuoteVolume: c.TakerBuyQuoteVolume,
+							})
+						}
+						hr.candles = out
 					}
 				}
-				if dataStruct.Done {
-					log.Println("Backtest Engine: Data stream finished.")
-					e.streamDone.Store(true)
-					close(candleChan) // Signal aggregator that no more candles are coming
-					return
+				historyCh <- &hr
+				close(historyCh)
+				continue
+			}
+
+			if orderCh != nil {
+				var or orderResponse
+				if resp.Status == "error" {
+					or.err = fmt.Errorf("%s", resp.Error)
+					// If the engine attached structured rejection detail, surface
+					// it explicitly so the strategy can react (e.g. shrink size).
+					var rej struct {
+						Code           string  `json:"code"`
+						RequiredQuote  float64 `json:"required_quote"`
+						AvailableQuote float64 `json:"available_quote"`
+						LockedQuote    float64 `json:"locked_quote"`
+						FeeEstimate    float64 `json:"fee_estimate"`
+					}
+					if len(resp.Data) > 0 && json.Unmarshal(resp.Data, &rej) == nil && rej.Code != "" {
+						or.err = fmt.Errorf("order rejected [%s]: required_quote=%.8f available_quote=%.8f locked_quote=%.8f fee=%.8f",
+							rej.Code, rej.RequiredQuote, rej.AvailableQuote, rej.LockedQuote, rej.FeeEstimate)
+					}
+				} else {
+					or.order = parseOrderAck(resp.Data)
 				}
+				orderCh <- &or
+				close(orderCh)
+			} else if accountCh != nil {
+				var ar accountResponse
+				if resp.Status == "error" {
+					ar.err = fmt.Errorf("%s", resp.Error)
+				} else {
+					json.Unmarshal(resp.Data, &ar.account)
+				}
+				accountCh <- &ar
+				close(accountCh)
+			} else if cancelCh != nil {
+				if resp.Status == "error" {
+					cancelCh <- fmt.Errorf("%s", resp.Error)
+				} else {
+					cancelCh <- nil
+				}
+				close(cancelCh)
 			}
 		}
-	}()
 
-	return nil
+		if resp.Status != "ok" {
+			log.Printf("Engine WS Error on %s: %s (%s)", resp.Action, resp.Error, resp.Code)
+			// A rejected tick sequence means the client and the engine no
+			// longer agree on what has been delivered. Carrying on would mean
+			// producing a result with a gap in it that nothing records, so the
+			// run stops instead.
+			switch resp.Code {
+			case "seq_ahead", "seq_too_old", "seq_required":
+				e.storeStreamErr(fmt.Errorf("backtest stream desynchronized: %s (%s)", resp.Error, resp.Code))
+				return outcomeFatal
+			case "not_attached":
+				// Another connection took this session over. It is now driving
+				// the run; this one must not.
+				e.storeStreamErr(fmt.Errorf("backtest session taken over by another connection: %s", resp.Error))
+				return outcomeFatal
+			}
+			continue
+		}
+
+		// The engine's opening frame, pushed on every attach before anything
+		// else — so a resumed strategy learns where the run stands, and warms
+		// up, before a single candle can reach it.
+		if resp.Action == "session_state" {
+			if resp.Status != "ok" {
+				e.storeStreamErr(&AttachError{Code: resp.Code, Message: resp.Error})
+				return outcomeFatal
+			}
+			state, err := decodeSessionState(resp.Data)
+			if err != nil {
+				log.Printf("Backtest Engine: %v", err)
+				continue
+			}
+			reattached := e.reattached.Load()
+			state.ColdStart = e.resuming && !reattached
+			if state.Resumed || reattached || e.resuming {
+				e.applyResume(state)
+			}
+			continue
+		}
+
+		// Server-pushed keepalive/observability frame. Arriving every ~15s, it
+		// also refreshes the read deadline above, which is what keeps long/slow
+		// backtests from being torn down as "disconnected". Just surface it.
+		if resp.Action == "progress" {
+			var p struct {
+				ProcessedCandles int64   `json:"processed_candles"`
+				TotalCandles     int64   `json:"total_candles"`
+				Percent          float64 `json:"percent"`
+				ETASeconds       float64 `json:"eta_seconds"`
+			}
+			if json.Unmarshal(resp.Data, &p) == nil && p.TotalCandles > 0 {
+				log.Printf("Backtest progress: %d/%d candles (%.1f%%), ETA %.0fs",
+					p.ProcessedCandles, p.TotalCandles, p.Percent, p.ETASeconds)
+			}
+			continue
+		}
+
+		if resp.Action == "next" {
+			var dataStruct struct {
+				Tick *struct {
+					Exchange string `json:"Exchange"`
+					Pair     string `json:"Pair"`
+					Candle   struct {
+						Time                time.Time `json:"time"`
+						UpdatedAt           time.Time `json:"updatedAt"`
+						Open                float64   `json:"open"`
+						High                float64   `json:"high"`
+						Low                 float64   `json:"low"`
+						Close               float64   `json:"close"`
+						Volume              float64   `json:"volume"`
+						Complete            bool      `json:"complete"`
+						TradeCount          int64     `json:"tradeCount"`
+						QuoteVolume         float64   `json:"quoteVolume"`
+						TakerBuyBaseVolume  float64   `json:"takerBuyBaseVolume"`
+						TakerBuyQuoteVolume float64   `json:"takerBuyQuoteVolume"`
+					} `json:"Candle"`
+				} `json:"tick"`
+				Seq    uint64 `json:"seq"`
+				Done   bool   `json:"done"`
+				Orders []struct {
+					ID         int64   `json:"id"`
+					ExchangeID int64   `json:"exchange_id"`
+					Pair       string  `json:"pair"`
+					Side       string  `json:"side"`
+					Type       string  `json:"type"`
+					Status     string  `json:"status"`
+					Price      float64 `json:"price"`
+					Quantity   float64 `json:"quantity"`
+				} `json:"orders"`
+			}
+			json.Unmarshal(resp.Data, &dataStruct)
+
+			// This tick is answered, so the next one gets a fresh sequence.
+			// A legacy engine echoes no seq; the request is still settled.
+			if dataStruct.Seq == 0 || dataStruct.Seq == e.inflightSeq.Load() {
+				e.inflightSeq.Store(0)
+			}
+			// When done:true the engine sends a sentinel zero-value tick.
+			// Skip it — the zero candle would otherwise pollute the SDK
+			// pipeline (advance clock backwards by no-op, fire OnCandle
+			// with empty data, etc.). The done flag itself is enough.
+			if dataStruct.Tick != nil && !dataStruct.Done && !dataStruct.Tick.Candle.Time.IsZero() {
+				candle := &types.Candle{
+					Symbol:              dataStruct.Tick.Pair,
+					Exchange:            dataStruct.Tick.Exchange,
+					Timeframe:           e.smallestTF,
+					OpenTime:            dataStruct.Tick.Candle.Time,
+					CloseTime:           dataStruct.Tick.Candle.UpdatedAt,
+					Open:                dataStruct.Tick.Candle.Open,
+					High:                dataStruct.Tick.Candle.High,
+					Low:                 dataStruct.Tick.Candle.Low,
+					Close:               dataStruct.Tick.Candle.Close,
+					Volume:              dataStruct.Tick.Candle.Volume,
+					IsComplete:          dataStruct.Tick.Candle.Complete,
+					TradeCount:          dataStruct.Tick.Candle.TradeCount,
+					QuoteVolume:         dataStruct.Tick.Candle.QuoteVolume,
+					TakerBuyBaseVolume:  dataStruct.Tick.Candle.TakerBuyBaseVolume,
+					TakerBuyQuoteVolume: dataStruct.Tick.Candle.TakerBuyQuoteVolume,
+				}
+				// log.Printf("[WS] Received Candle: %s", candle.OpenTime.Format("2006-01-02 15:04"))
+				candleChan <- candle
+			}
+			// Dispatch any orders filled during this tick to the order channel.
+			for _, o := range dataStruct.Orders {
+				id := fmt.Sprintf("%d", o.ExchangeID)
+				if id == "0" {
+					id = fmt.Sprintf("%d", o.ID)
+				}
+				if id == "0" {
+					continue
+				}
+				orderChan <- &types.Order{
+					ID:        id,
+					Symbol:    o.Pair,
+					Side:      types.OrderSide(strings.ToUpper(o.Side)),
+					Type:      types.OrderType(strings.ToUpper(o.Type)),
+					Status:    types.OrderStatus(strings.ToUpper(o.Status)),
+					Price:     o.Price,
+					Quantity:  o.Quantity,
+					FilledQty: o.Quantity, // engine fills fully
+					// Fill price for every order type: market orders fill at the
+					// current candle's close, limit orders at the limit price. In
+					// both cases the engine reports it in o.Price.
+					AveragePrice: o.Price,
+				}
+			}
+			if dataStruct.Done {
+				log.Println("Backtest Engine: Data stream finished.")
+				e.streamDone.Store(true)
+				return outcomeDone
+			}
+		}
+	}
+}
+
+// conn returns the currently attached socket, or nil if there is none.
+func (e *EngineClient) conn() *websocket.Conn { return e.wsConn.Load() }
+
+// ErrNotConnected is returned by writes issued while no socket is attached —
+// during a reconnect, or after the run has ended.
+//
+// Exported because the SDK's tick loop has to tell it apart from a real
+// failure: a write that lands mid-reconnect is a wait, not an error, and
+// treating it as terminal is what would make an otherwise-recoverable drop
+// end the run anyway.
+var ErrNotConnected = errors.New("backtest engine: websocket not connected")
+
+// writeJSON serializes every write to the engine.
+//
+// The nil check and the write are under the same lock deliberately: the
+// supervisor swaps the connection on reconnect, and checking outside the lock
+// leaves a window where the socket is replaced between the two.
+func (e *EngineClient) writeJSON(v interface{}) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	c := e.conn()
+	if c == nil {
+		return ErrNotConnected
+	}
+	return c.WriteJSON(v)
+}
+
+// SetOnResume registers a callback invoked whenever the SDK attaches to an
+// existing engine session — after an in-process reconnect, and after a cold
+// resume via BacktestOptions.SessionID.
+//
+// It fires before any candle from the resumed connection is dispatched, and
+// receives the engine's view of the session. That view is authoritative:
+// after a cold start local memory holds nothing, and after a reconnect it
+// holds a snapshot that may have moved on. Reconcile against it rather than
+// carrying on.
+func (e *EngineClient) SetOnResume(fn func(*types.SessionState)) {
+	e.onResumeMu.Lock()
+	defer e.onResumeMu.Unlock()
+	e.onResume = fn
 }
 
 // StreamErr reports a terminal error if the candle stream ended before the engine
@@ -815,25 +1069,49 @@ func (e *EngineClient) StreamErr() error {
 
 // nextTick issues a "next" command to step the backtester engine.
 // It is a no-op once the engine has signalled that the stream is finished.
+//
+// A tick already awaiting a response is re-sent under the *same* sequence
+// rather than a new one. That covers two cases with one rule: the SDK's own
+// 15s silence timer re-issuing a tick the engine is merely slow to answer, and
+// a reconnect re-requesting a tick the dropped socket never delivered. In both
+// the engine answers from its replay cache instead of advancing the run, so a
+// retry can neither skip a candle nor consume two.
 func (e *EngineClient) nextTick() error {
 	if e.streamDone.Load() {
 		return nil
 	}
-	if e.wsConn == nil {
-		return fmt.Errorf("nextTick failed: websocket not connected")
+	if e.conn() == nil {
+		return ErrNotConnected
 	}
 
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
-	// log.Printf("[WS] Sending Action: next")
-	if err := e.wsConn.WriteJSON(map[string]string{"action": "next"}); err != nil {
+	seq := e.inflightSeq.Load()
+	fresh := seq == 0
+	if fresh {
+		seq = e.nextSeq.Add(1)
+		e.inflightSeq.Store(seq)
+	}
+
+	if err := e.writeJSON(map[string]interface{}{
+		"action": "next",
+		"data":   map[string]uint64{"seq": seq},
+	}); err != nil {
+		if fresh {
+			// The send never happened, so the engine does not owe us this
+			// sequence. Releasing it keeps a later retry from asking to replay
+			// a tick that was never requested, which the engine rejects.
+			e.inflightSeq.Store(0)
+			e.nextSeq.Store(seq - 1)
+		}
+		if errors.Is(err, ErrNotConnected) {
+			return err
+		}
 		return fmt.Errorf("nextTick WriteJSON error: %w", err)
 	}
 	return nil
 }
 
 func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error) {
-	if e.wsConn == nil {
+	if e.conn() == nil {
 		return nil, fmt.Errorf("websocket not connected")
 	}
 
@@ -879,10 +1157,7 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 		"data":       orderData,
 	}
 
-	e.writeMu.Lock()
-	// log.Printf("[WS] Sending Action: order (reqID: %s)", reqID)
-	err = e.wsConn.WriteJSON(payload)
-	e.writeMu.Unlock()
+	err = e.writeJSON(payload)
 
 	if err != nil {
 		e.pendingMu.Lock()
@@ -912,7 +1187,7 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 }
 
 func (e *EngineClient) CancelOrder(ctx context.Context, exchange, symbol, orderID string) error {
-	if e.wsConn == nil {
+	if e.conn() == nil {
 		return fmt.Errorf("websocket not connected")
 	}
 
@@ -931,9 +1206,7 @@ func (e *EngineClient) CancelOrder(ctx context.Context, exchange, symbol, orderI
 		},
 	}
 
-	e.writeMu.Lock()
-	err := e.wsConn.WriteJSON(payload)
-	e.writeMu.Unlock()
+	err := e.writeJSON(payload)
 
 	if err != nil {
 		e.pendingMu.Lock()
@@ -959,7 +1232,7 @@ func (e *EngineClient) CancelOrder(ctx context.Context, exchange, symbol, orderI
 }
 
 func (e *EngineClient) GetAccount(ctx context.Context, exchange string, asset string) (*types.Account, error) {
-	if e.wsConn == nil {
+	if e.conn() == nil {
 		return nil, fmt.Errorf("websocket not connected")
 	}
 
@@ -979,9 +1252,7 @@ func (e *EngineClient) GetAccount(ctx context.Context, exchange string, asset st
 		},
 	}
 
-	e.writeMu.Lock()
-	err := e.wsConn.WriteJSON(payload)
-	e.writeMu.Unlock()
+	err := e.writeJSON(payload)
 
 	if err != nil {
 		e.pendingMu.Lock()
@@ -1012,7 +1283,7 @@ func (e *EngineClient) Next(ctx context.Context) error {
 // not exceed the simulated playhead and serves candles from data_provider.
 // Pure read — no playhead, wallet, or coordinator state is touched on either side.
 func (e *EngineClient) GetHistoricalCandles(ctx context.Context, exchange, symbol string, from, to time.Time, tf types.Timeframe) ([]*types.Candle, error) {
-	if e.wsConn == nil {
+	if e.conn() == nil {
 		return nil, fmt.Errorf("websocket not connected")
 	}
 
@@ -1035,9 +1306,7 @@ func (e *EngineClient) GetHistoricalCandles(ctx context.Context, exchange, symbo
 		},
 	}
 
-	e.writeMu.Lock()
-	err := e.wsConn.WriteJSON(payload)
-	e.writeMu.Unlock()
+	err := e.writeJSON(payload)
 
 	if err != nil {
 		e.pendingMu.Lock()
@@ -1106,7 +1375,7 @@ type rawResponse struct {
 // The shape mirrors PlaceOrder — register a channel, write, wait with the same
 // fail-safe timeout — but without a typed pending map per action.
 func (e *EngineClient) call(ctx context.Context, action string, data map[string]interface{}) (json.RawMessage, error) {
-	if e.wsConn == nil {
+	if e.conn() == nil {
 		return nil, fmt.Errorf("websocket not connected")
 	}
 
@@ -1123,13 +1392,11 @@ func (e *EngineClient) call(ctx context.Context, action string, data map[string]
 		e.pendingMu.Unlock()
 	}
 
-	e.writeMu.Lock()
-	err := e.wsConn.WriteJSON(map[string]interface{}{
+	err := e.writeJSON(map[string]interface{}{
 		"action":     action,
 		"request_id": reqID,
 		"data":       data,
 	})
-	e.writeMu.Unlock()
 
 	if err != nil {
 		forget()

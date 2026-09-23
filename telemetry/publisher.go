@@ -98,15 +98,15 @@ type httpPublisher struct {
 func (p *httpPublisher) Enabled() bool { return true }
 
 type telemetryPayload struct {
-	SessionID string            `json:"session_id"`
-	Exchange  string            `json:"exchange,omitempty"`
-	Symbol    string            `json:"symbol,omitempty"`
-	EventType string            `json:"event_type"`
-	Order     *orderPayload     `json:"order,omitempty"`
-	Balance   *balancePayload   `json:"balance,omitempty"`
-	Balances  []balancePayload  `json:"balances,omitempty"`
-	Heartbeat *heartbeatPayload `json:"heartbeat,omitempty"`
-	Stopped   *stoppedPayload   `json:"stopped,omitempty"`
+	SessionID string              `json:"session_id"`
+	Exchange  string              `json:"exchange,omitempty"`
+	Symbol    string              `json:"symbol,omitempty"`
+	EventType string              `json:"event_type"`
+	Order     *orderPayload       `json:"order,omitempty"`
+	Balance   *balancePayload     `json:"balance,omitempty"`
+	Balances  []balancePayload    `json:"balances,omitempty"`
+	Heartbeat *heartbeatPayload   `json:"heartbeat,omitempty"`
+	Stopped   *stoppedPayload     `json:"stopped,omitempty"`
 	Meta      *sessionMetaPayload `json:"meta,omitempty"`
 }
 

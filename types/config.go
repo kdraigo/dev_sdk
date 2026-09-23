@@ -77,6 +77,16 @@ type Credentials struct {
 
 // BacktestOptions contains configuration necessary to prepare the engine session for backtesting.
 type BacktestOptions struct {
+	// SessionID attaches to an existing engine session instead of creating a
+	// new one. Empty means a fresh session.
+	//
+	// It is how a bot that died mid-run picks up where it left off: the engine
+	// holds an interrupted session, wallets and positions intact, for its
+	// resume window, and the same API key that created it may reattach. The
+	// strategy's own memory does not come back with it — see SetOnResume for
+	// rebuilding that.
+	SessionID string
+
 	Endpoint           string   // Engine API URL e.g. "http://localhost:8080"
 	SessionName        string   // Human readable name for the backtesting run.
 	RequestedExchanges []string // List of exchanges to pull historical data against (e.g., "binance").

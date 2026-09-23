@@ -27,8 +27,9 @@ type SDK struct {
 	onCandleAll      types.OnCandleFunc                     // Fires on every closed candle regardless of timeframe.
 	onCandleHandlers map[types.Timeframe]types.OnCandleFunc // Per-timeframe callbacks.
 	onOrderUpdate    types.OnOrderUpdateFunc
-	onComplete       func()      // Called when a backtest run finishes naturally
-	onError          func(error) // Called when a backtest run ends in a terminal error
+	onResume         func(*types.Context, *types.SessionState) // Called on every attach to an existing session
+	onComplete       func()                                    // Called when a backtest run finishes naturally
+	onError          func(error)                               // Called when a backtest run ends in a terminal error
 
 	// runErr holds a terminal error from the backtest run (e.g. a truncated
 	// stream). Set by the tick loop before cancelling; returned from Start so a
@@ -177,6 +178,31 @@ func (s *SDK) SetOnError(fn func(error)) {
 	s.onError = fn
 }
 
+// SetOnResume registers a callback invoked whenever the SDK attaches to an
+// existing engine session — after an in-process reconnect, and after a cold
+// resume started with BacktestOptions.SessionID.
+//
+// It fires before any candle from the resumed connection is dispatched, and
+// receives the engine's view of the session. That view is authoritative:
+// after a cold start this process holds nothing, and after a reconnect what it
+// holds is a snapshot that may have moved on. Reconcile against it rather than
+// carrying on.
+//
+// The usual body is the warm-up idiom — GetCandlesFromTo(sessionStart,
+// state.Playhead, tf) to rebuild indicators — followed by reconciling position
+// bookkeeping against state.Positions and state.OpenOrders.
+//
+// It runs synchronously on the stream goroutine, so a long history fetch
+// delays the first candle. That is the correct trade: the alternative lets a
+// bar reach the strategy before its indicators are warm.
+//
+// state.ColdStart distinguishes the two cases. After an in-process reconnect
+// indicators and the in-flight aggregate bar are intact, and a strategy
+// usually needs to do nothing at all.
+func (s *SDK) SetOnResume(fn func(ctx *types.Context, state *types.SessionState)) {
+	s.onResume = fn
+}
+
 // Start launches the architecture pipeline and begins processing stream data.
 func (s *SDK) Start(ctx context.Context) error {
 	if s.adapter == nil {
@@ -198,6 +224,26 @@ func (s *SDK) Start(ctx context.Context) error {
 		Config: s.config,
 		Trader: s,
 		Clock:  s.clock,
+	}
+
+	// Resuming: the engine tells us where the run actually stands, and the
+	// simulated clock has to be moved there before anything else happens.
+	// It was seeded at the original session start, which on a resume is hours
+	// behind the playhead — and a warm-up history request computed against it
+	// would be rejected outright, since the engine refuses to read past the
+	// playhead. Registered even when the caller set no callback of its own,
+	// because the clock reseed is not optional.
+	if resumable, ok := s.adapter.(interface {
+		SetOnResume(func(*types.SessionState))
+	}); ok {
+		resumable.SetOnResume(func(state *types.SessionState) {
+			if bc, ok := s.clock.(*backtestClock); ok && !state.Playhead.IsZero() {
+				bc.Advance(state.Playhead)
+			}
+			if s.onResume != nil {
+				s.onResume(sdkCtx, state)
+			}
+		})
 	}
 
 	// 2. Start internal processing pipelines
@@ -385,17 +431,43 @@ func (s *SDK) Start(ctx context.Context) error {
 	// 6. Start the deterministic ticking loop for backtesting
 	if s.config.Environment == types.EnvBacktest {
 		go func() {
-			// Trigger initial tick
-			if err := s.adapter.Next(ctx); err != nil {
-				log.Printf("DevSDK: initial tick error: %v", err)
-				cancel()
-				return
-			}
-
 			// nextTimeout is how long the tick loop waits for syncChan before
 			// assuming the engine went silent (e.g. after an order fill) and
 			// re-issuing a "next" command to unblock it.
+			//
+			// Re-issuing used to be able to double-step the engine: the
+			// request carried no identity, so a tick that was merely slow
+			// could be served twice and one of the two candles reached
+			// nobody. Ticks now carry a sequence and a retry re-sends the same
+			// one, which the engine answers from cache — so this is a genuine
+			// retry rather than a second step.
 			const nextTimeout = 15 * time.Second
+
+			// tick issues the next step, reporting whether the run should
+			// continue. A write that lands while the adapter is reconnecting
+			// is not a failure: the session is parked engine-side and the
+			// adapter is redialing into it, so the loop waits and the timer
+			// above retries. Treating that as terminal is precisely what made
+			// a recoverable drop end the run anyway.
+			tick := func(label string) bool {
+				err := s.adapter.Next(ctx)
+				switch {
+				case err == nil:
+					return true
+				case errors.Is(err, backtest.ErrNotConnected):
+					log.Printf("DevSDK: %s deferred — adapter is reconnecting", label)
+					return true
+				default:
+					log.Printf("DevSDK: %s error: %v", label, err)
+					s.finishWithError(err)
+					cancel()
+					return false
+				}
+			}
+
+			if !tick("initial tick") {
+				return
+			}
 
 			for {
 				select {
@@ -419,10 +491,7 @@ func (s *SDK) Start(ctx context.Context) error {
 						cancel()
 						return
 					}
-					if err := s.adapter.Next(ctx); err != nil {
-						log.Printf("DevSDK: Next() error: %v", err)
-						s.finishWithError(err)
-						cancel()
+					if !tick("Next()") {
 						return
 					}
 				case <-time.After(nextTimeout):
@@ -430,10 +499,7 @@ func (s *SDK) Start(ctx context.Context) error {
 					// This happens when the engine sends an order-fill event but waits
 					// for another "next" command before streaming the following candle.
 					log.Printf("DevSDK: engine silent for %s — re-issuing next", nextTimeout)
-					if err := s.adapter.Next(ctx); err != nil {
-						log.Printf("DevSDK: recovery Next() error: %v", err)
-						s.finishWithError(err)
-						cancel()
+					if !tick("recovery Next()") {
 						return
 					}
 				}

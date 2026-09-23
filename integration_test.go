@@ -24,23 +24,63 @@ type mockEngineServer struct {
 	accountReqs  int
 	candlesSent  int
 	fillReported bool
-	// truncateAfter, when > 0, makes the WS handler drop the connection abruptly
-	// (without a done:true frame) after this many "next" calls — simulating a
-	// dropped websocket mid-run (D1).
+	// truncateAfter, when > 0, makes the WS handler drop the connection
+	// abruptly (without a done:true frame) after this many "next" calls AND
+	// refuse every redial thereafter — an engine that has genuinely lost the
+	// session. This is the D1 case: a partial run must surface as an error and
+	// must never pass as a clean finish.
 	truncateAfter int
+
+	// dropAfter, when > 0, drops the connection after this many "next" calls
+	// but accepts a redial — the ordinary interrupted-connection case the
+	// resume feature exists for.
+	dropAfter int
+
+	// Resume bookkeeping.
+	connections  int      // WS upgrades accepted
+	sessionPosts int      // POSTs to /api/v1/dev/session
+	seqLog       []uint64 // every seq the client asked for, in order
+	lastSeq      uint64   // last seq served
+	lastResp     []byte   // the response served for lastSeq
+	refuse       bool     // reject further upgrades with session_unknown
+	// suppressSessionState models an engine predating the opening frame.
+	suppressSessionState bool
+	closed               bool // client sent an explicit close action
 }
 
 func newMockEngineServer() *mockEngineServer {
 	m := &mockEngineServer{}
 	m.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/ws") {
+			m.mu.Lock()
+			refused := m.refuse
+			if !refused {
+				m.connections++
+			}
+			resumed := m.connections > 1
+			m.mu.Unlock()
+
+			if refused {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": "Session not found",
+					"code":  "session_unknown",
+				})
+				return
+			}
+
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				return
 			}
 			defer conn.Close()
+			m.sendSessionState(conn, resumed)
 			m.handleWS(conn)
 		} else if strings.HasPrefix(r.URL.Path, "/api/v1/dev/session") {
+			m.mu.Lock()
+			m.sessionPosts++
+			m.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"status": "ok",
@@ -49,6 +89,39 @@ func newMockEngineServer() *mockEngineServer {
 		}
 	}))
 	return m
+}
+
+// sendSessionState pushes the unsolicited opening frame the engine sends on
+// every attach.
+func (m *mockEngineServer) sendSessionState(conn *websocket.Conn, resumed bool) {
+	m.mu.Lock()
+	lastSeq := m.lastSeq
+	sent := m.candlesSent
+	suppress := m.suppressSessionState
+	m.mu.Unlock()
+
+	if suppress {
+		return
+	}
+
+	conn.WriteJSON(map[string]interface{}{
+		"action": "session_state",
+		"status": "ok",
+		"data": map[string]interface{}{
+			"session_id": "test-session-id",
+			"resumed":    resumed,
+			"cold_start": resumed,
+			"last_seq":   lastSeq,
+			"playhead":   time.Now().UTC().Add(time.Duration(sent) * time.Minute),
+			"timeframe":  "1m",
+		},
+	})
+}
+
+func (m *mockEngineServer) stats() (conns, posts int, seqs []uint64, closed bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.connections, m.sessionPosts, append([]uint64(nil), m.seqLog...), m.closed
 }
 
 func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
@@ -130,23 +203,56 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 			}
 			conn.WriteJSON(resp)
 
+		case "close":
+			m.closed = true
+			m.mu.Unlock()
+			conn.WriteJSON(map[string]interface{}{
+				"action":     "close",
+				"request_id": req.RequestID,
+				"status":     "ok",
+			})
+			return
+
 		case "next":
+			var nd struct {
+				Data struct {
+					Seq uint64 `json:"seq"`
+				} `json:"data"`
+			}
+			json.Unmarshal(message, &nd)
+			seq := nd.Data.Seq
+			m.seqLog = append(m.seqLog, seq)
+
+			// Exactly-once: a repeat of the current sequence is answered from
+			// cache rather than stepping the run again.
+			if seq != 0 && seq == m.lastSeq && m.lastResp != nil {
+				cached := m.lastResp
+				m.mu.Unlock()
+				conn.WriteMessage(websocket.TextMessage, cached)
+				continue
+			}
+
 			m.nextCalls++
 			if m.truncateAfter > 0 && m.nextCalls > m.truncateAfter {
-				// Simulate a dropped websocket: close abruptly without a
-				// done:true frame. Return so the deferred conn.Close() fires.
+				// An engine that has lost the session: drop, and refuse every
+				// redial. Without the refusal the supervisor would reconnect
+				// and the run would finish, which is not what this exercises.
+				m.refuse = true
+				m.mu.Unlock()
+				return
+			}
+			if m.dropAfter > 0 && m.nextCalls > m.dropAfter {
+				// An ordinary interrupted connection: drop, but stay
+				// resumable. The tick is deliberately not served, so the
+				// client must re-request this sequence to get it.
+				m.dropAfter = 0
+				m.nextCalls--
 				m.mu.Unlock()
 				return
 			}
 			if m.nextCalls > 5 {
 				// Finish after 5 candles
-				conn.WriteJSON(map[string]interface{}{
-					"action": "next",
-					"status": "ok",
-					"data": map[string]interface{}{
-						"done": true,
-					},
-				})
+				m.serveTick(conn, seq, map[string]interface{}{"done": true})
 			} else {
 				m.candlesSent++
 				data := map[string]interface{}{
@@ -184,11 +290,7 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 						},
 					}
 				}
-				conn.WriteJSON(map[string]interface{}{
-					"action": "next",
-					"status": "ok",
-					"data":   data,
-				})
+				m.serveTick(conn, seq, data)
 			}
 		}
 		m.mu.Unlock()
@@ -282,4 +384,22 @@ func TestSDK_Integration_Flow(t *testing.T) {
 	if mock.nextCalls != 6 {
 		t.Errorf("Expected exactly 6 Next() calls (1 initial + 5 candles), got %d", mock.nextCalls)
 	}
+}
+
+// serveTick writes one tick response and caches it, so a repeat of the same
+// sequence can be answered without stepping the run again. Caller holds m.mu.
+func (m *mockEngineServer) serveTick(conn *websocket.Conn, seq uint64, data map[string]interface{}) {
+	if seq != 0 {
+		data["seq"] = seq
+	}
+	frame, _ := json.Marshal(map[string]interface{}{
+		"action": "next",
+		"status": "ok",
+		"data":   data,
+	})
+	if seq != 0 {
+		m.lastSeq = seq
+		m.lastResp = frame
+	}
+	conn.WriteMessage(websocket.TextMessage, frame)
 }

@@ -302,3 +302,81 @@ func (f OrderFeed) Describe() string {
 		return "NONE — order updates will not be delivered"
 	}
 }
+
+// SessionState is the engine's view of a backtest session, delivered the moment
+// the SDK attaches to it.
+//
+// It is what makes a resume possible. A strategy whose process restarted has
+// none of its own state left — no indicator history, no partial bar, no record
+// of what it had open — and this is the authoritative answer to all of it.
+// Even after a mere reconnect, local memory is a snapshot that may have moved
+// on, so the right reflex is to reconcile against this rather than carry on.
+type SessionState struct {
+	SessionID string `json:"session_id"`
+
+	// Resumed is the engine's fact: this session has been attached before.
+	Resumed bool `json:"resumed"`
+
+	// ColdStart is the client's fact: this process did not create the session,
+	// so none of its own state — indicators, partial bars, position
+	// bookkeeping — survived and all of it has to be rebuilt from here. The
+	// engine cannot know this; the SDK sets it.
+	//
+	// After a mere in-process reconnect it is false, and a strategy usually
+	// needs to do nothing at all.
+	ColdStart bool `json:"-"`
+
+	// SupersededPrevious means this attach displaced a connection the engine
+	// still believed was live — normally a restarted bot whose old socket has
+	// not timed out, but also what a client racing itself looks like.
+	SupersededPrevious bool `json:"superseded_previous"`
+
+	Epoch uint64 `json:"epoch"`
+
+	// LastSeq is the tick sequence the engine last served.
+	LastSeq uint64 `json:"last_seq"`
+
+	// Playhead is the close time of the most recently dispatched candle: the
+	// point history may be read up to, and the point to warm indicators to.
+	Playhead  time.Time `json:"playhead"`
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+	Timeframe string    `json:"timeframe"`
+
+	Progress SessionProgress `json:"progress"`
+
+	Wallets    []Account      `json:"wallets"`
+	Positions  []Position     `json:"positions"`
+	OpenOrders []ResumedOrder `json:"open_orders"`
+
+	// ParkExpiresAt is the deadline for reconnecting after a drop; RunDeadline
+	// is when the remaining run budget would be exhausted.
+	ParkExpiresAt time.Time `json:"park_expires_at"`
+	RunDeadline   time.Time `json:"run_deadline"`
+}
+
+// SessionProgress is how far a run has advanced.
+type SessionProgress struct {
+	ProcessedCandles  int64     `json:"processed_candles"`
+	TotalCandles      int64     `json:"total_candles"`
+	CurrentCandleTime time.Time `json:"current_candle_time"`
+	Percent           float64   `json:"percent"`
+	CandlesPerSec     float64   `json:"candles_per_sec"`
+	ETASeconds        float64   `json:"eta_seconds"`
+}
+
+// ResumedOrder is an order still open on the engine at the moment of an attach.
+//
+// It mirrors the engine's stored row rather than types.Order because it comes
+// from the database view, which is the only complete record of the book: the
+// paper wallet exposes no order list.
+type ResumedOrder struct {
+	ID         string  `json:"id"`
+	ExchangeID int64   `json:"exchange_id"`
+	Pair       string  `json:"pair"`
+	Side       string  `json:"side"`
+	Type       string  `json:"type"`
+	Status     string  `json:"status"`
+	Price      float64 `json:"price"`
+	Quantity   float64 `json:"quantity"`
+}
