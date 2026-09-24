@@ -915,3 +915,17 @@ func (s *SDK) GetPositions(ctx context.Context, exchange string) ([]*types.Posit
 	}
 	return reader.GetPositions(ctx, exchange)
 }
+
+// SessionID returns the backtest session the SDK is driving, or "" outside
+// backtest mode or before Start has prepared one.
+//
+// Record it if the strategy might need to come back: a run interrupted by a
+// process restart is resumed by handing this id back through
+// BacktestOptions.SessionID, and the engine holds the session open only for
+// its resume window.
+func (s *SDK) SessionID() string {
+	if a, ok := s.adapter.(interface{ SessionID() string }); ok {
+		return a.SessionID()
+	}
+	return ""
+}

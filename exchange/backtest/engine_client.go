@@ -619,6 +619,15 @@ func (e *EngineClient) supervise(ctx context.Context, candleChan chan<- *types.C
 		}
 
 		outcome := e.readLoop(conn, candleChan, orderChan)
+
+		// Say goodbye on a clean finish. Hanging up silently now means "my
+		// connection broke", and while the engine recognises a finished run
+		// and finalizes it anyway, leaving it to infer that costs a round of
+		// ambiguity for no reason.
+		if outcome == outcomeDone {
+			_ = e.writeJSON(map[string]interface{}{"action": "close"})
+		}
+
 		e.wsConn.Store(nil)
 		_ = conn.Close()
 		e.failPendingWaiters()

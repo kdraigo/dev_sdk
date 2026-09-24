@@ -349,10 +349,11 @@ type SessionState struct {
 	Positions  []Position     `json:"positions"`
 	OpenOrders []ResumedOrder `json:"open_orders"`
 
-	// ParkExpiresAt is the deadline for reconnecting after a drop; RunDeadline
-	// is when the remaining run budget would be exhausted.
-	ParkExpiresAt time.Time `json:"park_expires_at"`
-	RunDeadline   time.Time `json:"run_deadline"`
+	// ResumeWindowSeconds is how long the engine holds this session open if
+	// the connection drops — the time available to reconnect. RunDeadline is
+	// when the remaining run budget would be exhausted.
+	ResumeWindowSeconds float64   `json:"resume_window_seconds"`
+	RunDeadline         time.Time `json:"run_deadline"`
 }
 
 // SessionProgress is how far a run has advanced.
@@ -379,4 +380,10 @@ type ResumedOrder struct {
 	Status     string  `json:"status"`
 	Price      float64 `json:"price"`
 	Quantity   float64 `json:"quantity"`
+}
+
+// ResumeWindow is how long the engine holds this session open after a dropped
+// connection.
+func (s SessionState) ResumeWindow() time.Duration {
+	return time.Duration(s.ResumeWindowSeconds * float64(time.Second))
 }

@@ -218,3 +218,11 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 		return false
 	}
 }
+
+// SessionID returns the engine session this client is driving, once
+// PrepareSession has run.
+//
+// A bot has to be able to record this: it is the only handle that lets a
+// restarted process reattach via BacktestOptions.SessionID, and without an
+// accessor the id existed solely in a log line.
+func (e *EngineClient) SessionID() string { return e.sessionID }
