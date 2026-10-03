@@ -128,6 +128,21 @@ type Order struct {
 	// GroupID links the legs of a bracket. Two orders sharing a non-empty
 	// GroupID are mutually cancelling: when one fills, the other is cancelled.
 	GroupID string
+
+	// CumulativeFee is the commission charged on the order so far, summed
+	// over its fills, where the adapter can tell the fills apart. Zero when
+	// unknown.
+	//
+	// Fee is what the venue reported on this update, and venues disagree on
+	// what that is: Binance futures sends the latest fill's commission alone,
+	// Bybit a running total. Fee keeps that meaning for strategies that book
+	// it per update; CumulativeFee is the order's total either way.
+	CumulativeFee float64
+
+	// RealizedPnL is the profit the venue realized on this order's fills so
+	// far, before fees, summed per fill (Binance futures "rp"). Zero on spot
+	// and wherever the venue does not report it.
+	RealizedPnL float64
 }
 
 // BracketRequest places a take-profit and a protective stop as a mutually

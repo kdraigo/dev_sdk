@@ -384,22 +384,26 @@ func (b *BinanceFuturesClient) handleOrderUpdate(ctx context.Context, u *futures
 		log.Printf("Binance futures: LIQUIDATION on %s — %s %s at %s", u.Symbol, u.Side, u.AccumulatedFilledQty, u.AveragePrice)
 	}
 
+	feeTotal, realized := b.recordFill(id, u)
+
 	order := &types.Order{
-		ID:           id,
-		Symbol:       symbol,
-		Exchange:     types.ExchangeBinanceFutures,
-		Side:         side,
-		Type:         sdkType,
-		Status:       status,
-		Price:        parseFloat(u.OriginalPrice),
-		Quantity:     parseFloat(u.OriginalQty),
-		FilledQty:    parseFloat(u.AccumulatedFilledQty),
-		AveragePrice: parseFloat(u.AveragePrice),
-		Fee:          parseFloat(u.Commission),
-		FeeAsset:     u.CommissionAsset,
-		StopPrice:    stop,
-		CreatedAt:    time.UnixMilli(u.TradeTime),
-		UpdatedAt:    time.UnixMilli(u.TradeTime),
+		ID:            id,
+		Symbol:        symbol,
+		Exchange:      types.ExchangeBinanceFutures,
+		Side:          side,
+		Type:          sdkType,
+		Status:        status,
+		Price:         parseFloat(u.OriginalPrice),
+		Quantity:      parseFloat(u.OriginalQty),
+		FilledQty:     parseFloat(u.AccumulatedFilledQty),
+		AveragePrice:  parseFloat(u.AveragePrice),
+		Fee:           parseFloat(u.Commission),
+		FeeAsset:      u.CommissionAsset,
+		CumulativeFee: feeTotal,
+		RealizedPnL:   realized,
+		StopPrice:     stop,
+		CreatedAt:     time.UnixMilli(u.TradeTime),
+		UpdatedAt:     time.UnixMilli(u.TradeTime),
 	}
 
 	b.mu.RLock()
@@ -435,7 +439,49 @@ func (b *BinanceFuturesClient) handleOrderUpdate(ctx context.Context, u *futures
 		// process.
 		b.forgetAlgo(u.ClientOrderID)
 		b.forgetDeclared(strconv.FormatInt(u.ID, 10))
+		b.forgetFills(id)
 	}
+}
+
+// orderFills is one order's fills so far. Binance reports each fill's
+// commission ("n") and realized profit ("rp") alone; the trade ids make the
+// sum safe against the same fill being delivered twice.
+type orderFills struct {
+	fee      float64
+	realized float64
+	trades   map[int64]struct{}
+}
+
+// recordFill adds an update's fill, if it carries one, to the order's totals
+// and returns them. Updates that are not fills (NEW, CANCELED, EXPIRED) carry
+// no trade id and leave the totals as they were.
+func (b *BinanceFuturesClient) recordFill(id string, u *futures.WsOrderTradeUpdate) (fee, realized float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f := b.fills[id]
+	if u.TradeID != 0 && parseFloat(u.LastFilledQty) > 0 {
+		if f == nil {
+			f = &orderFills{trades: make(map[int64]struct{})}
+			b.fills[id] = f
+		}
+		if _, dup := f.trades[u.TradeID]; !dup {
+			f.trades[u.TradeID] = struct{}{}
+			f.fee += parseFloat(u.Commission)
+			f.realized += parseFloat(u.RealizedPnL)
+		}
+	}
+	if f == nil {
+		return 0, 0
+	}
+	return f.fee, f.realized
+}
+
+// forgetFills drops a finished order's totals, which would otherwise
+// accumulate for the life of the process.
+func (b *BinanceFuturesClient) forgetFills(id string) {
+	b.mu.Lock()
+	delete(b.fills, id)
+	b.mu.Unlock()
 }
 
 // bracketGroupID gives the two legs of a bracket one stable shared id,

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/kdraigo/dev_sdk/types"
@@ -68,6 +69,7 @@ func NewPublisher(sessionID, url, keyID, privateKey, defaultExchange, defaultSym
 		defaultExchange: defaultExchange,
 		defaultSymbol:   defaultSymbol,
 		client:          &http.Client{Timeout: 5 * time.Second},
+		open:            make(map[string]orderPayload),
 	}
 }
 
@@ -93,7 +95,18 @@ type httpPublisher struct {
 	defaultExchange string
 	defaultSymbol   string
 	client          *http.Client
+
+	// open is the last payload sent for each order not yet finished, used to
+	// fill in sparse updates. See complete.
+	mu   sync.Mutex
+	open map[string]orderPayload
 }
+
+// maxTrackedOrders bounds the open-order memory. Past it an arbitrary entry
+// is dropped: the memory only improves sparse updates, which live_trades also
+// guards against, so losing one is harmless where growing without bound on a
+// long-running bot is not.
+const maxTrackedOrders = 4096
 
 func (p *httpPublisher) Enabled() bool { return true }
 
@@ -127,6 +140,7 @@ type orderPayload struct {
 	AvgPrice      float64        `json:"avg_price"`
 	Fee           float64        `json:"fee"`
 	FeeAsset      string         `json:"fee_asset"`
+	RealizedPnL   float64        `json:"realized_pnl"`
 	CreatedAt     time.Time      `json:"created_at"`
 	UpdatedAt     time.Time      `json:"updated_at"`
 	Reason        map[string]any `json:"reason,omitempty"`
@@ -155,29 +169,103 @@ type stoppedPayload struct {
 
 func (p *httpPublisher) PublishOrder(order *types.Order, reason map[string]any, logs []string) {
 	reasonOut, logsOut := truncateReasonAndLogs(reason, logs)
+	// The order's total commission, not what this update charged: Binance
+	// futures reports each fill's commission alone, and live_trades keeps one
+	// row per order.
+	fee := order.Fee
+	if order.CumulativeFee > 0 {
+		fee = order.CumulativeFee
+	}
+	op := orderPayload{
+		OrderID:     order.ID,
+		Side:        string(order.Side),
+		Type:        string(order.Type),
+		Status:      string(order.Status),
+		Price:       order.Price,
+		Qty:         order.Quantity,
+		FilledQty:   order.FilledQty,
+		AvgPrice:    order.AveragePrice,
+		Fee:         fee,
+		FeeAsset:    order.FeeAsset,
+		RealizedPnL: order.RealizedPnL,
+		CreatedAt:   order.CreatedAt,
+		UpdatedAt:   order.UpdatedAt,
+		Reason:      reasonOut,
+		Logs:        logsOut,
+	}
+	p.complete(&op)
 	payload := &telemetryPayload{
 		SessionID: p.sessionID,
 		Exchange:  order.Exchange,
 		Symbol:    order.Symbol,
 		EventType: "order",
-		Order: &orderPayload{
-			OrderID:   order.ID,
-			Side:      string(order.Side),
-			Type:      string(order.Type),
-			Status:    string(order.Status),
-			Price:     order.Price,
-			Qty:       order.Quantity,
-			FilledQty: order.FilledQty,
-			AvgPrice:  order.AveragePrice,
-			Fee:       order.Fee,
-			FeeAsset:  order.FeeAsset,
-			CreatedAt: order.CreatedAt,
-			UpdatedAt: order.UpdatedAt,
-			Reason:    reasonOut,
-			Logs:      logsOut,
-		},
+		Order:     &op,
 	}
 	go p.send(payload)
+}
+
+// complete fills what a sparse update left out from the last payload sent for
+// the same order, then remembers this one.
+//
+// The SDK's synthetic CANCELED carries only an id and a status, and a poll
+// finds no commission; sent as they are, live_trades would hear of an order
+// with no side, type or size, or one whose fee went back to zero. Payloads
+// are completed here rather than in CancelOrder because only the publisher
+// sees every update an order has had.
+func (p *httpPublisher) complete(o *orderPayload) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if last, ok := p.open[o.OrderID]; ok {
+		if o.Side == "" {
+			o.Side = last.Side
+		}
+		if o.Type == "" {
+			o.Type = last.Type
+		}
+		if o.Price == 0 {
+			o.Price = last.Price
+		}
+		if o.Qty == 0 {
+			o.Qty = last.Qty
+		}
+		if o.FilledQty < last.FilledQty {
+			o.FilledQty = last.FilledQty
+		}
+		if o.AvgPrice == 0 {
+			o.AvgPrice = last.AvgPrice
+		}
+		if o.Fee == 0 {
+			o.Fee, o.FeeAsset = last.Fee, last.FeeAsset
+		}
+		if o.RealizedPnL == 0 {
+			o.RealizedPnL = last.RealizedPnL
+		}
+		if o.CreatedAt.IsZero() {
+			o.CreatedAt = last.CreatedAt
+		}
+	}
+	if o.UpdatedAt.IsZero() {
+		o.UpdatedAt = time.Now().UTC()
+	}
+	if o.CreatedAt.IsZero() {
+		o.CreatedAt = o.UpdatedAt
+	}
+
+	switch types.OrderStatus(o.Status) {
+	case types.OrderStatusFilled, types.OrderStatusCanceled, types.OrderStatusRejected:
+		delete(p.open, o.OrderID)
+		return
+	}
+	if _, ok := p.open[o.OrderID]; !ok && len(p.open) >= maxTrackedOrders {
+		for k := range p.open {
+			delete(p.open, k)
+			break
+		}
+	}
+	kept := *o
+	kept.Reason, kept.Logs = nil, nil
+	p.open[o.OrderID] = kept
 }
 
 func (p *httpPublisher) PublishBalance(account *types.Account) {

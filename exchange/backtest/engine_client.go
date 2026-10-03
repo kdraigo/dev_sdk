@@ -232,6 +232,8 @@ func parseOrderAck(data json.RawMessage) *types.Order {
 		Price:    w.Price,
 		Quantity: w.Quantity,
 		Fee:      w.Commission,
+		// The engine fills an order whole, so its commission is the total.
+		CumulativeFee: w.Commission,
 	}
 
 	// Carry the bracket fields through, so a strategy handling OnOrderUpdate can

@@ -223,8 +223,10 @@ func mapBybitOrder(d bybit.V5WebsocketPrivateOrderData) *types.Order {
 		AveragePrice: avgPrice,
 		Fee:          fee,
 		FeeAsset:     string("USDT"),
-		CreatedAt:    parseMillis(d.CreatedTime),
-		UpdatedAt:    parseMillis(d.UpdatedTime),
+		// Bybit's cumExecFee is already the order's running total.
+		CumulativeFee: fee,
+		CreatedAt:     parseMillis(d.CreatedTime),
+		UpdatedAt:     parseMillis(d.UpdatedTime),
 	}
 }
 

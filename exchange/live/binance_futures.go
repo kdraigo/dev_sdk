@@ -62,6 +62,12 @@ type BinanceFuturesClient struct {
 	// live incident hard to reconstruct.
 	declared map[string]types.OrderType
 
+	// fills sums each open order's fills: commission and realized profit.
+	// Binance sends both per fill, not as a running total, so an order
+	// filled in three trades would otherwise report only the last trade's
+	// commission. Keyed by the SDK order id.
+	fills map[string]*orderFills
+
 	// orderOut is the SDK's order channel, held from ConnectStream so that a
 	// conditional placement can announce itself. See emitSynthetic.
 	orderOut chan<- *types.Order
@@ -88,6 +94,7 @@ func NewBinanceFuturesClient(cfg *types.Config) *BinanceFuturesClient {
 		brackets: make(map[string]string),
 		algos:    make(map[string]algoRef),
 		declared: make(map[string]types.OrderType),
+		fills:    make(map[string]*orderFills),
 		stopped:  make(chan struct{}),
 	}
 }

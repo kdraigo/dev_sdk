@@ -2,8 +2,12 @@ package telemetry
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kdraigo/dev_sdk/types"
 )
@@ -126,5 +130,99 @@ func TestBuildBalancesPayload_AccountExchangeWins(t *testing.T) {
 	got := hp.buildBalancesPayload(&types.Account{Exchange: "bybit"}, "balance")
 	if got.Exchange != "bybit" {
 		t.Fatalf("account exchange should override default, got %q", got.Exchange)
+	}
+}
+
+// capture starts a server that hands each telemetry body to the test.
+func capture(t *testing.T) (*httpPublisher, <-chan telemetryPayload) {
+	t.Helper()
+	got := make(chan telemetryPayload, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p telemetryPayload
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		got <- p
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	return NewPublisher("sess-1", srv.URL, "", "", "binance_futures", "BTC/USDT").(*httpPublisher), got
+}
+
+func receive(t *testing.T, got <-chan telemetryPayload) *orderPayload {
+	t.Helper()
+	select {
+	case p := <-got:
+		return p.Order
+	case <-time.After(5 * time.Second):
+		t.Fatal("no telemetry received")
+		return nil
+	}
+}
+
+// Binance futures reports each fill's commission alone; live_trades keeps one
+// row per order, so the publisher sends the order's total.
+func TestPublishOrder_SendsOrderTotals(t *testing.T) {
+	p, got := capture(t)
+	p.PublishOrder(&types.Order{
+		ID: "42", Symbol: "BTC/USDT", Exchange: "binance_futures", Side: types.OrderSideSell,
+		Type: types.OrderTypeTakeProfitLimit, Status: types.OrderStatusFilled,
+		Fee: 0.017, CumulativeFee: 0.033, FeeAsset: "USDT", RealizedPnL: 5.1,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}, nil, nil)
+
+	o := receive(t, got)
+	if o.Fee != 0.033 {
+		t.Fatalf("fee = %v, want the order's total 0.033", o.Fee)
+	}
+	if o.RealizedPnL != 5.1 {
+		t.Fatalf("realized_pnl = %v, want 5.1", o.RealizedPnL)
+	}
+}
+
+// The SDK's synthetic CANCELED carries only an id and a status. It must reach
+// live_trades with the order's side, type, size and placement time.
+func TestComplete_FillsSparseCancelFromLastPayload(t *testing.T) {
+	p := NewPublisher("s", "http://example.invalid", "", "", "", "").(*httpPublisher)
+	placed := time.Date(2026, 10, 3, 10, 0, 0, 0, time.UTC)
+
+	first := orderPayload{OrderID: "7", Side: "SELL", Type: "TAKE_PROFIT_LIMIT", Status: "NEW",
+		Price: 80000, Qty: 0.002, CreatedAt: placed, UpdatedAt: placed, Reason: map[string]any{"x": 1}}
+	p.complete(&first)
+	partial := orderPayload{OrderID: "7", Side: "SELL", Type: "TAKE_PROFIT_LIMIT", Status: "PARTIALLY_FILLED",
+		Price: 80000, Qty: 0.002, FilledQty: 0.001, AvgPrice: 80000, Fee: 0.016, FeeAsset: "USDT", RealizedPnL: 2.5,
+		CreatedAt: placed, UpdatedAt: placed.Add(time.Minute)}
+	p.complete(&partial)
+
+	cancel := orderPayload{OrderID: "7", Status: "CANCELED"}
+	p.complete(&cancel)
+
+	if cancel.Side != "SELL" || cancel.Type != "TAKE_PROFIT_LIMIT" || cancel.Price != 80000 || cancel.Qty != 0.002 {
+		t.Fatalf("identity not filled in: %+v", cancel)
+	}
+	if cancel.FilledQty != 0.001 || cancel.Fee != 0.016 || cancel.RealizedPnL != 2.5 {
+		t.Fatalf("a cancel after a partial fill must keep the fill: %+v", cancel)
+	}
+	if !cancel.CreatedAt.Equal(placed) || cancel.UpdatedAt.IsZero() {
+		t.Fatalf("times: created %v updated %v", cancel.CreatedAt, cancel.UpdatedAt)
+	}
+	if len(p.open) != 0 {
+		t.Fatalf("a finished order must be forgotten, %d tracked", len(p.open))
+	}
+}
+
+func TestComplete_KeepsNoReasonAndStaysBounded(t *testing.T) {
+	p := NewPublisher("s", "http://example.invalid", "", "", "", "").(*httpPublisher)
+	for i := 0; i < maxTrackedOrders+10; i++ {
+		o := orderPayload{OrderID: strconv.Itoa(i), Status: "NEW", Reason: map[string]any{"big": i}, Logs: []string{"l"}}
+		p.complete(&o)
+	}
+	if len(p.open) > maxTrackedOrders {
+		t.Fatalf("tracked %d orders, cap is %d", len(p.open), maxTrackedOrders)
+	}
+	for _, o := range p.open {
+		if o.Reason != nil || o.Logs != nil {
+			t.Fatal("the open-order memory must not hold reasoning or logs")
+		}
 	}
 }
