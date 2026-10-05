@@ -52,16 +52,26 @@ type Publisher interface {
 	Enabled() bool
 }
 
+// Option configures a publisher.
+type Option func(*httpPublisher)
+
+// WithEnvironment names the SDK environment (types.Environment, e.g.
+// "real_binance_futures") in session_meta, so the platform can tell real
+// money from testnet without guessing from the strategy config.
+func WithEnvironment(env string) Option {
+	return func(p *httpPublisher) { p.environment = env }
+}
+
 // NewPublisher returns an httpPublisher when url is set, otherwise a NoOpPublisher.
 // defaultExchange / defaultSymbol are stamped onto every payload that doesn't
 // carry its own (heartbeat, initial_balance, balance, session_stopped) so the
 // first ingest creates a live_sessions row with the right exchange/symbol —
 // otherwise the frontend's chart sits on an empty symbol forever.
-func NewPublisher(sessionID, url, keyID, privateKey, defaultExchange, defaultSymbol string) Publisher {
+func NewPublisher(sessionID, url, keyID, privateKey, defaultExchange, defaultSymbol string, opts ...Option) Publisher {
 	if url == "" {
 		return NoOpPublisher{}
 	}
-	return &httpPublisher{
+	p := &httpPublisher{
 		sessionID:       sessionID,
 		baseURL:         url,
 		keyID:           keyID,
@@ -71,6 +81,10 @@ func NewPublisher(sessionID, url, keyID, privateKey, defaultExchange, defaultSym
 		client:          &http.Client{Timeout: 5 * time.Second},
 		open:            make(map[string]orderPayload),
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // ── NoOp ─────────────────────────────────────────────────────────────────────
@@ -94,6 +108,7 @@ type httpPublisher struct {
 	privateKey      string
 	defaultExchange string
 	defaultSymbol   string
+	environment     string
 	client          *http.Client
 
 	// open is the last payload sent for each order not yet finished, used to
@@ -126,6 +141,7 @@ type telemetryPayload struct {
 type sessionMetaPayload struct {
 	StrategyName string         `json:"strategy_name"`
 	Config       map[string]any `json:"config,omitempty"`
+	Environment  string         `json:"environment,omitempty"`
 }
 
 type orderPayload struct {
@@ -141,6 +157,8 @@ type orderPayload struct {
 	Fee           float64        `json:"fee"`
 	FeeAsset      string         `json:"fee_asset"`
 	RealizedPnL   float64        `json:"realized_pnl"`
+	StopPrice     float64        `json:"stop_price,omitempty"`
+	ReduceOnly    bool           `json:"reduce_only,omitempty"`
 	CreatedAt     time.Time      `json:"created_at"`
 	UpdatedAt     time.Time      `json:"updated_at"`
 	Reason        map[string]any `json:"reason,omitempty"`
@@ -188,6 +206,8 @@ func (p *httpPublisher) PublishOrder(order *types.Order, reason map[string]any, 
 		Fee:         fee,
 		FeeAsset:    order.FeeAsset,
 		RealizedPnL: order.RealizedPnL,
+		StopPrice:   order.StopPrice,
+		ReduceOnly:  order.ReduceOnly,
 		CreatedAt:   order.CreatedAt,
 		UpdatedAt:   order.UpdatedAt,
 		Reason:      reasonOut,
@@ -241,6 +261,11 @@ func (p *httpPublisher) complete(o *orderPayload) {
 		if o.RealizedPnL == 0 {
 			o.RealizedPnL = last.RealizedPnL
 		}
+		if o.StopPrice == 0 {
+			o.StopPrice = last.StopPrice
+		}
+		// Reduce-only is fixed at placement; a sparse update just omits it.
+		o.ReduceOnly = o.ReduceOnly || last.ReduceOnly
 		if o.CreatedAt.IsZero() {
 			o.CreatedAt = last.CreatedAt
 		}
@@ -326,7 +351,7 @@ func (p *httpPublisher) PublishHeartbeat(meta HeartbeatMeta) {
 // the first order means the console never briefly shows the session as a bare
 // UUID. The server upserts, so re-sending on a reconnect is harmless.
 func (p *httpPublisher) PublishSessionMeta(name string, config map[string]any) {
-	if name == "" && len(config) == 0 {
+	if name == "" && len(config) == 0 && p.environment == "" {
 		return
 	}
 	p.send(&telemetryPayload{
@@ -337,6 +362,7 @@ func (p *httpPublisher) PublishSessionMeta(name string, config map[string]any) {
 		Meta: &sessionMetaPayload{
 			StrategyName: name,
 			Config:       config,
+			Environment:  p.environment,
 		},
 	})
 }

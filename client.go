@@ -116,7 +116,8 @@ func New(cfg *types.Config) (*SDK, error) {
 		if len(cfg.Live.Assets) > 0 {
 			defaultSymbol = cfg.Live.Assets[0]
 		}
-		pub = telemetry.NewPublisher(sessionID, cfg.Live.TelemetryURL, cfg.Credentials.KeyID, cfg.Credentials.PrivateKey, defaultExchange, defaultSymbol)
+		pub = telemetry.NewPublisher(sessionID, cfg.Live.TelemetryURL, cfg.Credentials.KeyID, cfg.Credentials.PrivateKey,
+			defaultExchange, defaultSymbol, telemetry.WithEnvironment(string(cfg.Environment)))
 		log.Printf("SDK: telemetry session_id=%s → %s (default %s/%s)", sessionID, cfg.Live.TelemetryURL, defaultExchange, defaultSymbol)
 	} else {
 		pub = telemetry.NoOpPublisher{}

@@ -84,3 +84,41 @@ func TestHandleOrderUpdate_NonFillAddsNothing(t *testing.T) {
 		t.Fatalf("a NEW update must not start tracking, got %d entries", len(b.fills))
 	}
 }
+
+// Telemetry tells an entry from an exit by the reduce-only flag. A plain order
+// carries Binance's "R"; a fired stop arrives as a MARKET order whose only
+// thread back is the clientAlgoId, so its flag comes from what was placed.
+func TestHandleOrderUpdate_ReportsReduceOnly(t *testing.T) {
+	b := NewBinanceFuturesClient(&types.Config{Environment: types.EnvTestBinanceFutures})
+	out := make(chan *types.Order, 4)
+	original := map[string]string{"BTCUSDT": "BTC/USDT"}
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+
+	base := func(id int64, reduceOnly bool, clientID string) *futures.WsOrderTradeUpdate {
+		return &futures.WsOrderTradeUpdate{
+			Symbol: "BTCUSDT", ID: id, ClientOrderID: clientID, Side: futures.SideTypeSell,
+			Type: futures.OrderTypeLimit, OriginalType: futures.OrderTypeLimit,
+			ExecutionType: futures.OrderExecutionTypeNew, Status: futures.OrderStatusTypeNew,
+			OriginalQty: "0.001", OriginalPrice: "90000", IsReduceOnly: reduceOnly, TradeTime: now,
+		}
+	}
+
+	b.handleOrderUpdate(ctx, base(1, true, ""), original, out)
+	if o := <-out; !o.ReduceOnly {
+		t.Fatal("R=true must be reported as ReduceOnly")
+	}
+	b.handleOrderUpdate(ctx, base(2, false, ""), original, out)
+	if o := <-out; o.ReduceOnly {
+		t.Fatal("an entry must not be reported as ReduceOnly")
+	}
+
+	b.trackAlgo("kdraigo77", algoRef{algoID: 77, declared: types.OrderTypeStopLoss, stopPrice: 85000, reduceOnly: true})
+	fired := base(3, false, "kdraigo77")
+	fired.Type, fired.OriginalType = futures.OrderTypeMarket, futures.OrderTypeMarket
+	b.handleOrderUpdate(ctx, fired, original, out)
+	o := <-out
+	if o.ID != "algo:77" || o.Type != types.OrderTypeStopLoss || o.StopPrice != 85000 || !o.ReduceOnly {
+		t.Fatalf("fired stop = %s %s stop %v reduceOnly %v, want algo:77 STOP_LOSS 85000 true", o.ID, o.Type, o.StopPrice, o.ReduceOnly)
+	}
+}

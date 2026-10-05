@@ -129,6 +129,11 @@ type Order struct {
 	// GroupID are mutually cancelling: when one fills, the other is cancelled.
 	GroupID string
 
+	// ReduceOnly is true for an order that can only shrink a position: a
+	// stop loss, a take profit or a closing order. False on spot, where the
+	// flag does not exist.
+	ReduceOnly bool
+
 	// CumulativeFee is the commission charged on the order so far, summed
 	// over its fills, where the adapter can tell the fills apart. Zero when
 	// unknown.

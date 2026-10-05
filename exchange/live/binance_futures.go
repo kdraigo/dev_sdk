@@ -424,6 +424,7 @@ func (b *BinanceFuturesClient) place(ctx context.Context, req *types.OrderReques
 		AveragePrice: parseFloat(res.AvgPrice),
 		StopPrice:    intent.StopPrice,
 		GroupID:      groupID,
+		ReduceOnly:   intent.ReduceOnly,
 		CreatedAt:    time.UnixMilli(res.UpdateTime),
 		UpdatedAt:    time.UnixMilli(res.UpdateTime),
 	}
@@ -484,25 +485,27 @@ func (b *BinanceFuturesClient) placeConditional(ctx context.Context, req *types.
 	// Remember what was asked for before returning: the triggered order
 	// carries this client id and nothing else that identifies it as a stop.
 	b.trackAlgo(clientAlgoID, algoRef{
-		algoID:    res.AlgoId,
-		declared:  req.Type,
-		stopPrice: intent.StopPrice,
-		groupID:   groupID,
+		algoID:     res.AlgoId,
+		declared:   req.Type,
+		stopPrice:  intent.StopPrice,
+		groupID:    groupID,
+		reduceOnly: intent.ReduceOnly,
 	})
 
 	order := &types.Order{
-		ID:        algoOrderID(res.AlgoId),
-		Symbol:    req.Symbol,
-		Exchange:  types.ExchangeBinanceFutures,
-		Side:      req.Side,
-		Type:      req.Type,
-		Status:    mapAlgoStatus(string(res.AlgoStatus), ""),
-		Price:     parseFloat(res.Price),
-		Quantity:  parseFloat(res.Quantity),
-		StopPrice: parseFloat(res.TriggerPrice),
-		GroupID:   groupID,
-		CreatedAt: time.UnixMilli(res.CreateTime),
-		UpdatedAt: time.UnixMilli(res.UpdateTime),
+		ID:         algoOrderID(res.AlgoId),
+		Symbol:     req.Symbol,
+		Exchange:   types.ExchangeBinanceFutures,
+		Side:       req.Side,
+		Type:       req.Type,
+		Status:     mapAlgoStatus(string(res.AlgoStatus), ""),
+		Price:      parseFloat(res.Price),
+		Quantity:   parseFloat(res.Quantity),
+		StopPrice:  parseFloat(res.TriggerPrice),
+		GroupID:    groupID,
+		ReduceOnly: intent.ReduceOnly,
+		CreatedAt:  time.UnixMilli(res.CreateTime),
+		UpdatedAt:  time.UnixMilli(res.UpdateTime),
 	}
 	b.emitSynthetic(order)
 	return order, nil
@@ -517,18 +520,19 @@ func (b *BinanceFuturesClient) dryRunAck(req *types.OrderRequest, intent *OrderI
 		intent.Type, intent.Price, intent.StopPrice, intent.ReduceOnly)
 	now := time.Now()
 	return &types.Order{
-		ID:        fmt.Sprintf("dryrun-%d", now.UnixNano()),
-		Symbol:    req.Symbol,
-		Exchange:  types.ExchangeBinanceFutures,
-		Side:      req.Side,
-		Type:      req.Type,
-		Status:    types.OrderStatusNew,
-		Price:     intent.Price,
-		Quantity:  intent.Quantity,
-		StopPrice: intent.StopPrice,
-		GroupID:   groupID,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:         fmt.Sprintf("dryrun-%d", now.UnixNano()),
+		Symbol:     req.Symbol,
+		Exchange:   types.ExchangeBinanceFutures,
+		Side:       req.Side,
+		Type:       req.Type,
+		Status:     types.OrderStatusNew,
+		Price:      intent.Price,
+		Quantity:   intent.Quantity,
+		StopPrice:  intent.StopPrice,
+		GroupID:    groupID,
+		ReduceOnly: intent.ReduceOnly,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 }
 
@@ -859,10 +863,11 @@ func parseVenueOrderID(id string) (raw int64, isAlgo bool, err error) {
 // fired protective stop reaches the strategy looking like a market order it
 // never placed, under an id it has never seen.
 type algoRef struct {
-	algoID    int64
-	declared  types.OrderType
-	stopPrice float64
-	groupID   string
+	algoID     int64
+	declared   types.OrderType
+	stopPrice  float64
+	groupID    string
+	reduceOnly bool
 }
 
 // newClientAlgoID mints an identifier for one conditional order. Alphanumeric
@@ -1182,17 +1187,18 @@ func mapAlgoOrder(a *futures.GetAlgoOrderResp, symbol string, declared types.Ord
 		}
 	}
 	o := &types.Order{
-		ID:        algoOrderID(a.AlgoId),
-		Symbol:    symbol,
-		Exchange:  types.ExchangeBinanceFutures,
-		Side:      side,
-		Type:      declared,
-		Status:    mapAlgoStatus(string(a.AlgoStatus), a.ActualOrderId),
-		Price:     parseFloat(a.Price),
-		Quantity:  parseFloat(a.Quantity),
-		StopPrice: parseFloat(a.TriggerPrice),
-		CreatedAt: time.UnixMilli(a.CreateTime),
-		UpdatedAt: time.UnixMilli(a.UpdateTime),
+		ID:         algoOrderID(a.AlgoId),
+		Symbol:     symbol,
+		Exchange:   types.ExchangeBinanceFutures,
+		Side:       side,
+		Type:       declared,
+		Status:     mapAlgoStatus(string(a.AlgoStatus), a.ActualOrderId),
+		Price:      parseFloat(a.Price),
+		Quantity:   parseFloat(a.Quantity),
+		StopPrice:  parseFloat(a.TriggerPrice),
+		ReduceOnly: a.ReduceOnly || a.ClosePosition,
+		CreatedAt:  time.UnixMilli(a.CreateTime),
+		UpdatedAt:  time.UnixMilli(a.UpdateTime),
 	}
 	// A fired conditional produced an ordinary order; its price is the truth
 	// about what the stop actually got.
@@ -1251,6 +1257,7 @@ func mapFuturesOrder(o *futures.Order, symbol string) *types.Order {
 		FilledQty:    parseFloat(o.ExecutedQuantity),
 		AveragePrice: parseFloat(o.AvgPrice),
 		StopPrice:    stop,
+		ReduceOnly:   o.ReduceOnly || o.ClosePosition,
 		CreatedAt:    time.UnixMilli(o.Time),
 		UpdatedAt:    time.UnixMilli(o.UpdateTime),
 	}

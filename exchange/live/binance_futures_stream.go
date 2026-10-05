@@ -358,6 +358,7 @@ func (b *BinanceFuturesClient) handleOrderUpdate(ctx context.Context, u *futures
 	// has filled, under an id it has never seen, while the protective stop it
 	// is actually watching appears to have simply vanished.
 	sdkType := sdkOrderType(declared, stop > 0)
+	reduceOnly := u.IsReduceOnly
 	// Prefer what the strategy called it over what the venue calls it back.
 	// A TAKE_PROFIT_LIMIT goes out as a plain LIMIT, so the venue can only
 	// ever report LIMIT, and the same order would otherwise carry two names.
@@ -370,6 +371,7 @@ func (b *BinanceFuturesClient) handleOrderUpdate(ctx context.Context, u *futures
 		if stop == 0 {
 			stop = ref.stopPrice
 		}
+		reduceOnly = reduceOnly || ref.reduceOnly
 		log.Printf("Binance futures: conditional order %s triggered (venue order %d, %s)",
 			id, u.ID, ref.declared)
 	}
@@ -402,6 +404,7 @@ func (b *BinanceFuturesClient) handleOrderUpdate(ctx context.Context, u *futures
 		CumulativeFee: feeTotal,
 		RealizedPnL:   realized,
 		StopPrice:     stop,
+		ReduceOnly:    reduceOnly,
 		CreatedAt:     time.UnixMilli(u.TradeTime),
 		UpdatedAt:     time.UnixMilli(u.TradeTime),
 	}

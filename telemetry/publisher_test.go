@@ -226,3 +226,48 @@ func TestComplete_KeepsNoReasonAndStaysBounded(t *testing.T) {
 		}
 	}
 }
+
+// The bot needs the stop price to show a stop loss, and reduce-only to tell an
+// exit from an entry; a sparse update must not lose either.
+func TestPublishOrder_SendsStopPriceAndReduceOnly(t *testing.T) {
+	p, got := capture(t)
+	p.PublishOrder(&types.Order{
+		ID: "algo:9", Symbol: "BTC/USDT", Exchange: "binance_futures", Side: types.OrderSideSell,
+		Type: types.OrderTypeStopLoss, Status: types.OrderStatusNew, Quantity: 0.002,
+		StopPrice: 85000, ReduceOnly: true, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}, nil, nil)
+	o := receive(t, got)
+	if o.StopPrice != 85000 || !o.ReduceOnly {
+		t.Fatalf("stop_price %v reduce_only %v, want 85000 true", o.StopPrice, o.ReduceOnly)
+	}
+
+	cancel := orderPayload{OrderID: "algo:9", Status: "CANCELED"}
+	p.complete(&cancel)
+	if cancel.StopPrice != 85000 || !cancel.ReduceOnly {
+		t.Fatalf("sparse cancel lost stop_price/reduce_only: %v %v", cancel.StopPrice, cancel.ReduceOnly)
+	}
+}
+
+func TestPublishSessionMeta_SendsEnvironment(t *testing.T) {
+	got := make(chan telemetryPayload, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p telemetryPayload
+		_ = json.NewDecoder(r.Body).Decode(&p)
+		got <- p
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	p := NewPublisher("s", srv.URL, "", "", "binance_futures", "BTC/USDT", WithEnvironment("real_binance_futures"))
+	// Even with no name or config, the environment alone is worth sending.
+	p.PublishSessionMeta("", nil)
+
+	select {
+	case m := <-got:
+		if m.EventType != "session_meta" || m.Meta == nil || m.Meta.Environment != "real_binance_futures" {
+			t.Fatalf("got %+v", m)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no session_meta sent")
+	}
+}
