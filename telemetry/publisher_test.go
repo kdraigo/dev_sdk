@@ -1,7 +1,10 @@
 package telemetry
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -9,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kdraigo/dev_sdk/signing"
 	"github.com/kdraigo/dev_sdk/types"
 )
 
@@ -269,5 +273,45 @@ func TestPublishSessionMeta_SendsEnvironment(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no session_meta sent")
+	}
+}
+
+// Telemetry is signed with version 2: a fresh nonce per event, the body by
+// hash, over the path live_trades receives.
+func TestPublish_SignsV2(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	type seen struct {
+		nonce string
+		ok    bool
+	}
+	got := make(chan seen, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		sig, _ := hex.DecodeString(r.Header.Get("X-Signature"))
+		canonical := signing.Canonical(http.MethodPost, "/api/v1/telemetry", r.URL.Query(), r.Header.Get("X-Timestamp"), r.Header.Get("X-Nonce"), body)
+		got <- seen{nonce: r.Header.Get("X-Nonce"), ok: r.Header.Get("X-Key-ID") == "key-1" && ed25519.Verify(pub, []byte(canonical), sig)}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	p := NewPublisher("sess-1", srv.URL, "key-1", hex.EncodeToString(priv), "binance", "BTC/USDT").(*httpPublisher)
+	order := &types.Order{ID: "1", Symbol: "BTC/USDT", Status: types.OrderStatusNew, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	p.PublishOrder(order, nil, nil)
+	p.PublishOrder(order, nil, nil)
+
+	var nonces []string
+	for range 2 {
+		select {
+		case s := <-got:
+			if !s.ok {
+				t.Fatal("not a valid version 2 signature")
+			}
+			nonces = append(nonces, s.nonce)
+		case <-time.After(5 * time.Second):
+			t.Fatal("no telemetry received")
+		}
+	}
+	if len(nonces[0]) != 32 || nonces[0] == nonces[1] {
+		t.Fatalf("each event needs its own nonce: %q", nonces)
 	}
 }

@@ -3,16 +3,14 @@ package backtest
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/kdraigo/dev_sdk/signing"
 	"github.com/kdraigo/dev_sdk/types"
 )
 
@@ -467,8 +466,7 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	body, _ := json.Marshal(payload)
 
 	// 2. Perform HTTP action
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	sig, err := e.generateSignature(http.MethodPost, "/api/v1/dev/session", timestamp, string(body))
+	headers, err := e.signedHeaders(http.MethodPost, "/api/v1/dev/session", nil, body)
 	if err != nil {
 		return fmt.Errorf("failed to generate signature: %v", err)
 	}
@@ -477,9 +475,7 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-API-KEY", e.config.Credentials.KeyID)
-	req.Header.Set("X-SIGNATURE", sig)
-	req.Header.Set("X-TIMESTAMP", timestamp)
+	req.Header = headers
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -656,19 +652,18 @@ func (e *EngineClient) supervise(ctx context.Context, candleChan chan<- *types.C
 // session_state frame.
 func (e *EngineClient) dialOnce(ctx context.Context) (*websocket.Conn, error) {
 	log.Printf("Backtest Engine: Establishing WS connection for session %s...", e.sessionID)
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	sig, err := e.generateSignature(http.MethodGet, "/api/v1/dev/session/ws", timestamp, "")
+	// Signed afresh on every dial (a nonce is accepted once), covering ?id=,
+	// and sent as headers: a URL lands in access logs.
+	query := url.Values{"id": {e.sessionID}}
+	headers, err := e.signedHeaders(http.MethodGet, "/api/v1/dev/session/ws", query, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate signature: %v", err)
 	}
 
 	wsEndpoint := strings.Replace(e.config.Backtest.Endpoint, "http", "ws", 1) +
-		"/api/v1/dev/session/ws?id=" + e.sessionID +
-		"&key_id=" + e.config.Credentials.KeyID +
-		"&signature=" + sig +
-		"&timestamp=" + timestamp
+		"/api/v1/dev/session/ws?" + query.Encode()
 
-	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsEndpoint, nil)
+	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsEndpoint, headers)
 	if err != nil {
 		// The refusal body carries the reason. Without reading it the client
 		// cannot tell "wrong key, fix your config" from "session gone" from
@@ -1350,23 +1345,13 @@ func (e *EngineClient) GetHistoricalCandles(ctx context.Context, exchange, symbo
 	}
 }
 
-func (e *EngineClient) generateSignature(method, path, timestamp, body string) (string, error) {
+// signedHeaders signs a request to the engine with request signing version 2
+// (internal/signing).
+func (e *EngineClient) signedHeaders(method, path string, query url.Values, body []byte) (http.Header, error) {
 	if e.config.Credentials.PrivateKey == "" {
-		return "", fmt.Errorf("platform private key is missing in config")
+		return nil, fmt.Errorf("platform private key is missing in config")
 	}
-
-	privKeyBytes, err := hex.DecodeString(e.config.Credentials.PrivateKey)
-	if err != nil {
-		return "", fmt.Errorf("failed to decode private key: %v", err)
-	}
-
-	if len(privKeyBytes) != ed25519.PrivateKeySize {
-		return "", fmt.Errorf("invalid private key size: expected %d, got %d", ed25519.PrivateKeySize, len(privKeyBytes))
-	}
-
-	canonical := fmt.Sprintf("%s\n%s\n%s\n%s", method, path, timestamp, body)
-	sig := ed25519.Sign(privKeyBytes, []byte(canonical))
-	return hex.EncodeToString(sig), nil
+	return signing.Headers(signing.StyleBacktester, e.config.Credentials.KeyID, e.config.Credentials.PrivateKey, method, path, query, body)
 }
 
 type accountResponse struct {

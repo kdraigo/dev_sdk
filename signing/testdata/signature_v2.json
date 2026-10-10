@@ -1,0 +1,89 @@
+{
+  "comment": "Golden vectors for API-key request signing v2. The same file is checked into lib (auth/testdata), dev_sdk (signing/testdata), kdraigo_mcp (internal/auth/testdata) and strategies/trading_strategy_v1 (bridge/testdata); each copy of the signing code must reproduce every canonical string and signature. Do not edit by hand: change the scheme everywhere at once.",
+  "public_hex": "3631fdc8aa7b691db6ec2bc7d7f948b56079d413e9ba0a8d29033ad4dc1f29f0",
+  "seed_hex": "29598b66e5c70b3a3512193f15fcf5be9fdca9f7ccbee346e98d3fb317316d3d",
+  "vectors": [
+    {
+      "name": "GET with a query",
+      "method": "GET",
+      "path": "/api/v1/dev/orders",
+      "query": {
+        "limit": [
+          "50"
+        ],
+        "offset": [
+          "0"
+        ],
+        "session_id": [
+          "4213b8eb-aad5-40d1-b915-2fe4281a6f31"
+        ]
+      },
+      "timestamp": "1791615000",
+      "nonce": "00112233445566778899aabbccddeeff",
+      "body": "",
+      "canonical": "KDRAIGO-SIG-V2\nGET\n/api/v1/dev/orders\nlimit=50&offset=0&session_id=4213b8eb-aad5-40d1-b915-2fe4281a6f31\n1791615000\n00112233445566778899aabbccddeeff\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "75f5a2abc4ceae43217e71e717ffceea8d23ec383edd97fdafc9022f60f04410ba0e18778fec61fcf01965583120ed7dffa01e2af17d2e8a80839b2fab274e08"
+    },
+    {
+      "name": "POST with a body",
+      "method": "POST",
+      "path": "/api/v1/dev/session",
+      "query": null,
+      "timestamp": "1791615001",
+      "nonce": "ffeeddccbbaa99887766554433221100",
+      "body": "{\"streams\":[{\"exchange\":\"binance\",\"pair\":\"BTC/USDT\",\"timeframe\":\"1h\"}]}",
+      "canonical": "KDRAIGO-SIG-V2\nPOST\n/api/v1/dev/session\n\n1791615001\nffeeddccbbaa99887766554433221100\n5b209521c597bd4ce1271d39f6b12bbb6d01252e4e3644db6d574defd82a2df2",
+      "signature": "cad7fdc2ba9838b7e39ae56a388e4e2303cabf942f3b325e568a1e35112952e1327eb9b4c0fd922d39efd08180909f44b6a684b0f0ec28bb136ef0079b0c1500"
+    },
+    {
+      "name": "WebSocket: credential params are not signed",
+      "method": "GET",
+      "path": "/api/v1/dev/session/ws",
+      "query": {
+        "id": [
+          "4213b8eb-aad5-40d1-b915-2fe4281a6f31"
+        ],
+        "key_id": [
+          "k"
+        ],
+        "nonce": [
+          "n"
+        ],
+        "signature": [
+          "s"
+        ],
+        "timestamp": [
+          "1"
+        ]
+      },
+      "timestamp": "1791615002",
+      "nonce": "0123456789abcdef0123456789abcdef",
+      "body": "",
+      "canonical": "KDRAIGO-SIG-V2\nGET\n/api/v1/dev/session/ws\nid=4213b8eb-aad5-40d1-b915-2fe4281a6f31\n1791615002\n0123456789abcdef0123456789abcdef\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "9e98e1db137cf752506f46b0524d750a9caa520bdae6cbc3c5374064d1c08092fbf0cf80c0a985ff51e07164936d88186cfc5c0886b5ce5d82f93e8d7711c10d"
+    },
+    {
+      "name": "repeated keys, spaces and reserved characters",
+      "method": "PATCH",
+      "path": "/api/v1/dev/sessions/abc/metadata",
+      "query": {
+        "a": [
+          ""
+        ],
+        "tag": [
+          "b c",
+          "a+d",
+          "é/?&="
+        ],
+        "z": [
+          "1"
+        ]
+      },
+      "timestamp": "1791615003",
+      "nonce": "deadbeefdeadbeefdeadbeefdeadbeef",
+      "body": "{\"name\":\"renamed\"}",
+      "canonical": "KDRAIGO-SIG-V2\nPATCH\n/api/v1/dev/sessions/abc/metadata\na=&tag=b+c&tag=a%2Bd&tag=%C3%A9%2F%3F%26%3D&z=1\n1791615003\ndeadbeefdeadbeefdeadbeefdeadbeef\n5480d74271a1634fc3f5859bc1808f3f7a92535735f76f5c753f41ba5e4dea79",
+      "signature": "ffac5ca6aeb9c9f239077848de088d6a048255f445a4afa1c9321d95551a8cbed1edb20731a6a41a412d5d043dd6597810d467e8600efca5b2651d46797e7304"
+    }
+  ]
+}

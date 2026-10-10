@@ -2,17 +2,15 @@ package telemetry
 
 import (
 	"bytes"
-	"crypto/ed25519"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
+	"github.com/kdraigo/dev_sdk/signing"
 	"github.com/kdraigo/dev_sdk/types"
 )
 
@@ -433,7 +431,6 @@ func (p *httpPublisher) send(payload *telemetryPayload) {
 
 	method := http.MethodPost
 	sigPath := "/api/v1/telemetry"
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 
 	reqURL := p.baseURL
 	if reqURL == "https://api.kdraigo.com" || reqURL == "http://localhost:5001" {
@@ -447,15 +444,13 @@ func (p *httpPublisher) send(payload *telemetryPayload) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// Kdraigo Signature
+	// Kdraigo signature, version 2 (internal/signing): a fresh nonce for every
+	// event, and the query of the configured URL, if it has one.
 	if p.keyID != "" && p.privateKey != "" {
-		privKeyBytes, err := hex.DecodeString(p.privateKey)
-		if err == nil && len(privKeyBytes) == ed25519.PrivateKeySize {
-			canonical := fmt.Sprintf("%s\n%s\n%s\n%s", method, sigPath, timestamp, string(body))
-			sig := ed25519.Sign(privKeyBytes, []byte(canonical))
-			req.Header.Set("X-Key-ID", p.keyID)
-			req.Header.Set("X-Signature", hex.EncodeToString(sig))
-			req.Header.Set("X-Timestamp", timestamp)
+		if headers, err := signing.Headers(signing.StyleStandard, p.keyID, p.privateKey, method, sigPath, req.URL.Query(), body); err == nil {
+			for k, vs := range headers {
+				req.Header[k] = vs
+			}
 		}
 	}
 
