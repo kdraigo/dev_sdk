@@ -93,8 +93,9 @@ type OrderRequest struct {
 	// it trades at or above. It is ignored by other order types.
 	StopPrice float64
 
-	// Reason and Logs are telemetry-only annotations. The SDK strips both
-	// before forwarding to the adapter; only live_trades sees them. Use them
+	// Reason and Logs annotate the order. In a backtest the engine stores them
+	// with the order; live, the SDK strips both before the exchange and only
+	// live_trades sees them. Use them
 	// to capture the strategy's decision context ({rsi: 32, signal: "..."})
 	// and short log lines for post-hoc review. Size caps are enforced
 	// server-side (4 KB reason, 16 KB logs); the SDK truncates locally to

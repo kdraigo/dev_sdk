@@ -123,7 +123,7 @@ func New(cfg *types.Config) (*SDK, error) {
 		pub = telemetry.NoOpPublisher{}
 	}
 
-	return &SDK{
+	s := &SDK{
 		config:        cfg,
 		adapter:       adapter,
 		rawCandleChan: make(chan *types.Candle, 100),
@@ -131,7 +131,46 @@ func New(cfg *types.Config) (*SDK, error) {
 		publisher:     pub,
 		clock:         clock,
 		reconciler:    newOrderReconciler(),
-	}, nil
+	}
+	// Built here rather than in Start, so IndicatorManagerFor works on a fresh
+	// SDK. Until v1.3.1 it returned nil before Start, and a strategy that took
+	// the manager once up front panicked on its first candle.
+	s.ensureIndicatorManagers()
+	return s, nil
+}
+
+// indicatorScope is the exchanges and assets every indicator manager tracks.
+func (s *SDK) indicatorScope() (exchanges, assets []string) {
+	if s.config.Backtest != nil {
+		return s.config.Backtest.RequestedExchanges, s.config.Backtest.Assets
+	}
+	if s.config.Live != nil {
+		return s.config.Live.RequestedExchanges, s.config.Live.Assets
+	}
+	return nil, nil
+}
+
+// ensureIndicatorManagers gives every configured timeframe a manager that
+// tracks every configured exchange and asset. It adds what is missing and never
+// replaces a manager, because the strategy may already hold it: New builds them,
+// and Start catches up with a config edited in between.
+func (s *SDK) ensureIndicatorManagers() {
+	exchanges, assets := s.indicatorScope()
+	if s.indManagers == nil {
+		s.indManagers = make(map[types.Timeframe]indicators.IndicatorManager, len(s.config.Timeframes))
+	}
+	for _, tf := range s.config.Timeframes {
+		im, ok := s.indManagers[tf]
+		if !ok {
+			s.indManagers[tf] = indicators.NewIndicatorManager(exchanges, assets, indicators.WithMaxPoints(s.config.IndicatorHistory))
+			continue
+		}
+		if grow, ok := im.(interface {
+			EnsurePairs(exchanges, pairs []string)
+		}); ok {
+			grow.EnsurePairs(exchanges, assets)
+		}
+	}
 }
 
 // Now returns the current time in the strategy's frame of reference.
@@ -258,25 +297,19 @@ func (s *SDK) Start(ctx context.Context) error {
 		return fmt.Errorf("config.Timeframes must contain at least one timeframe")
 	}
 
-	var imExchanges, imAssets []string
 	if s.config.Backtest != nil {
-		imExchanges = s.config.Backtest.RequestedExchanges
-		imAssets = s.config.Backtest.Assets
-
 		// Round start time up to the next boundary of the largest requested timeframe
 		// to avoid receiving a partial first candle.
 		largest := largestTimeframe(s.config.Timeframes)
 		s.config.Backtest.StartTime = roundUpToTimeframe(s.config.Backtest.StartTime, largest)
-	} else if s.config.Live != nil {
-		imExchanges = s.config.Live.RequestedExchanges
-		imAssets = s.config.Live.Assets
 	}
 
-	// Build one indicator manager and one aggregator per requested timeframe.
-	s.indManagers = make(map[types.Timeframe]indicators.IndicatorManager, len(s.config.Timeframes))
+	// Indicator managers exist since New; catch up with any config edit since.
+	s.ensureIndicatorManagers()
+
+	// One aggregator per requested timeframe.
 	s.aggregators = make(map[types.Timeframe]*aggregator.MultiAggregator, len(s.config.Timeframes))
 	for _, tf := range s.config.Timeframes {
-		s.indManagers[tf] = indicators.NewIndicatorManager(imExchanges, imAssets, indicators.WithMaxPoints(s.config.IndicatorHistory))
 		// Symbol-partitioned: a multi-symbol session must not fold BTC and ETH
 		// candles into the same bar.
 		s.aggregators[tf] = aggregator.NewMultiAggregator(tf)
@@ -680,9 +713,11 @@ func (s *SDK) feedIndicators(tf types.Timeframe, candles []*types.Candle) {
 	}
 }
 
-// IndicatorManagerFor returns the indicator manager scoped to the given timeframe.
-// Call this inside SetOnCandleFor or SetOnCandle (use candle.Timeframe) to get
-// RSI/EMA/etc. values calculated from candles of that specific timeframe.
+// IndicatorManagerFor returns the indicator manager scoped to the given timeframe,
+// which must be listed in Config.Timeframes (otherwise it returns nil). Call it
+// inside SetOnCandleFor or SetOnCandle (use candle.Timeframe) to get RSI/EMA/etc.
+// values calculated from candles of that specific timeframe. Since v1.3.1 it is
+// also safe to take once, between New and Start, and reuse in the callback.
 func (s *SDK) IndicatorManagerFor(tf types.Timeframe) indicators.IndicatorsCalculator {
 	return s.indManagers[tf]
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -422,6 +423,22 @@ func truncateReasonAndLogs(reason map[string]any, logs []string) (map[string]any
 	return reasonOut, logsOut
 }
 
+// telemetryEndpoint is where events are posted for a configured TelemetryURL.
+// A bare base URL is completed to its ingest path. On api.kdraigo.com that path
+// is /telemetry, which the gateway forwards to live_trades' /api/v1/telemetry;
+// until v1.3.1 the bare host was completed to /api/v1/telemetry, which the
+// gateway does not route, and every event got a 404. Any other URL is used as
+// given.
+func telemetryEndpoint(base string) string {
+	switch strings.TrimSuffix(base, "/") {
+	case "https://api.kdraigo.com":
+		return "https://api.kdraigo.com/telemetry"
+	case "http://localhost:5001":
+		return "http://localhost:5001/api/v1/telemetry"
+	}
+	return base
+}
+
 func (p *httpPublisher) send(payload *telemetryPayload) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -432,12 +449,7 @@ func (p *httpPublisher) send(payload *telemetryPayload) {
 	method := http.MethodPost
 	sigPath := "/api/v1/telemetry"
 
-	reqURL := p.baseURL
-	if reqURL == "https://api.kdraigo.com" || reqURL == "http://localhost:5001" {
-		reqURL = reqURL + sigPath
-	}
-
-	req, err := http.NewRequest(method, reqURL, bytes.NewReader(body))
+	req, err := http.NewRequest(method, telemetryEndpoint(p.baseURL), bytes.NewReader(body))
 	if err != nil {
 		log.Printf("[telemetry] request error: %v", err)
 		return

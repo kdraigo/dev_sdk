@@ -149,3 +149,31 @@ func TestIndicatorManager_Run(t *testing.T) {
 	// 	t.Fatal("Timeout waiting for OnCandle callback")
 	// }
 }
+
+// TestIndicatorManager_EnsurePairs proves a pair added after construction is
+// tracked from then on, and that pairs already tracked keep their history.
+func TestIndicatorManager_EnsurePairs(t *testing.T) {
+	im := NewIndicatorManager([]string{"binance"}, []string{"BTC/USDT"}).(*indicatorManager)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	feed := func(symbol string, n int) {
+		for i := 0; i < n; i++ {
+			im.Update(&types.Candle{Exchange: "binance", Symbol: symbol, OpenTime: base.Add(time.Duration(i) * time.Minute), Close: float64(i + 1)})
+		}
+	}
+
+	feed("BTC/USDT", 3)
+	feed("ETH/USDT", 3) // not tracked yet: dropped
+	if p := im.pairCandlePoints["binance"]["ETH/USDT"]; p != nil {
+		t.Fatalf("ETH/USDT tracked before EnsurePairs")
+	}
+
+	im.EnsurePairs([]string{"binance"}, []string{"BTC/USDT", "ETH/USDT"})
+	feed("ETH/USDT", 3)
+
+	if got := len(im.pairCandlePoints["binance"]["ETH/USDT"].Close); got != 3 {
+		t.Fatalf("ETH/USDT points = %d, want 3", got)
+	}
+	if got := len(im.pairCandlePoints["binance"]["BTC/USDT"].Close); got != 3 {
+		t.Fatalf("BTC/USDT history lost: %d points, want 3", got)
+	}
+}

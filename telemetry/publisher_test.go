@@ -315,3 +315,19 @@ func TestPublish_SignsV2(t *testing.T) {
 		t.Fatalf("each event needs its own nonce: %q", nonces)
 	}
 }
+
+func TestTelemetryEndpoint(t *testing.T) {
+	cases := map[string]string{
+		// The bare host used to become /api/v1/telemetry, which the gateway 404s.
+		"https://api.kdraigo.com":                  "https://api.kdraigo.com/telemetry",
+		"https://api.kdraigo.com/":                 "https://api.kdraigo.com/telemetry",
+		"https://api.kdraigo.com/telemetry":        "https://api.kdraigo.com/telemetry",
+		"http://localhost:5001":                    "http://localhost:5001/api/v1/telemetry",
+		"http://live_trades:5001/api/v1/telemetry": "http://live_trades:5001/api/v1/telemetry",
+	}
+	for in, want := range cases {
+		if got := telemetryEndpoint(in); got != want {
+			t.Errorf("telemetryEndpoint(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

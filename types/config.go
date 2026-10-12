@@ -87,7 +87,7 @@ type BacktestOptions struct {
 	// rebuilding that.
 	SessionID string
 
-	Endpoint           string   // Engine API URL e.g. "http://localhost:8080"
+	Endpoint           string   // Engine API URL: "https://api.kdraigo.com" on the hosted platform; default "http://localhost:4000"
 	SessionName        string   // Human readable name for the backtesting run.
 	RequestedExchanges []string // List of exchanges to pull historical data against (e.g., "binance").
 	Assets             []string // Trading pairs requested (e.g., "BTC/USDT", "ETH/USDT").
@@ -195,7 +195,7 @@ type SimulationOptions struct {
 type LiveOptions struct {
 	RequestedExchanges []string // List of real exchanges to connect to (e.g., "binance", "bybit").
 	Assets             []string // Trading pairs requested (e.g., "BTCUSDT", "ETHUSDT"). Note: Binance requires no slashes usually.
-	TelemetryURL       string   // Base URL of the live_trades service (e.g. "http://localhost:5001"). Empty = disabled.
+	TelemetryURL       string   // Where live telemetry is posted: "https://api.kdraigo.com/telemetry" on the hosted platform. Empty = disabled.
 	TelemetryAPIKey    string   // X-API-Key for live_trades service authentication.
 	SessionID          string   // Optional fixed telemetry session id. Empty = a new UUID is generated; set to resume/extend an existing session.
 	// StrategyName is a human-readable label for the run, the live counterpart

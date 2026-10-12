@@ -77,6 +77,25 @@ func NewIndicatorManager(exchanges []string, pairs []string, opts ...Option) Ind
 	return im
 }
 
+// EnsurePairs adds a series for every exchange/pair not tracked yet, in place.
+// Existing series and their history are left alone, so a manager a strategy
+// already holds keeps working when the configuration grows after it was built.
+func (im *indicatorManager) EnsurePairs(exchanges []string, pairs []string) {
+	im.guard.Lock()
+	defer im.guard.Unlock()
+
+	for _, exchange := range exchanges {
+		if im.pairCandlePoints[exchange] == nil {
+			im.pairCandlePoints[exchange] = make(map[string]*pairCandlePoints)
+		}
+		for _, pair := range pairs {
+			if im.pairCandlePoints[exchange][pair] == nil {
+				im.pairCandlePoints[exchange][pair] = &pairCandlePoints{}
+			}
+		}
+	}
+}
+
 // Run listens to aggregated candles emitted by the TimeframeAggregator
 func (im *indicatorManager) IndicatorsCalculatorRun(
 	ctx *types.Context,
