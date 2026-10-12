@@ -1,0 +1,25 @@
+name: Go proxy
+
+# proxy.golang.org lists a new tag under @latest only after someone asks for
+# that exact version, which can leave @latest a release behind for a long
+# while. `go install …@latest` and the version shown on kdraigo.com
+# (/releases/<repo>, read from @latest) both lag with it. Ask at tag time.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions: {}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the tag through the Go module proxy
+        run: |
+          url="https://proxy.golang.org/github.com/${GITHUB_REPOSITORY}/@v/${GITHUB_REF_NAME}.info"
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fsS "$url"; then echo; exit 0; fi
+            sleep 20
+          done
+          echo "proxy.golang.org did not serve ${GITHUB_REF_NAME}" >&2
+          exit 1
