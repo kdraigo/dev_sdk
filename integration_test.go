@@ -290,6 +290,7 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 							"commission":  5.0,
 							"created_at":  mockPlacedAt,
 							"updated_at":  mockFilledAt,
+							"exchange":    "binance",
 						},
 					}
 				}
@@ -342,6 +343,7 @@ func TestSDK_Integration_Flow(t *testing.T) {
 	var candlesReceived int
 	var ordersFilled int
 	var filled types.Order
+	var placed *types.Order
 	var mu sync.Mutex
 
 	sdk.SetOnCandle(func(sdkCtx *types.Context, candle *types.Candle) {
@@ -358,10 +360,13 @@ func TestSDK_Integration_Flow(t *testing.T) {
 				Type:     types.OrderTypeMarket,
 				Quantity: 0.1,
 			}
-			_, err := sdkCtx.PlaceOrder(req)
+			o, err := sdkCtx.PlaceOrder(req)
 			if err != nil {
 				t.Errorf("PlaceOrder err: %v", err)
 			}
+			mu.Lock()
+			placed = o
+			mu.Unlock()
 		}
 	})
 
@@ -396,6 +401,12 @@ func TestSDK_Integration_Flow(t *testing.T) {
 	}
 	if filled.Fee != 5.0 {
 		t.Errorf("fill fee = %v, want 5", filled.Fee)
+	}
+	if filled.Exchange != "binance" {
+		t.Errorf("fill exchange = %q, want binance", filled.Exchange)
+	}
+	if placed == nil || placed.Exchange != "binance" {
+		t.Errorf("PlaceOrder's order must name its exchange; got %+v", placed)
 	}
 	if mock.accountReqs < 1 {
 		t.Errorf("Expected at least 1 account handshake, got %d", mock.accountReqs)

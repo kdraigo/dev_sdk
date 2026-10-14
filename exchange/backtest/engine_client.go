@@ -113,6 +113,10 @@ type orderWire struct {
 	// the bar of its latest transition (its fill, for a filled order).
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// Exchange is set on the fills a tick reports; core.Order has no
+	// exchange, so the acks leave it empty and the caller fills it in from
+	// the request.
+	Exchange string `json:"exchange"`
 }
 
 // quoteAssetOf extracts the quote side of a BASE/QUOTE symbol.
@@ -235,6 +239,7 @@ func (w orderWire) order() *types.Order {
 	order := &types.Order{
 		ID:       id,
 		Symbol:   w.Pair,
+		Exchange: w.Exchange,
 		Side:     types.OrderSide(strings.ToUpper(w.Side)),
 		Type:     types.OrderType(strings.ToUpper(w.Type)),
 		Status:   types.OrderStatus(strings.ToUpper(w.Status)),
@@ -1157,6 +1162,9 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 	case resp := <-respChan:
 		if resp.err != nil {
 			return nil, resp.err
+		}
+		if resp.order != nil {
+			resp.order.Exchange = req.Exchange
 		}
 		return resp.order, nil
 	case <-ctx.Done():
