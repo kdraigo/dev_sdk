@@ -3,6 +3,7 @@ package backtest
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/kdraigo/dev_sdk/types"
 )
@@ -71,5 +72,27 @@ func TestParseOrderAck_IDFallback(t *testing.T) {
 	// Non-filled order: AveragePrice/FilledQty stay zero.
 	if got.AveragePrice != 0 || got.FilledQty != 0 {
 		t.Errorf("non-filled order should not derive fill fields; got avg=%v filled=%v", got.AveragePrice, got.FilledQty)
+	}
+}
+
+// TestParseOrderAck_CarriesSimulatedTimes pins the order's times: the engine
+// sends the bars it was placed and filled on, and a strategy reading
+// CreatedAt/UpdatedAt in a backtest must see those, not zero.
+func TestParseOrderAck_CarriesSimulatedTimes(t *testing.T) {
+	// time.Time as lib/core.Order marshals it.
+	raw := json.RawMessage(`{
+		"id": 9, "exchange_id": 9, "pair": "BTC/USDT", "side": "BUY", "type": "LIMIT",
+		"status": "FILLED", "price": 107000, "quantity": 0.001, "commission": 0.107,
+		"created_at": "2026-09-01T00:59:00Z", "updated_at": "2026-09-01T02:13:00Z"
+	}`)
+	got := parseOrderAck(raw)
+	if got == nil {
+		t.Fatal("parseOrderAck returned nil")
+	}
+	if want := time.Date(2026, 9, 1, 0, 59, 0, 0, time.UTC); !got.CreatedAt.Equal(want) {
+		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, want)
+	}
+	if want := time.Date(2026, 9, 1, 2, 13, 0, 0, time.UTC); !got.UpdatedAt.Equal(want) {
+		t.Errorf("UpdatedAt = %v, want %v", got.UpdatedAt, want)
 	}
 }

@@ -287,6 +287,9 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 							"status":      "FILLED",
 							"price":       50000.0,
 							"quantity":    0.1,
+							"commission":  5.0,
+							"created_at":  mockPlacedAt,
+							"updated_at":  mockFilledAt,
 						},
 					}
 				}
@@ -296,6 +299,13 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 		m.mu.Unlock()
 	}
 }
+
+// The simulated bars the mock's order was placed and filled on: far from the
+// wall clock, so a time taken from anywhere else cannot match.
+var (
+	mockPlacedAt = time.Date(2026, 9, 1, 0, 59, 0, 0, time.UTC)
+	mockFilledAt = time.Date(2026, 9, 1, 2, 13, 0, 0, time.UTC)
+)
 
 func TestSDK_Integration_Flow(t *testing.T) {
 	mock := newMockEngineServer()
@@ -331,6 +341,7 @@ func TestSDK_Integration_Flow(t *testing.T) {
 
 	var candlesReceived int
 	var ordersFilled int
+	var filled types.Order
 	var mu sync.Mutex
 
 	sdk.SetOnCandle(func(sdkCtx *types.Context, candle *types.Candle) {
@@ -358,6 +369,7 @@ func TestSDK_Integration_Flow(t *testing.T) {
 		if order.Status == types.OrderStatusFilled {
 			mu.Lock()
 			ordersFilled++
+			filled = *order
 			mu.Unlock()
 		}
 	})
@@ -377,6 +389,13 @@ func TestSDK_Integration_Flow(t *testing.T) {
 	}
 	if ordersFilled != 1 {
 		t.Errorf("Expected 1 order fill, got %d", ordersFilled)
+	}
+	// A fill reported by a tick keeps the engine's simulated times and fee.
+	if !filled.CreatedAt.Equal(mockPlacedAt) || !filled.UpdatedAt.Equal(mockFilledAt) {
+		t.Errorf("fill times = %v / %v, want %v / %v", filled.CreatedAt, filled.UpdatedAt, mockPlacedAt, mockFilledAt)
+	}
+	if filled.Fee != 5.0 {
+		t.Errorf("fill fee = %v, want 5", filled.Fee)
 	}
 	if mock.accountReqs < 1 {
 		t.Errorf("Expected at least 1 account handshake, got %d", mock.accountReqs)

@@ -109,6 +109,10 @@ type orderWire struct {
 	Commission float64  `json:"commission"`
 	Stop       *float64 `json:"stop"`
 	GroupID    *int64   `json:"group_id"`
+	// Simulated times: CreatedAt is the bar the order was placed on, UpdatedAt
+	// the bar of its latest transition (its fill, for a filled order).
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // quoteAssetOf extracts the quote side of a BASE/QUOTE symbol.
@@ -204,17 +208,23 @@ func (e *EngineClient) PlaceBracket(ctx context.Context, req *types.BracketReque
 	}
 }
 
-// parseOrderAck maps a synchronous PlaceOrder ack into a types.Order. The engine
-// omits average_price/filled_qty on the ack, so for a FILLED order they are derived
-// from the fill price/quantity — market orders fill at the candle close, limit
-// orders at the limit price, both reported in `price` (D2).
+// parseOrderAck maps a synchronous PlaceOrder ack into a types.Order.
 func parseOrderAck(data json.RawMessage) *types.Order {
 	var w orderWire
 	if err := json.Unmarshal(data, &w); err != nil {
 		log.Printf("Backtest Engine: failed to decode order ack: %v", err)
 		return nil
 	}
+	return w.order()
+}
 
+// order maps the engine's order into a types.Order. Every path that receives
+// one goes through here: PlaceOrder's ack, both legs of a bracket, and the fills
+// a tick reports. The engine omits average_price/filled_qty, so for a FILLED
+// order they are derived from the fill price/quantity — market orders fill at
+// the candle close, limit orders at the limit price, both reported in `price`
+// (D2). The ID is empty when the engine sent neither id.
+func (w orderWire) order() *types.Order {
 	id := ""
 	if w.ExchangeID != 0 {
 		id = fmt.Sprintf("%d", w.ExchangeID)
@@ -233,6 +243,8 @@ func parseOrderAck(data json.RawMessage) *types.Order {
 		Fee:      w.Commission,
 		// The engine fills an order whole, so its commission is the total.
 		CumulativeFee: w.Commission,
+		CreatedAt:     w.CreatedAt,
+		UpdatedAt:     w.UpdatedAt,
 	}
 
 	// Carry the bracket fields through, so a strategy handling OnOrderUpdate can
@@ -757,14 +769,8 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 					if err := json.Unmarshal(resp.Data, &bp); err != nil {
 						br.err = fmt.Errorf("bracket decode: %w", err)
 					} else {
-						for i := range bp.Orders {
-							encoded, err := json.Marshal(bp.Orders[i])
-							if err != nil {
-								continue
-							}
-							if order := parseOrderAck(encoded); order != nil {
-								br.orders = append(br.orders, order)
-							}
+						for _, w := range bp.Orders {
+							br.orders = append(br.orders, w.order())
 						}
 					}
 				}
@@ -942,18 +948,9 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 						TakerBuyQuoteVolume float64   `json:"takerBuyQuoteVolume"`
 					} `json:"Candle"`
 				} `json:"tick"`
-				Seq    uint64 `json:"seq"`
-				Done   bool   `json:"done"`
-				Orders []struct {
-					ID         int64   `json:"id"`
-					ExchangeID int64   `json:"exchange_id"`
-					Pair       string  `json:"pair"`
-					Side       string  `json:"side"`
-					Type       string  `json:"type"`
-					Status     string  `json:"status"`
-					Price      float64 `json:"price"`
-					Quantity   float64 `json:"quantity"`
-				} `json:"orders"`
+				Seq    uint64      `json:"seq"`
+				Done   bool        `json:"done"`
+				Orders []orderWire `json:"orders"`
 			}
 			json.Unmarshal(resp.Data, &dataStruct)
 
@@ -988,27 +985,10 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 				candleChan <- candle
 			}
 			// Dispatch any orders filled during this tick to the order channel.
-			for _, o := range dataStruct.Orders {
-				id := fmt.Sprintf("%d", o.ExchangeID)
-				if id == "0" {
-					id = fmt.Sprintf("%d", o.ID)
-				}
-				if id == "0" {
-					continue
-				}
-				orderChan <- &types.Order{
-					ID:        id,
-					Symbol:    o.Pair,
-					Side:      types.OrderSide(strings.ToUpper(o.Side)),
-					Type:      types.OrderType(strings.ToUpper(o.Type)),
-					Status:    types.OrderStatus(strings.ToUpper(o.Status)),
-					Price:     o.Price,
-					Quantity:  o.Quantity,
-					FilledQty: o.Quantity, // engine fills fully
-					// Fill price for every order type: market orders fill at the
-					// current candle's close, limit orders at the limit price. In
-					// both cases the engine reports it in o.Price.
-					AveragePrice: o.Price,
+			// The engine reports only fills here, and fills an order whole.
+			for _, w := range dataStruct.Orders {
+				if order := w.order(); order.ID != "" {
+					orderChan <- order
 				}
 			}
 			if dataStruct.Done {
