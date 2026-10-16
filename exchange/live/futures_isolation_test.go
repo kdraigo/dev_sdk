@@ -364,9 +364,41 @@ func TestSdkOrderTypeRoundTrip(t *testing.T) {
 	}
 }
 
-func TestBracketGroupIDIsStableWhicheverLegReports(t *testing.T) {
-	assert.Equal(t, bracketGroupID("100", "200"), bracketGroupID("200", "100"),
-		"both legs of one bracket must report the same GroupID")
+// TestBracketGroupIDIsThePlacementID: the placement and every later update of
+// both legs must carry the GroupID PlaceBracket returned, or the order log
+// splits one bracket into two groups. A triggered stop whose bracket entry is
+// gone still reports it from its algo record.
+func TestBracketGroupIDIsThePlacementID(t *testing.T) {
+	b := NewBinanceFuturesClient(&types.Config{Environment: types.EnvTestBinanceFutures})
+	out := make(chan *types.Order, 8)
+	original := map[string]string{"BTCUSDT": "BTC/USDT"}
+	const group = "bracket-1700000000000000000"
+	b.brackets["100"] = bracketLeg{sibling: "algo:200", groupID: group}
+	b.brackets["algo:200"] = bracketLeg{sibling: "100", groupID: group}
+	b.trackAlgo("kdstop1", algoRef{algoID: 200, declared: types.OrderTypeStopLoss, stopPrice: 79000, groupID: group, reduceOnly: true})
+
+	update := func(id int64, client string, status futures.OrderStatusType) *futures.WsOrderTradeUpdate {
+		return &futures.WsOrderTradeUpdate{
+			Symbol: "BTCUSDT", ID: id, ClientOrderID: client, Side: futures.SideTypeSell,
+			Type: futures.OrderTypeLimit, OriginalType: futures.OrderTypeLimit,
+			ExecutionType: futures.OrderExecutionTypeNew, Status: status,
+			OriginalQty: "0.002", OriginalPrice: "81000", TradeTime: time.Now().UnixMilli(),
+		}
+	}
+	ctx := t.Context()
+
+	b.handleOrderUpdate(ctx, update(100, "", futures.OrderStatusTypeNew), original, out)
+	assert.Equal(t, group, (<-out).GroupID, "take-profit leg")
+
+	b.handleOrderUpdate(ctx, update(100, "", futures.OrderStatusTypeCanceled), original, out)
+	assert.Equal(t, group, (<-out).GroupID, "take-profit leg, canceled")
+
+	// The cancel forgot the pair; the stop fires afterwards as a venue order
+	// stamped with our clientAlgoId.
+	b.handleOrderUpdate(ctx, update(555, "kdstop1", futures.OrderStatusTypeNew), original, out)
+	stop := <-out
+	assert.Equal(t, "algo:200", stop.ID)
+	assert.Equal(t, group, stop.GroupID, "triggered stop leg")
 }
 
 // TestExplainOrderError_ConditionalRejection: Binance answers a refused stop

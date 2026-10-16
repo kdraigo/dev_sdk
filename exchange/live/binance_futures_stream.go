@@ -365,9 +365,11 @@ func (b *BinanceFuturesClient) handleOrderUpdate(ctx context.Context, u *futures
 	if d := b.declaredOrderType(id); d != "" {
 		sdkType = d
 	}
+	algoGroup := ""
 	if ref, ok := b.algoByClientID(u.ClientOrderID); ok {
 		id = algoOrderID(ref.algoID)
 		sdkType = ref.declared
+		algoGroup = ref.groupID
 		if stop == 0 {
 			stop = ref.stopPrice
 		}
@@ -410,11 +412,15 @@ func (b *BinanceFuturesClient) handleOrderUpdate(ctx context.Context, u *futures
 	}
 
 	b.mu.RLock()
-	sibling := b.brackets[id]
+	leg := b.brackets[id]
 	b.mu.RUnlock()
-	order.GroupID = ""
-	if sibling != "" {
-		order.GroupID = bracketGroupID(id, sibling)
+	sibling := leg.sibling
+	// The id the legs were placed with, so that the placement and every later
+	// update of both legs carry one GroupID. A triggered stop whose bracket
+	// entry is gone still has it on its algo record.
+	order.GroupID = leg.groupID
+	if order.GroupID == "" && algoGroup != "" {
+		order.GroupID = algoGroup
 	}
 
 	select {
@@ -487,13 +493,11 @@ func (b *BinanceFuturesClient) forgetFills(id string) {
 	b.mu.Unlock()
 }
 
-// bracketGroupID gives the two legs of a bracket one stable shared id,
-// whichever of them is being reported.
-func bracketGroupID(a, b string) string {
-	if a < b {
-		return "bracket-" + a + "-" + b
-	}
-	return "bracket-" + b + "-" + a
+// bracketLeg is one leg's side of a bracket: the order to cancel when this
+// one fills, and the GroupID both legs report.
+type bracketLeg struct {
+	sibling string
+	groupID string
 }
 
 // reconcile re-reads the exchange after a reconnect.

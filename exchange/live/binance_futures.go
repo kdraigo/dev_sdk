@@ -42,10 +42,11 @@ type BinanceFuturesClient struct {
 	mu    sync.RWMutex
 	marks map[string]float64
 
-	// brackets maps an order id to the id of the leg that must be cancelled
-	// when it fills. Binance does not link the legs of a bracket on futures the
-	// way the backtest engine does, so the adapter does it.
-	brackets map[string]string
+	// brackets maps an order id to its bracket: the leg that must be
+	// cancelled when it fills, and the group id both legs were placed with.
+	// Binance does not link the legs of a bracket on futures the way the
+	// backtest engine does, so the adapter does it.
+	brackets map[string]bracketLeg
 
 	// algos maps a clientAlgoId we generated onto what the strategy asked for,
 	// so the ordinary order Binance creates when a conditional fires can be
@@ -91,7 +92,7 @@ func NewBinanceFuturesClient(cfg *types.Config) *BinanceFuturesClient {
 		guard:    Guard{Env: cfg.Environment, Opts: cfg.Live},
 		filters:  make(map[string]InstrumentFilter),
 		marks:    make(map[string]float64),
-		brackets: make(map[string]string),
+		brackets: make(map[string]bracketLeg),
 		algos:    make(map[string]algoRef),
 		declared: make(map[string]types.OrderType),
 		fills:    make(map[string]*orderFills),
@@ -624,8 +625,8 @@ func (b *BinanceFuturesClient) PlaceBracket(ctx context.Context, req *types.Brac
 	}
 
 	b.mu.Lock()
-	b.brackets[tp.ID] = sl.ID
-	b.brackets[sl.ID] = tp.ID
+	b.brackets[tp.ID] = bracketLeg{sibling: sl.ID, groupID: groupID}
+	b.brackets[sl.ID] = bracketLeg{sibling: tp.ID, groupID: groupID}
 	b.mu.Unlock()
 
 	return []*types.Order{tp, sl}, nil
@@ -1009,8 +1010,8 @@ func (b *BinanceFuturesClient) setMark(symbol string, price float64) {
 func (b *BinanceFuturesClient) forgetBracket(id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if sibling, ok := b.brackets[id]; ok {
-		delete(b.brackets, sibling)
+	if leg, ok := b.brackets[id]; ok {
+		delete(b.brackets, leg.sibling)
 		delete(b.brackets, id)
 	}
 }

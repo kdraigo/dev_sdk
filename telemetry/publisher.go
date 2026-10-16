@@ -158,6 +158,7 @@ type orderPayload struct {
 	RealizedPnL   float64        `json:"realized_pnl"`
 	StopPrice     float64        `json:"stop_price,omitempty"`
 	ReduceOnly    bool           `json:"reduce_only,omitempty"`
+	GroupID       string         `json:"group_id,omitempty"`
 	CreatedAt     time.Time      `json:"created_at"`
 	UpdatedAt     time.Time      `json:"updated_at"`
 	Reason        map[string]any `json:"reason,omitempty"`
@@ -207,6 +208,7 @@ func (p *httpPublisher) PublishOrder(order *types.Order, reason map[string]any, 
 		RealizedPnL: order.RealizedPnL,
 		StopPrice:   order.StopPrice,
 		ReduceOnly:  order.ReduceOnly,
+		GroupID:     order.GroupID,
 		CreatedAt:   order.CreatedAt,
 		UpdatedAt:   order.UpdatedAt,
 		Reason:      reasonOut,
@@ -265,6 +267,11 @@ func (p *httpPublisher) complete(o *orderPayload) {
 		}
 		// Reduce-only is fixed at placement; a sparse update just omits it.
 		o.ReduceOnly = o.ReduceOnly || last.ReduceOnly
+		// So is the bracket: the sibling's cancel after a fill arrives once
+		// the adapter has already forgotten the pair.
+		if o.GroupID == "" {
+			o.GroupID = last.GroupID
+		}
 		if o.CreatedAt.IsZero() {
 			o.CreatedAt = last.CreatedAt
 		}

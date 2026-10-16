@@ -252,6 +252,27 @@ func TestPublishOrder_SendsStopPriceAndReduceOnly(t *testing.T) {
 	}
 }
 
+// The console links the two legs of a bracket by group_id. The sibling's
+// cancel after a fill arrives without it and must keep it.
+func TestPublishOrder_SendsGroupID(t *testing.T) {
+	p, got := capture(t)
+	p.PublishOrder(&types.Order{
+		ID: "algo:9", Symbol: "BTC/USDT", Exchange: "binance_futures", Side: types.OrderSideSell,
+		Type: types.OrderTypeStopLoss, Status: types.OrderStatusNew, Quantity: 0.002,
+		StopPrice: 85000, ReduceOnly: true, GroupID: "bracket-1",
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}, nil, nil)
+	if o := receive(t, got); o.GroupID != "bracket-1" {
+		t.Fatalf("group_id = %q, want bracket-1", o.GroupID)
+	}
+
+	cancel := orderPayload{OrderID: "algo:9", Status: "CANCELED"}
+	p.complete(&cancel)
+	if cancel.GroupID != "bracket-1" {
+		t.Fatalf("sparse cancel lost group_id: %q", cancel.GroupID)
+	}
+}
+
 func TestPublishSessionMeta_SendsEnvironment(t *testing.T) {
 	got := make(chan telemetryPayload, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
