@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/kdraigo/dev_sdk/plots"
 	"github.com/kdraigo/dev_sdk/types"
 )
 
@@ -15,6 +16,14 @@ import (
 // every live adapter for a capability only the backtest engine currently has.
 type BracketPlacer interface {
 	PlaceBracket(ctx context.Context, req *types.BracketRequest) ([]*types.Order, error)
+}
+
+// PlotCarrier is an optional capability: an adapter that delivers the
+// strategy's plots to the platform. The SDK hands it the recorder once, in New,
+// and the adapter activates and drains it. Where no adapter carries plots,
+// adding a value does nothing.
+type PlotCarrier interface {
+	CarryPlots(r *plots.Recorder)
 }
 
 // Adapter interface standardizes how the SDK interacts with any underlying exchange (Real or Backtest).

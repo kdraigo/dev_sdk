@@ -14,6 +14,7 @@ import (
 	"github.com/kdraigo/dev_sdk/exchange/backtest"
 	"github.com/kdraigo/dev_sdk/exchange/live"
 	"github.com/kdraigo/dev_sdk/indicators"
+	"github.com/kdraigo/dev_sdk/plots"
 	"github.com/kdraigo/dev_sdk/telemetry"
 	"github.com/kdraigo/dev_sdk/types"
 )
@@ -45,6 +46,10 @@ type SDK struct {
 	aggregators map[types.Timeframe]*aggregator.MultiAggregator
 
 	publisher telemetry.Publisher
+
+	// plots holds the strategy's declared plots and the values waiting to be
+	// sent. Active only when the adapter carries plots (see PlotCarrier).
+	plots *plots.Recorder
 
 	// orderFeed records how this adapter delivers order updates, resolved once
 	// at Start and reported to the strategy through OrderFeed().
@@ -131,6 +136,10 @@ func New(cfg *types.Config) (*SDK, error) {
 		publisher:     pub,
 		clock:         clock,
 		reconciler:    newOrderReconciler(),
+		plots:         plots.NewRecorder(),
+	}
+	if pc, ok := adapter.(PlotCarrier); ok {
+		pc.CarryPlots(s.plots)
 	}
 	// Built here rather than in Start, so IndicatorManagerFor works on a fresh
 	// SDK. Until v1.3.1 it returned nil before Start, and a strategy that took
@@ -182,6 +191,25 @@ func (s *SDK) Now() time.Time {
 		return time.Now()
 	}
 	return s.clock.Now()
+}
+
+// Plot declares a plot: a series of the strategy's own values that the
+// session chart draws over the candles or in a panel of its own. Declare plots
+// before Start, then add a value per bar with the returned series:
+//
+//	ema, _ := sdk.Plot(plots.Def{Key: "ema_fast", Title: "EMA 50"})
+//	adx, _ := sdk.Plot(plots.Def{Key: "adx", Pane: "ADX", Levels: []plots.Level{{Value: 25}}})
+//	...
+//	ema.Add(candle, emaFast)
+//
+// Declaring a key again with the same Def returns the same series, so each of
+// a strategy's per-pair bots may declare its plots. On an error the series is
+// nil, and a nil series ignores every call.
+//
+// Backtests store plots with the session. Live sessions do not send them yet:
+// there the series accepts values and drops them.
+func (s *SDK) Plot(d plots.Def) (*plots.Series, error) {
+	return s.plots.Declare(d)
 }
 
 // SetOnCandle registers a catch-all callback that fires whenever any subscribed timeframe closes.

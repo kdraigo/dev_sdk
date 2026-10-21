@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/kdraigo/dev_sdk/plots"
 	"github.com/kdraigo/dev_sdk/types"
 )
 
@@ -46,6 +47,31 @@ type mockEngineServer struct {
 	// suppressSessionState models an engine predating the opening frame.
 	suppressSessionState bool
 	closed               bool // client sent an explicit close action
+
+	// Plots, stored as the engine stores them: a tick's plots only when the
+	// tick is served for the first time, plus every "plot" frame.
+	plotDefs   []plots.Def
+	plotPoints []plots.Point
+	plotFrames int
+}
+
+// recordPlots keeps the plots carried by one message. Caller holds mu.
+func (m *mockEngineServer) recordPlots(raw json.RawMessage) {
+	if len(raw) == 0 {
+		return
+	}
+	var b plots.Batch
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return
+	}
+	m.plotDefs = append(m.plotDefs, b.Defs...)
+	m.plotPoints = append(m.plotPoints, b.Points...)
+}
+
+func (m *mockEngineServer) plotStats() (defs []plots.Def, points []plots.Point, frames int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]plots.Def(nil), m.plotDefs...), append([]plots.Point(nil), m.plotPoints...), m.plotFrames
 }
 
 func newMockEngineServer() *mockEngineServer {
@@ -203,6 +229,15 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 			}
 			conn.WriteJSON(resp)
 
+		case "plot":
+			var pd struct {
+				Data json.RawMessage `json:"data"`
+			}
+			json.Unmarshal(message, &pd)
+			m.recordPlots(pd.Data)
+			m.plotFrames++
+			conn.WriteJSON(map[string]interface{}{"action": "plot", "status": "ok"})
+
 		case "close":
 			m.closed = true
 			m.mu.Unlock()
@@ -216,7 +251,8 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 		case "next":
 			var nd struct {
 				Data struct {
-					Seq uint64 `json:"seq"`
+					Seq   uint64          `json:"seq"`
+					Plots json.RawMessage `json:"plots"`
 				} `json:"data"`
 			}
 			json.Unmarshal(message, &nd)
@@ -250,6 +286,7 @@ func (m *mockEngineServer) handleWS(conn *websocket.Conn) {
 				m.mu.Unlock()
 				return
 			}
+			m.recordPlots(nd.Data.Plots)
 			if m.nextCalls > 5 {
 				// Finish after 5 candles
 				m.serveTick(conn, seq, map[string]interface{}{"done": true})

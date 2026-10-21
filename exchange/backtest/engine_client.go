@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/kdraigo/dev_sdk/plots"
 	"github.com/kdraigo/dev_sdk/signing"
 	"github.com/kdraigo/dev_sdk/types"
 )
@@ -73,6 +74,105 @@ type EngineClient struct {
 	pendingMu  sync.Mutex
 
 	smallestTF types.Timeframe
+
+	// plots is the strategy's plot recorder, drained into every tick request
+	// (see CarryPlots). plotBatch is what went out with tick plotSeq: a retry
+	// of that tick re-sends it unchanged, and the engine stores a tick's plots
+	// only the first time it serves the tick, so they are stored once.
+	plots     *plots.Recorder
+	plotMu    sync.Mutex
+	plotSeq   uint64
+	plotBatch *plots.Batch
+
+	// warned holds the engine warnings already logged, so each shows once.
+	warned sync.Map
+}
+
+// maxPlotBytes bounds the plots one message carries. The engine ends a session
+// whose message exceeds 64 KB; this leaves room for the rest of the message.
+// What does not fit waits for the next tick.
+const maxPlotBytes = 48 << 10
+
+// CarryPlots implements dev_sdk.PlotCarrier: the strategy's plots ride on the
+// tick requests, so they cost no extra round trip.
+func (e *EngineClient) CarryPlots(r *plots.Recorder) {
+	e.plots = r
+	r.Activate()
+}
+
+// plotsFor returns the plots to send with tick seq. A fresh tick takes what is
+// waiting; a retry of the same tick re-sends exactly what went out with it.
+func (e *EngineClient) plotsFor(seq uint64, fresh bool) *plots.Batch {
+	if e.plots == nil {
+		return nil
+	}
+	e.plotMu.Lock()
+	defer e.plotMu.Unlock()
+	if !fresh {
+		if e.plotSeq == seq {
+			return e.plotBatch
+		}
+		return nil
+	}
+	e.plotSeq, e.plotBatch = seq, e.plots.Take(maxPlotBytes)
+	return e.plotBatch
+}
+
+// releasePlots puts back the plots of a tick that was never sent, so the next
+// tick carries them.
+func (e *EngineClient) releasePlots(seq uint64) {
+	if e.plots == nil {
+		return
+	}
+	e.plotMu.Lock()
+	defer e.plotMu.Unlock()
+	if e.plotSeq == seq && e.plotBatch != nil {
+		e.plots.Return(e.plotBatch)
+		e.plotBatch = nil
+	}
+}
+
+// flushPlots sends whatever the ticks did not carry once the run is over: a
+// backlog larger than a tick carries, which is rare. The frames go unanswered
+// on purpose, because the read loop has ended; the engine handles frames in
+// order, so it stores them before it sees close. Reports whether any went out.
+func (e *EngineClient) flushPlots() bool {
+	if e.plots == nil {
+		return false
+	}
+	sent := false
+	for b := e.plots.Take(maxPlotBytes); b != nil; b = e.plots.Take(maxPlotBytes) {
+		if err := e.writeJSON(map[string]interface{}{"action": "plot", "data": b}); err != nil {
+			e.plots.Return(b)
+			log.Printf("Backtest Engine: the last plots were not sent: %v", err)
+			break
+		}
+		sent = true
+	}
+	return sent
+}
+
+// awaitClose reads until the engine answers close. Closing a socket with
+// unread data in it resets the connection, and a reset can discard frames the
+// engine has not read yet — here, the last plots.
+func (e *EngineClient) awaitClose(conn *websocket.Conn) {
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for {
+		var resp struct {
+			Action string `json:"action"`
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		}
+		if err := conn.ReadJSON(&resp); err != nil {
+			return
+		}
+		if resp.Status == "error" {
+			log.Printf("Engine WS Error on %s: %s", resp.Action, resp.Error)
+		}
+		if resp.Action == "close" {
+			return
+		}
+	}
 }
 
 // historyResponse carries the result of a "history" WS round-trip.
@@ -640,7 +740,11 @@ func (e *EngineClient) supervise(ctx context.Context, candleChan chan<- *types.C
 		// and finalizes it anyway, leaving it to infer that costs a round of
 		// ambiguity for no reason.
 		if outcome == outcomeDone {
+			flushed := e.flushPlots()
 			_ = e.writeJSON(map[string]interface{}{"action": "close"})
+			if flushed {
+				e.awaitClose(conn)
+			}
 		}
 
 		e.wsConn.Store(nil)
@@ -709,6 +813,7 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 			Error     string          `json:"error"`
 			Code      string          `json:"code"`
 			RequestID string          `json:"request_id"`
+			Warning   string          `json:"warning"`
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 		if err := conn.ReadJSON(&resp); err != nil {
@@ -722,6 +827,15 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 			// exhausted does this become the terminal error D1 requires.
 			log.Printf("Backtest Engine WS disconnected before completion: %v", err)
 			return outcomeRecoverable
+		}
+
+		// A success the strategy should still hear about, such as reasoning
+		// or plots no longer being stored. Once each: it repeats on every
+		// later message it applies to.
+		if resp.Warning != "" {
+			if _, seen := e.warned.LoadOrStore(resp.Warning, true); !seen {
+				log.Printf("Backtest Engine: %s", resp.Warning)
+			}
 		}
 
 		// Handle pending PlaceOrder/GetAccount/CancelOrder/History waiters
@@ -1082,9 +1196,16 @@ func (e *EngineClient) nextTick() error {
 		e.inflightSeq.Store(seq)
 	}
 
+	data := map[string]interface{}{"seq": seq}
+	// The plots the strategy added while handling the previous candle. An
+	// engine that predates plots ignores the field.
+	if b := e.plotsFor(seq, fresh); !b.Empty() {
+		data["plots"] = b
+	}
+
 	if err := e.writeJSON(map[string]interface{}{
 		"action": "next",
-		"data":   map[string]uint64{"seq": seq},
+		"data":   data,
 	}); err != nil {
 		if fresh {
 			// The send never happened, so the engine does not owe us this
@@ -1092,6 +1213,7 @@ func (e *EngineClient) nextTick() error {
 			// a tick that was never requested, which the engine rejects.
 			e.inflightSeq.Store(0)
 			e.nextSeq.Store(seq - 1)
+			e.releasePlots(seq)
 		}
 		if errors.Is(err, ErrNotConnected) {
 			return err

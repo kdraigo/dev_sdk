@@ -11,6 +11,7 @@ Full documentation: **<https://kdraigo.com/docs>**
 - **Timeframe aggregation**: the stream is aggregated into each timeframe you request (e.g. 15m and 1h at once).
 - **Indicators**: ~95 TA-Lib indicators through a timeframe-scoped indicator manager.
 - **Multi-exchange backtesting**: synchronized backtests across several exchanges and pairs in one session.
+- **Strategy plots**: draw your own values (moving averages, oscillators, signal markers) on the session chart at kdraigo.com.
 
 ## Getting Started
 
@@ -98,6 +99,25 @@ Live: &types.LiveOptions{
 	StrategyName:       "my-strategy",
 },
 ```
+
+### Plotting your indicators
+
+A strategy can draw its own values on its backtest's chart (v1.4.0+). Declare each plot once, then add a value per bar:
+
+```go
+import "github.com/kdraigo/dev_sdk/plots"
+
+ema, _ := bot.Plot(plots.Def{Key: "ema_fast", Title: "EMA 50"})                  // over the candles
+rsi, _ := bot.Plot(plots.Def{Key: "rsi", Title: "RSI 14", Pane: "RSI",           // in a panel below them
+	Levels: []plots.Level{{Value: 70}, {Value: 30}}})
+
+bot.SetOnCandleFor(types.Timeframe1h, func(ctx *types.Context, c *types.Candle) {
+	ema.Add(c, emaValue)
+	rsi.Add(c, rsiValue)
+})
+```
+
+`Kind` picks lines, step lines, histograms, areas, bands (`AddBand`) or markers (`Mark`). The strategy's style is the default; viewers can hide or restyle each plot on the chart. Plotting never fails a run: NaN values are skipped, and a plot that could not be declared is a nil series that ignores every call. Live sessions do not send plots yet. See `get_sdk_docs` section `plots` in [kdraigo_mcp](https://github.com/kdraigo/kdraigo_mcp) for every option and limit.
 
 ## Architecture
 
