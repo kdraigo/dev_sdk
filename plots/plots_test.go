@@ -262,3 +262,23 @@ func TestBufferIsBounded(t *testing.T) {
 		t.Fatalf("buffer holds %d points, want %d", got, maxBuffered)
 	}
 }
+
+func TestRedeclareQueuesEveryDeclarationAgain(t *testing.T) {
+	r := active()
+	r.Declare(Def{Key: "b"})
+	r.Declare(Def{Key: "a"})
+	r.Take(0)
+	if r.Take(0) != nil {
+		t.Fatal("nothing should wait")
+	}
+	r.Redeclare()
+	b := r.Take(0)
+	if b == nil || len(b.Defs) != 2 || b.Defs[0].Key != "b" || b.Defs[1].Key != "a" {
+		t.Fatalf("redeclared %+v, want b then a", b)
+	}
+	r.Redeclare()
+	r.Redeclare()
+	if b := r.Take(0); len(b.Defs) != 2 {
+		t.Fatalf("redeclaring twice queued %d", len(b.Defs))
+	}
+}

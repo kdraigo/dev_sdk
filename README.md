@@ -102,7 +102,7 @@ Live: &types.LiveOptions{
 
 ### Plotting your indicators
 
-A strategy can draw its own values on its backtest's chart (v1.4.0+). Declare each plot once, then add a value per bar:
+A strategy can draw its own values on its chart, in backtests (v1.4.0+) and live (v1.5.0+, with `TelemetryURL` set). Declare each plot once, then add a value per bar:
 
 ```go
 import "github.com/kdraigo/dev_sdk/plots"
@@ -117,7 +117,7 @@ bot.SetOnCandleFor(types.Timeframe1h, func(ctx *types.Context, c *types.Candle) 
 })
 ```
 
-`Kind` picks lines, step lines, histograms, areas, bands (`AddBand`) or markers (`Mark`). The strategy's style is the default; viewers can hide or restyle each plot on the chart. Plotting never fails a run: NaN values are skipped, and a plot that could not be declared is a nil series that ignores every call. Live sessions do not send plots yet. See `get_sdk_docs` section `plots` in [kdraigo_mcp](https://github.com/kdraigo/kdraigo_mcp) for every option and limit.
+`Kind` picks lines, step lines, histograms, areas, bands (`AddBand`) or markers (`Mark`). The strategy's style is the default; viewers can hide or restyle each plot on the chart. Plotting never fails a run: NaN values are skipped, and a plot that could not be declared is a nil series that ignores every call. Live, values are sent every 2 s in one request and kept through an outage. See `get_sdk_docs` section `plots` in [kdraigo_mcp](https://github.com/kdraigo/kdraigo_mcp) for every option and limit.
 
 ## Architecture
 

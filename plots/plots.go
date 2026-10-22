@@ -257,6 +257,7 @@ type Recorder struct {
 
 	mu       sync.Mutex
 	series   map[string]*Series
+	order    []string       // keys in declaration order
 	declared map[string]Def // each plot as first declared, for re-declaration
 	defs     map[string]Def // as sent: Timeframe filled in by the first Add
 	panes    map[string]bool
@@ -314,10 +315,27 @@ func (r *Recorder) Declare(d Def) (*Series, error) {
 	}
 	s := &Series{r: r, key: n.Key, kind: n.Kind}
 	r.series[n.Key] = s
+	r.order = append(r.order, n.Key)
 	r.declared[n.Key] = n
 	r.defs[n.Key] = n
 	r.pending = append(r.pending, n.Key)
 	return s, nil
+}
+
+// Redeclare queues every declaration to be sent again, in declaration order.
+// A live carrier calls it now and then: its messages can be lost on the way,
+// and a value whose plot the platform never heard of is not drawn.
+func (r *Recorder) Redeclare() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, key := range r.order {
+		if !contains(r.pending, key) {
+			r.pending = append(r.pending, key)
+		}
+	}
 }
 
 // Pending reports whether anything is waiting to be sent.

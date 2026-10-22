@@ -139,7 +139,11 @@ func New(cfg *types.Config) (*SDK, error) {
 		plots:         plots.NewRecorder(),
 	}
 	if pc, ok := adapter.(PlotCarrier); ok {
+		// Backtest: plots ride on the engine's tick requests.
 		pc.CarryPlots(s.plots)
+	} else if _, ok := pub.(telemetry.PlotPublisher); ok && pub.Enabled() {
+		// Live with telemetry: Start runs the loop that posts them.
+		s.plots.Activate()
 	}
 	// Built here rather than in Start, so IndicatorManagerFor works on a fresh
 	// SDK. Until v1.3.1 it returned nil before Start, and a strategy that took
@@ -206,8 +210,10 @@ func (s *SDK) Now() time.Time {
 // a strategy's per-pair bots may declare its plots. On an error the series is
 // nil, and a nil series ignores every call.
 //
-// Backtests store plots with the session. Live sessions do not send them yet:
-// there the series accepts values and drops them.
+// Backtests store plots with the session. Live sessions (v1.5.0+) send them
+// through telemetry (LiveOptions.TelemetryURL), batched every couple of
+// seconds; with no telemetry configured, the series accept values and drop
+// them.
 func (s *SDK) Plot(d plots.Def) (*plots.Series, error) {
 	return s.plots.Declare(d)
 }
@@ -488,6 +494,16 @@ func (s *SDK) Start(ctx context.Context) error {
 		go s.heartbeatLoop(sdkCtx.Ctx, startedAt)
 		go s.balanceFallbackLoop(sdkCtx.Ctx)
 		defer s.publisher.PublishStopped("normal_shutdown")
+		// Deferred after PublishStopped, so it runs first: the last values
+		// are sent before the session says it stopped.
+		if pp, ok := s.publisher.(telemetry.PlotPublisher); ok && s.plots.Active() {
+			plotsDone := make(chan struct{})
+			go func() {
+				defer close(plotsDone)
+				s.sendPlotsLoop(sdkCtx.Ctx, pp, defaultLivePlotTiming)
+			}()
+			defer func() { <-plotsDone }()
+		}
 	}
 
 	// 6. Start the deterministic ticking loop for backtesting

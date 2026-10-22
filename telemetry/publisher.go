@@ -2,7 +2,9 @@ package telemetry
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kdraigo/dev_sdk/plots"
 	"github.com/kdraigo/dev_sdk/signing"
 	"github.com/kdraigo/dev_sdk/types"
 )
@@ -50,6 +53,24 @@ type Publisher interface {
 	// goroutines should not start when this is false.
 	Enabled() bool
 }
+
+// PlotPublisher is a publisher that delivers strategy plots (see package
+// plots). Unlike the other events, plots are posted synchronously: the caller
+// keeps a batch that did not arrive and sends it again, because a chart with a
+// gap in it is what a lost batch costs.
+//
+// A separate interface rather than a Publisher method, so implementations of
+// Publisher outside this package keep compiling.
+type PlotPublisher interface {
+	// PublishPlots posts one batch. warning is the platform's note about
+	// values it did not store (over a limit, not declared). An error wrapping
+	// ErrPlotsRejected means the batch was refused and sending it again
+	// cannot help; any other error is worth a retry.
+	PublishPlots(ctx context.Context, b *plots.Batch) (warning string, err error)
+}
+
+// ErrPlotsRejected wraps a refusal (a 4xx other than 408 and 429).
+var ErrPlotsRejected = errors.New("plots rejected")
 
 // Option configures a publisher.
 type Option func(*httpPublisher)
@@ -135,6 +156,7 @@ type telemetryPayload struct {
 	Heartbeat *heartbeatPayload   `json:"heartbeat,omitempty"`
 	Stopped   *stoppedPayload     `json:"stopped,omitempty"`
 	Meta      *sessionMetaPayload `json:"meta,omitempty"`
+	Plots     *plots.Batch        `json:"plots,omitempty"`
 }
 
 type sessionMetaPayload struct {
@@ -447,19 +469,29 @@ func telemetryEndpoint(base string) string {
 }
 
 func (p *httpPublisher) send(payload *telemetryPayload) {
+	status, body, err := p.post(context.Background(), payload)
+	if err != nil {
+		log.Printf("[telemetry] POST error: %v", err)
+		return
+	}
+	if status >= 400 {
+		log.Printf("[telemetry] POST %s returned %d: %s", telemetryEndpoint(p.baseURL), status, string(body))
+	}
+}
+
+// post signs and sends one event, returning the status and the response body.
+func (p *httpPublisher) post(ctx context.Context, payload *telemetryPayload) (int, []byte, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("[telemetry] marshal error: %v", err)
-		return
+		return 0, nil, fmt.Errorf("marshal: %w", err)
 	}
 
 	method := http.MethodPost
 	sigPath := "/api/v1/telemetry"
 
-	req, err := http.NewRequest(method, telemetryEndpoint(p.baseURL), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, telemetryEndpoint(p.baseURL), bytes.NewReader(body))
 	if err != nil {
-		log.Printf("[telemetry] request error: %v", err)
-		return
+		return 0, nil, fmt.Errorf("request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -475,12 +507,38 @@ func (p *httpPublisher) send(payload *telemetryPayload) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		log.Printf("[telemetry] POST error: %v", err)
-		return
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		log.Printf("[telemetry] POST %s returned %d: %s", req.URL, resp.StatusCode, string(b))
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode, b, nil
+}
+
+// PublishPlots implements PlotPublisher.
+func (p *httpPublisher) PublishPlots(ctx context.Context, b *plots.Batch) (string, error) {
+	if b.Empty() {
+		return "", nil
 	}
+	status, body, err := p.post(ctx, &telemetryPayload{
+		SessionID: p.sessionID,
+		Exchange:  p.defaultExchange,
+		Symbol:    p.defaultSymbol,
+		EventType: "plots",
+		Plots:     b,
+	})
+	switch {
+	case err != nil:
+		return "", err
+	case status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500:
+		return "", fmt.Errorf("plots: status %d: %s", status, body)
+	case status >= 400:
+		return "", fmt.Errorf("%w: status %d: %s", ErrPlotsRejected, status, body)
+	}
+	var reply struct {
+		Warning string `json:"warning"`
+	}
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &reply)
+	}
+	return reply.Warning, nil
 }
