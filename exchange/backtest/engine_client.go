@@ -670,6 +670,21 @@ func (e *EngineClient) supervise(ctx context.Context, candleChan chan<- *types.C
 	// The single close, for the whole life of the stream.
 	defer close(candleChan)
 
+	// A stopped program says goodbye. Without the close action the engine
+	// reads the dropped socket as a network blip and parks the run for its
+	// resume window, holding the account's session slot for a resume nobody
+	// will make. A cancelled context, Ctrl+C and the cloud workspace's stop
+	// (SIGTERM, see SDK.Start) all end ctx.
+	streamOver := make(chan struct{})
+	defer close(streamOver)
+	go func() {
+		select {
+		case <-ctx.Done():
+			e.sayGoodbye()
+		case <-streamOver:
+		}
+	}()
+
 	var readyOnce sync.Once
 	signal := func(err error) { readyOnce.Do(func() { ready <- err }) }
 	// However this ends, an unreported ConnectStream must never hang.
@@ -758,6 +773,11 @@ func (e *EngineClient) supervise(ctx context.Context, candleChan chan<- *types.C
 			return
 		}
 
+		if ctx.Err() != nil {
+			// Stopped, not dropped: sayGoodbye already ended the session.
+			e.storeStreamErr(fmt.Errorf("backtest stopped before it finished: %w", ctx.Err()))
+			return
+		}
 		log.Printf("Backtest Engine: connection dropped mid-run, resuming session %s in %s", e.sessionID, backoff)
 		if !sleepCtx(ctx, backoff) {
 			// The context ended while we were waiting. The run did not finish,
@@ -1136,6 +1156,20 @@ var ErrNotConnected = errors.New("backtest engine: websocket not connected")
 // The nil check and the write are under the same lock deliberately: the
 // supervisor swaps the connection on reconnect, and checking outside the lock
 // leaves a window where the socket is replaced between the two.
+// sayGoodbye tells the engine the run is over and hangs up, so the session ends
+// at once (FAILED, "client closed session") instead of waiting to be resumed.
+// The engine reads the close action before it sees the socket go.
+func (e *EngineClient) sayGoodbye() {
+	c := e.conn()
+	if c == nil {
+		return
+	}
+	if err := e.writeJSON(map[string]interface{}{"action": "close"}); err == nil {
+		log.Printf("Backtest Engine: stopped; told the engine session %s is over.", e.sessionID)
+	}
+	_ = c.Close()
+}
+
 func (e *EngineClient) writeJSON(v interface{}) error {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()

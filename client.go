@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -282,6 +285,16 @@ func (s *SDK) Start(ctx context.Context) error {
 	if s.adapter == nil {
 		log.Println("DevSDK: No adapter attached (stub initialized). Cannot connect.")
 		return nil
+	}
+
+	// In a backtest, Ctrl+C and SIGTERM (the cloud workspace's stop) end the
+	// run through ctx, and the engine is told it is over: killed without a
+	// word, the session would sit parked for its resume window, holding the
+	// account's slot. Live bots keep their own signal handling.
+	if s.config.Environment == types.EnvBacktest {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
 	}
 
 	// 1. Prepare session configuration against target Backend (crucial for Backtesting)
@@ -589,6 +602,12 @@ func (s *SDK) Start(ctx context.Context) error {
 	<-sdkCtx.Ctx.Done()
 	if p := s.runErr.Load(); p != nil {
 		return *p
+	}
+	// Stopped from outside (the caller's context, Ctrl+C, SIGTERM) before the
+	// stream finished: a backtest that did not run to its end must not read
+	// as one that did. A finished run cancels only its own context.
+	if s.config.Environment == types.EnvBacktest && ctx.Err() != nil {
+		return fmt.Errorf("backtest stopped before it finished: %w", context.Cause(ctx))
 	}
 	return nil
 }
