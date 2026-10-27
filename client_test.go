@@ -95,3 +95,35 @@ func TestSDK_Start(t *testing.T) {
 		t.Error("ConnectStream was not called")
 	}
 }
+
+func TestRoundUpToTimeframe_LandsOnBucketStarts(t *testing.T) {
+	at := func(s string) time.Time {
+		t.Helper()
+		ts, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ts
+	}
+	cases := []struct {
+		tf       types.Timeframe
+		in, want string
+	}{
+		{types.Timeframe1h, "2026-09-02T10:30:00Z", "2026-09-02T11:00:00Z"},
+		{types.Timeframe1d, "2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z"},
+		// Weeks start on Monday 00:00 UTC, as data_provider's 1w bars do.
+		{types.Timeframe1w, "2026-09-02T00:00:00Z", "2026-09-07T00:00:00Z"},
+		{types.Timeframe1w, "2026-08-31T00:00:00Z", "2026-08-31T00:00:00Z"},
+		// Months start on the 1st, whatever their length. Truncating by 31
+		// days gave 2026-09-19 here.
+		{types.Timeframe1M, "2026-09-02T00:00:00Z", "2026-10-01T00:00:00Z"},
+		{types.Timeframe1M, "2026-01-31T12:00:00Z", "2026-02-01T00:00:00Z"},
+		{types.Timeframe1M, "2026-02-01T00:00:01Z", "2026-03-01T00:00:00Z"},
+		{types.Timeframe1M, "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z"},
+	}
+	for _, c := range cases {
+		if got := roundUpToTimeframe(at(c.in), c.tf); !got.Equal(at(c.want)) {
+			t.Errorf("%s %s: got %s, want %s", c.tf, c.in, got.Format(time.RFC3339), c.want)
+		}
+	}
+}

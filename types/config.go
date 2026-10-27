@@ -88,7 +88,7 @@ type BacktestOptions struct {
 	SessionID string
 
 	Endpoint           string   // Engine API URL: "https://api.kdraigo.com" on the hosted platform; default "http://localhost:4000"
-	SessionName        string   // Human readable name for the backtesting run.
+	SessionName        string   // Human readable name for the backtesting run: the session list shows it until the session is renamed (at most 255 characters).
 	RequestedExchanges []string // List of exchanges to pull historical data against (e.g., "binance").
 	Assets             []string // Trading pairs requested (e.g., "BTC/USDT", "ETH/USDT").
 	// Wallets is the starting balance per asset, for a single-exchange session.

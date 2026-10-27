@@ -974,15 +974,24 @@ func largestTimeframe(tfs []types.Timeframe) types.Timeframe {
 	return largest
 }
 
-// roundUpToTimeframe rounds t up to the next boundary of the given timeframe duration.
-// If t is already on a boundary it is returned unchanged.
+// roundUpToTimeframe rounds t up to the next bucket boundary of the given
+// timeframe. If t is already on a boundary it is returned unchanged.
+//
+// Boundaries come from the timeframe's spec, not time.Truncate: a calendar
+// month has no fixed length, and truncating by a nominal 31 days started a 1M
+// run mid-month, so its first monthly bar was a partial one.
 func roundUpToTimeframe(t time.Time, tf types.Timeframe) time.Time {
-	d := aggregator.ExtractDuration(tf)
-	truncated := t.UTC().Truncate(d)
-	if truncated.Equal(t.UTC()) {
+	spec, err := types.ParseTimeframe(tf)
+	if err != nil {
 		return t
 	}
-	rounded := truncated.Add(d)
+	start := spec.BucketStart(t)
+	if start.Equal(t.UTC()) {
+		return t
+	}
+	// One nominal length past a bucket's start (31 days for a month) always
+	// lands in the next bucket, whose start is the boundary.
+	rounded := spec.BucketStart(start.Add(spec.Duration()))
 	log.Printf("DevSDK: start time rounded up from %s to %s (largest timeframe: %s)", t.UTC().Format(time.RFC3339), rounded.Format(time.RFC3339), tf)
 	return rounded
 }

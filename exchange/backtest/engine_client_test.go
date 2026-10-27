@@ -40,6 +40,9 @@ func TestEngineClient_PrepareSession(t *testing.T) {
 		if len(payload.Streams) == 0 {
 			t.Error("Expected at least one stream")
 		}
+		if payload.Name != "Test-Session" {
+			t.Errorf("the session's name must travel with the create, got %q", payload.Name)
+		}
 
 		// Return success
 		w.Header().Set("Content-Type", "application/json")

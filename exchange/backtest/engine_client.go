@@ -412,6 +412,9 @@ type newSessionRequestPayload struct {
 	Streams        []startSessionRequestStream `json:"streams"`
 	InitialWallets []startSessionRequestWallet `json:"initial_wallets"`
 	Simulation     *types.SimulationOptions    `json:"simulation,omitempty"`
+	// Name is BacktestOptions.SessionName: the name the session list shows
+	// until someone renames it. An older engine ignores it.
+	Name string `json:"name,omitempty"`
 }
 
 type sessionResponse struct {
@@ -579,6 +582,7 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 		Streams:        streams,
 		InitialWallets: wallets,
 		Simulation:     cfg.Backtest.Simulation,
+		Name:           cfg.Backtest.SessionName,
 	}
 	body, _ := json.Marshal(payload)
 
