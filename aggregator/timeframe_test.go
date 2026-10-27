@@ -150,3 +150,61 @@ func TestTimeframeAggregator_BoundaryAlignment(t *testing.T) {
 		t.Errorf("Expected aligned OpenTime %v, got %v", expectedOpenTime, agg.current.OpenTime)
 	}
 }
+
+// Candles as venues and the backtest stream send them: CloseTime is the last
+// millisecond (open + d − 1 ms). A bucket's last candle completes it; folded
+// bars used to run one raw candle late, from the next bucket's first candle.
+func TestTimeframeAggregator_InclusiveCloseTimes(t *testing.T) {
+	feed := func(target, raw types.Timeframe, d time.Duration, start time.Time, n int) (out []*types.Candle) {
+		agg := NewTimeframeAggregator(target)
+		for i := 0; i < n; i++ {
+			open := start.Add(time.Duration(i) * d)
+			c := &types.Candle{Symbol: "BTC/USDT", Exchange: "binance", Timeframe: raw,
+				OpenTime: open, CloseTime: open.Add(d - time.Millisecond),
+				Open: float64(100 + i), High: float64(101 + i), Low: float64(99 + i), Close: float64(100 + i), Volume: 1}
+			if bar := agg.Process(c); bar != nil {
+				out = append(out, bar)
+			}
+		}
+		return out
+	}
+
+	t.Run("4h from 1h", func(t *testing.T) {
+		start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+		bars := feed(types.Timeframe4h, types.Timeframe1h, time.Hour, start, 9)
+		if len(bars) != 2 {
+			t.Fatalf("want 2 complete 4h bars from 9 hours, got %d", len(bars))
+		}
+		for i, b := range bars {
+			wantOpen := start.Add(time.Duration(4*i) * time.Hour)
+			if !b.OpenTime.Equal(wantOpen) {
+				t.Errorf("bar %d opens %s, want %s", i, b.OpenTime, wantOpen)
+			}
+			if b.Open != float64(100+4*i) || b.Close != float64(103+4*i) || b.Volume != 4 {
+				t.Errorf("bar %d is O %.0f C %.0f V %.0f, want the four hours %d–%d", i, b.Open, b.Close, b.Volume, 4*i, 4*i+3)
+			}
+			if wantClose := wantOpen.Add(4*time.Hour - time.Millisecond); !b.CloseTime.Equal(wantClose) {
+				t.Errorf("bar %d closes %s, want %s", i, b.CloseTime, wantClose)
+			}
+		}
+	})
+
+	t.Run("1w from 1d, weeks from Monday", func(t *testing.T) {
+		monday := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
+		bars := feed(types.Timeframe1w, types.Timeframe1d, 24*time.Hour, monday, 14)
+		if len(bars) != 2 {
+			t.Fatalf("want 2 weeks from 14 days, got %d", len(bars))
+		}
+		if !bars[1].OpenTime.Equal(monday.AddDate(0, 0, 7)) || bars[1].Open != 107 || bars[1].Close != 113 {
+			t.Errorf("second week opens %s O %.0f C %.0f, want Monday Sep 7, days 7–13", bars[1].OpenTime, bars[1].Open, bars[1].Close)
+		}
+	})
+
+	t.Run("5m from 1m", func(t *testing.T) {
+		start := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+		bars := feed(types.Timeframe5m, types.Timeframe1m, time.Minute, start, 5)
+		if len(bars) != 1 || bars[0].Close != 104 {
+			t.Fatalf("want the 5th minute to complete the bar, got %d bars", len(bars))
+		}
+	})
+}

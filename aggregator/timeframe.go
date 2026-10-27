@@ -102,14 +102,21 @@ func (ta *TimeframeAggregator) aggregate(raw *types.Candle) {
 	ta.current.TakerBuyQuoteVolume += raw.TakerBuyQuoteVolume
 }
 
-// isBoundaryCrossed reports whether the raw candle completes the current bucket.
+// isBoundaryCrossed reports whether the raw candle completes the current bucket:
+// whether the instant it ends at belongs to the next one.
+//
+// A candle's CloseTime is its last millisecond on the venues and in
+// data_provider (open + d − 1 ms: Binance's and Bybit's kline streams, the
+// backtest stream), and the next candle's open in the SDK's own history fetch
+// (open + d). One millisecond past it is the end in both: the next candle's
+// open. Compared as it was, a bucket's last candle never completed it; the
+// next bucket's first candle was folded in and then closed it, so every
+// folded bar ran one raw candle late (4h bars of 01:00–05:00 from 1h).
 //
 // It compares bucket membership rather than subtracting timestamps, because a
-// fixed duration cannot express a calendar month. (Weeks were already correct
-// under the previous Time.Truncate, which anchors at Go's zero time — year 1,
-// a Monday — rather than at the Unix epoch, a Thursday.)
+// fixed duration cannot express a calendar month.
 func (ta *TimeframeAggregator) isBoundaryCrossed(raw *types.Candle) bool {
-	return !ta.spec.SameBucket(raw.CloseTime, ta.current.OpenTime)
+	return !ta.spec.SameBucket(raw.CloseTime.Add(time.Millisecond), ta.current.OpenTime)
 }
 
 // ExtractDuration returns the nominal length of a timeframe, for client-side

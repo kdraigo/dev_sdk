@@ -127,3 +127,37 @@ func TestRoundUpToTimeframe_LandsOnBucketStarts(t *testing.T) {
 		}
 	}
 }
+
+// startAdapter records the start the session was prepared with.
+type startAdapter struct {
+	mockAdapter
+	prepared chan time.Time
+}
+
+func (a *startAdapter) PrepareSession(ctx context.Context, config *types.Config) error {
+	a.prepared <- config.Backtest.StartTime
+	return context.Canceled // the test needs nothing past it
+}
+
+// The session is prepared with the rounded start, so the engine streams from
+// the boundary: rounded after, a run starting on a Wednesday got a partial
+// first weekly bar.
+func TestSDK_StartRoundsBeforeThePreparedSession(t *testing.T) {
+	a := &startAdapter{prepared: make(chan time.Time, 1)}
+	s := &SDK{
+		config: &types.Config{Environment: types.EnvBacktest, Timeframes: []types.Timeframe{types.Timeframe1d, types.Timeframe1w},
+			Backtest: &types.BacktestOptions{StartTime: time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)}},
+		adapter:       a,
+		rawCandleChan: make(chan *types.Candle, 1),
+		orderChan:     make(chan *types.Order, 1),
+	}
+	_ = s.Start(context.Background())
+	select {
+	case got := <-a.prepared:
+		if want := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Errorf("prepared with %s, want Monday %s", got, want)
+		}
+	default:
+		t.Fatal("PrepareSession was not called")
+	}
+}

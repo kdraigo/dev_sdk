@@ -297,6 +297,20 @@ func (s *SDK) Start(ctx context.Context) error {
 		defer stop()
 	}
 
+	if len(s.config.Timeframes) == 0 {
+		return fmt.Errorf("config.Timeframes must contain at least one timeframe")
+	}
+
+	if s.config.Backtest != nil {
+		// Round start time up to the next boundary of the largest requested
+		// timeframe, so the first bar is a whole one. Before the session is
+		// prepared: the engine streams from the start it is given, and rounded
+		// after, the first weekly bar of a run starting on a Wednesday was
+		// three days long.
+		largest := largestTimeframe(s.config.Timeframes)
+		s.config.Backtest.StartTime = roundUpToTimeframe(s.config.Backtest.StartTime, largest)
+	}
+
 	// 1. Prepare session configuration against target Backend (crucial for Backtesting)
 	if err := s.adapter.PrepareSession(ctx, s.config); err != nil {
 		return err
@@ -339,17 +353,6 @@ func (s *SDK) Start(ctx context.Context) error {
 	// This keeps the pipeline fully sequential and deterministic — the engine never
 	// receives a "next" request while a concurrent "order" request is in flight.
 	syncChan := make(chan bool, 1)
-
-	if len(s.config.Timeframes) == 0 {
-		return fmt.Errorf("config.Timeframes must contain at least one timeframe")
-	}
-
-	if s.config.Backtest != nil {
-		// Round start time up to the next boundary of the largest requested timeframe
-		// to avoid receiving a partial first candle.
-		largest := largestTimeframe(s.config.Timeframes)
-		s.config.Backtest.StartTime = roundUpToTimeframe(s.config.Backtest.StartTime, largest)
-	}
 
 	// Indicator managers exist since New; catch up with any config edit since.
 	s.ensureIndicatorManagers()
