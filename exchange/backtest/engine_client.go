@@ -55,6 +55,10 @@ type EngineClient struct {
 	nextSeq     atomic.Uint64
 	inflightSeq atomic.Uint64
 
+	// lastProgress is the processed-candle count last logged from a progress
+	// frame.
+	lastProgress atomic.Int64
+
 	// onResume is invoked on every attach to an existing session, before any
 	// candle from that connection is dispatched.
 	onResume   func(*types.SessionState)
@@ -1064,7 +1068,10 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 				Percent          float64 `json:"percent"`
 				ETASeconds       float64 `json:"eta_seconds"`
 			}
-			if json.Unmarshal(resp.Data, &p) == nil && p.TotalCandles > 0 {
+			// Only when it moved: the engine sends one every 15 s, and a
+			// repeated line made a strategy stuck in a callback look busy
+			// to the cloud workspace's stall watchdog.
+			if json.Unmarshal(resp.Data, &p) == nil && p.TotalCandles > 0 && e.lastProgress.Swap(p.ProcessedCandles) != p.ProcessedCandles {
 				log.Printf("Backtest progress: %d/%d candles (%.1f%%), ETA %.0fs",
 					p.ProcessedCandles, p.TotalCandles, p.Percent, p.ETASeconds)
 			}

@@ -53,6 +53,10 @@ type mockEngineServer struct {
 	plotDefs   []plots.Def
 	plotPoints []plots.Point
 	plotFrames int
+
+	// progress, when set, is sent after the opening frame as one progress
+	// frame per processed-candle count, as the engine's 15 s keepalive does.
+	progress []int64
 }
 
 // recordPlots keeps the plots carried by one message. Caller holds mu.
@@ -102,6 +106,7 @@ func newMockEngineServer() *mockEngineServer {
 			}
 			defer conn.Close()
 			m.sendSessionState(conn, resumed)
+			m.sendProgress(conn)
 			m.handleWS(conn)
 		} else if strings.HasPrefix(r.URL.Path, "/api/v1/dev/session") {
 			m.mu.Lock()
@@ -142,6 +147,19 @@ func (m *mockEngineServer) sendSessionState(conn *websocket.Conn, resumed bool) 
 			"timeframe":  "1m",
 		},
 	})
+}
+
+func (m *mockEngineServer) sendProgress(conn *websocket.Conn) {
+	m.mu.Lock()
+	progress := m.progress
+	m.mu.Unlock()
+	for _, n := range progress {
+		conn.WriteJSON(map[string]interface{}{
+			"action": "progress",
+			"status": "ok",
+			"data":   map[string]interface{}{"processed_candles": n, "total_candles": 100, "percent": float64(n)},
+		})
+	}
 }
 
 func (m *mockEngineServer) stats() (conns, posts int, seqs []uint64, closed bool) {

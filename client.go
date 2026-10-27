@@ -72,7 +72,23 @@ type SDK struct {
 	candlesProcessed atomic.Int64
 	ordersPlaced     atomic.Int32
 	lastOrderID      atomic.Value // string
+
+	// handlingSince is when the candle pipeline took the raw candle it is
+	// still handling (Unix nanoseconds), or 0 while it is idle. The backtest
+	// tick loop reads it so it never steps the engine past a callback that
+	// has not returned.
+	handlingSince atomic.Int64
 }
+
+// Backtest tick loop timing; variables so tests can shorten them.
+var (
+	// nextTimeout is how long the tick loop waits for the pipeline to finish
+	// a candle before it treats the engine as silent and re-issues "next".
+	nextTimeout = 15 * time.Second
+	// slowCallbackAfter is how long a candle's callbacks may run before the
+	// SDK warns, once, that the backtest is waiting for them.
+	slowCallbackAfter = 60 * time.Second
+)
 
 var _ types.Trader = (*SDK)(nil)
 
@@ -371,6 +387,7 @@ func (s *SDK) Start(ctx context.Context) error {
 	go func() {
 		count := 0
 		for rawCandle := range s.rawCandleChan {
+			s.handlingSince.Store(time.Now().UnixNano())
 			count++
 			s.candlesProcessed.Store(int64(count))
 			if count%1000 == 0 {
@@ -399,6 +416,10 @@ func (s *SDK) Start(ctx context.Context) error {
 			if s.config.Environment == types.EnvBacktest {
 				syncChan <- true
 			}
+			// Idle only once the signal is queued: the tick loop's timer
+			// must never find both an idle pipeline and no signal for a
+			// candle that was just handled.
+			s.handlingSince.Store(0)
 		}
 		close(syncChan)
 	}()
@@ -524,10 +545,11 @@ func (s *SDK) Start(ctx context.Context) error {
 
 	// 6. Start the deterministic ticking loop for backtesting
 	if s.config.Environment == types.EnvBacktest {
+		timeout, slowAfter := nextTimeout, slowCallbackAfter
 		go func() {
-			// nextTimeout is how long the tick loop waits for syncChan before
-			// assuming the engine went silent (e.g. after an order fill) and
-			// re-issuing a "next" command to unblock it.
+			// After nextTimeout without a signal on syncChan, the loop
+			// re-issues "next", for an engine that went silent (e.g. after
+			// an order fill).
 			//
 			// Re-issuing used to be able to double-step the engine: the
 			// request carried no identity, so a tick that was merely slow
@@ -535,7 +557,13 @@ func (s *SDK) Start(ctx context.Context) error {
 			// nobody. Ticks now carry a sequence and a retry re-sends the same
 			// one, which the engine answers from cache — so this is a genuine
 			// retry rather than a second step.
-			const nextTimeout = 15 * time.Second
+			//
+			// That holds only while the tick is unanswered. Once its candle
+			// has arrived, a new "next" is a new step, so none is sent while
+			// the candle is still in the pipeline: a slow or blocked callback
+			// used to be stepped past every 15 s, so a deadlocked strategy
+			// crawled on instead of stopping.
+			var warnedFor int64
 
 			// tick issues the next step, reporting whether the run should
 			// continue. A write that lands while the adapter is reconnecting
@@ -588,11 +616,25 @@ func (s *SDK) Start(ctx context.Context) error {
 					if !tick("Next()") {
 						return
 					}
-				case <-time.After(nextTimeout):
+				case <-time.After(timeout):
+					if since := s.handlingSince.Load(); since != 0 || len(syncChan) > 0 || len(s.rawCandleChan) > 0 {
+						// The engine answered; the strategy has not finished.
+						// Warned once per candle, so a deadlocked strategy
+						// goes quiet and the cloud workspace's stall watchdog
+						// can stop it.
+						if since != 0 && since != warnedFor {
+							if took := time.Since(time.Unix(0, since)); took >= slowAfter {
+								warnedFor = since
+								log.Printf("DevSDK: WARNING — the callbacks for the candle closing %s have not returned after %s; the backtest waits for them",
+									s.Now().UTC().Format("2006-01-02 15:04"), took.Round(time.Second))
+							}
+						}
+						continue
+					}
 					// Engine went silent (no candle arrived within nextTimeout).
 					// This happens when the engine sends an order-fill event but waits
 					// for another "next" command before streaming the following candle.
-					log.Printf("DevSDK: engine silent for %s — re-issuing next", nextTimeout)
+					log.Printf("DevSDK: engine silent for %s — re-issuing next", timeout)
 					if !tick("recovery Next()") {
 						return
 					}
