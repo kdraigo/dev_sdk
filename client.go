@@ -325,6 +325,7 @@ func (s *SDK) Start(ctx context.Context) error {
 		// three days long.
 		largest := largestTimeframe(s.config.Timeframes)
 		s.config.Backtest.StartTime = roundUpToTimeframe(s.config.Backtest.StartTime, largest)
+		applySmoke(s.config.Backtest, os.Getenv(smokeEnv))
 	}
 
 	// 1. Prepare session configuration against target Backend (crucial for Backtesting)
@@ -1053,6 +1054,46 @@ func (s *SDK) SetLeverage(ctx context.Context, exchange, pair string, leverage f
 		return ErrUnsupportedByAdapter
 	}
 	return setter.SetLeverage(ctx, exchange, pair, leverage)
+}
+
+// GetMargin reads a futures wallet's collateral in asset (USDT for linear
+// perpetuals) and what its open positions hold: what is free for a new
+// position, what is posted, the unrealized P&L, equity, and the funding paid
+// so far. Funding eating a long-held position shows here first.
+//
+// It reads the account and the positions, so it needs an adapter that can
+// read positions (the backtester and Binance futures); others return
+// ErrUnsupportedByAdapter.
+func (s *SDK) GetMargin(ctx context.Context, exchange, asset string) (*types.Margin, error) {
+	reader, ok := s.adapter.(PositionReader)
+	if !ok {
+		return nil, ErrUnsupportedByAdapter
+	}
+	acc, err := s.adapter.GetAccount(ctx, exchange, asset)
+	if err != nil {
+		return nil, err
+	}
+	positions, err := reader.GetPositions(ctx, exchange)
+	if err != nil {
+		return nil, err
+	}
+	m := &types.Margin{Exchange: exchange, Asset: asset}
+	for _, b := range acc.Balances {
+		if b.Asset == asset {
+			m.Available, m.InUse = b.Free, b.Lock
+		}
+	}
+	for _, p := range positions {
+		// "BTC/USDT" in backtests, "BTCUSDT" on the venue.
+		if !strings.HasSuffix(strings.ReplaceAll(p.Symbol, "/", ""), asset) {
+			continue
+		}
+		m.Positions++
+		m.Unrealized += p.UnrealizedPnL
+		m.FundingPaid += p.FundingPaid
+	}
+	m.Equity = m.Available + m.InUse + m.Unrealized
+	return m, nil
 }
 
 // GetPositions returns open futures positions. Pass an empty exchange to read

@@ -215,6 +215,30 @@ type Position struct {
 	UnrealizedPnL float64
 }
 
+// Margin is a futures wallet's collateral in one asset and what its open
+// positions hold, as SDK.GetMargin reads it.
+type Margin struct {
+	Exchange string
+	// Asset is the collateral, e.g. USDT for linear perpetuals.
+	Asset string
+
+	// Available is the collateral a new position can use.
+	Available float64
+	// InUse is what is posted as margin: the wallet balance less Available.
+	InUse float64
+	// Unrealized is the open positions' P&L at their mark (in backtests, the
+	// last close).
+	Unrealized float64
+	// Equity is the wallet balance plus Unrealized: what closing everything
+	// at the mark would leave, before fees.
+	Equity float64
+	// FundingPaid is what the open positions have paid in funding so far;
+	// negative when they received more.
+	FundingPaid float64
+	// Positions counts the open positions margined in Asset.
+	Positions int
+}
+
 // Trader is the internal dependency decoupled interface to execute logic.
 type Trader interface {
 	PlaceOrder(ctx context.Context, req *OrderRequest) (*Order, error)

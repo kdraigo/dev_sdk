@@ -90,6 +90,12 @@ type EngineClient struct {
 
 	// warned holds the engine warnings already logged, so each shows once.
 	warned sync.Map
+
+	// lastClose is each pair's latest streamed close, keyed "exchange|pair":
+	// the price the engine values open positions at, which its positions
+	// action does not return. Empty after a cold resume until the next
+	// candle.
+	lastClose sync.Map
 }
 
 // maxPlotBytes bounds the plots one message carries. The engine ends a session
@@ -1131,7 +1137,7 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 					TakerBuyBaseVolume:  dataStruct.Tick.Candle.TakerBuyBaseVolume,
 					TakerBuyQuoteVolume: dataStruct.Tick.Candle.TakerBuyQuoteVolume,
 				}
-				// log.Printf("[WS] Received Candle: %s", candle.OpenTime.Format("2006-01-02 15:04"))
+				e.lastClose.Store(candle.Exchange+"|"+candle.Symbol, candle.Close)
 				candleChan <- candle
 			}
 			// Dispatch any orders filled during this tick to the order channel.
@@ -1630,21 +1636,37 @@ func (e *EngineClient) GetPositions(ctx context.Context, exchange string) ([]*ty
 		}
 
 		for _, w := range wire {
-			out = append(out, &types.Position{
-				Symbol:         w.Pair,
-				Exchange:       ex,
-				Side:           w.Side,
-				Size:           w.Size,
-				EntryPrice:     w.EntryPrice,
-				Leverage:       w.Leverage,
-				IsolatedMargin: w.IsolatedMargin,
-				RealizedPnL:    w.RealizedPnL,
-				FundingPaid:    w.FundingPaid,
-			})
+			out = append(out, e.position(ex, w))
 		}
 	}
 
 	return out, nil
+}
+
+// position maps one engine position, valued at its pair's last streamed
+// close as the engine values it: the positions action carries no price, and
+// MarkPrice and UnrealizedPnL were always zero in backtests.
+func (e *EngineClient) position(ex string, w positionWire) *types.Position {
+	p := &types.Position{
+		Symbol:         w.Pair,
+		Exchange:       ex,
+		Side:           w.Side,
+		Size:           w.Size,
+		EntryPrice:     w.EntryPrice,
+		Leverage:       w.Leverage,
+		IsolatedMargin: w.IsolatedMargin,
+		RealizedPnL:    w.RealizedPnL,
+		FundingPaid:    w.FundingPaid,
+	}
+	if v, ok := e.lastClose.Load(ex + "|" + w.Pair); ok {
+		p.MarkPrice = v.(float64)
+		dir := 1.0
+		if strings.EqualFold(w.Side, "SHORT") {
+			dir = -1
+		}
+		p.UnrealizedPnL = dir * w.Size * (p.MarkPrice - w.EntryPrice)
+	}
+	return p
 }
 
 // futuresExchanges lists the configured exchanges running a perpetual wallet,
