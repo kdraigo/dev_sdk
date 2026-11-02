@@ -252,6 +252,31 @@ func (s *SDK) SetOnCandleFor(tf types.Timeframe, fn types.OnCandleFunc) {
 	s.onCandleHandlers[tf] = fn
 }
 
+// dispatchOrder hands one order update to the strategy, once per transition.
+func (s *SDK) dispatchOrder(sdkCtx *types.Context, order *types.Order) {
+	// Push and poll can both be live during a reconnect, and the backtest
+	// engine replays nothing, so dedup happens here for every source rather
+	// than in each adapter. A transition the strategy has already been told
+	// about is dropped.
+	if !s.reconciler.observe(order) {
+		return
+	}
+	// Order updates from the exchange/engine stream carry no
+	// strategy-supplied reason — that lives on the original PlaceOrder call.
+	if s.publisher != nil {
+		s.publisher.PublishOrder(order, nil, nil)
+	}
+	if s.onOrderUpdate != nil {
+		s.onOrderUpdate(sdkCtx, order)
+	}
+	// After a fill, refresh the current-balance snapshot so the frontend's
+	// wallet delta picks up the change without reconstructing from order
+	// history.
+	if order.Status == types.OrderStatusFilled && s.publisher != nil && s.publisher.Enabled() {
+		go s.publishCurrentBalanceFor(sdkCtx.Ctx, order.Exchange, order.Symbol)
+	}
+}
+
 // SetOnOrderUpdate binds the strategy callback to watch execution.
 func (s *SDK) SetOnOrderUpdate(fn types.OnOrderUpdateFunc) {
 	s.onOrderUpdate = fn
@@ -382,81 +407,116 @@ func (s *SDK) Start(ctx context.Context) error {
 		s.aggregators[tf] = aggregator.NewMultiAggregator(tf)
 	}
 
-	// Single goroutine: fan out each raw tick to all aggregators, fire callbacks for any
-	// that cross a boundary, then signal the ticking loop exactly once per raw tick.
-	// This keeps the pipeline fully sequential and deterministic.
-	go func() {
-		count := 0
-		for rawCandle := range s.rawCandleChan {
-			s.handlingSince.Store(time.Now().UnixNano())
-			count++
-			s.candlesProcessed.Store(int64(count))
-			if count%1000 == 0 {
-				log.Printf("DevSDK: processed %d candles... (%s)", count, rawCandle.OpenTime.Format("2006-01-02 15:04"))
-			}
-			// Advance the simulated clock for backtest. In live the clock is a
-			// wallClock and Advance is a no-op (interface check below).
-			if bc, ok := s.clock.(*backtestClock); ok && rawCandle != nil {
-				bc.Advance(rawCandle.CloseTime)
-			}
-			for _, tf := range s.config.Timeframes {
-				if closed := s.aggregators[tf].Process(rawCandle); closed != nil {
-					s.indManagers[tf].Update(closed)
-					s.dispatchCandle(sdkCtx, tf, closed)
-				}
-			}
-			// Signal the tick loop — but only in backtest, where it exists.
-			//
-			// syncChan is buffered at 1 and its sole reader is the backtest
-			// ticking loop below. In live mode nothing drains it, so the
-			// second send blocked this goroutine forever: a live session
-			// dispatched exactly two candles and then went permanently deaf,
-			// with the websockets still connected and no error anywhere.
-			// Observed on a live futures session — candles=2 for the whole run
-			// while the venue kept sending.
-			if s.config.Environment == types.EnvBacktest {
-				syncChan <- true
-			}
-			// Idle only once the signal is queued: the tick loop's timer
-			// must never find both an idle pipeline and no signal for a
-			// candle that was just handled.
-			s.handlingSince.Store(0)
+	// processCandle fans one raw tick out to every aggregator, fires the
+	// callbacks of any bar that closes, and in backtest then signals the
+	// ticking loop exactly once per raw tick.
+	count := 0
+	processCandle := func(rawCandle *types.Candle) {
+		count++
+		s.candlesProcessed.Store(int64(count))
+		if count%1000 == 0 {
+			log.Printf("DevSDK: processed %d candles... (%s)", count, rawCandle.OpenTime.Format("2006-01-02 15:04"))
 		}
-		close(syncChan)
-	}()
+		// Advance the simulated clock for backtest. In live the clock is a
+		// wallClock and Advance is a no-op (interface check below).
+		if bc, ok := s.clock.(*backtestClock); ok && rawCandle != nil {
+			bc.Advance(rawCandle.CloseTime)
+		}
+		for _, tf := range s.config.Timeframes {
+			if closed := s.aggregators[tf].Process(rawCandle); closed != nil {
+				s.indManagers[tf].Update(closed)
+				s.dispatchCandle(sdkCtx, tf, closed)
+			}
+		}
+		// Signal the tick loop — but only in backtest, where it exists.
+		//
+		// syncChan is buffered at 1 and its sole reader is the backtest
+		// ticking loop below. In live mode nothing drains it, so the
+		// second send blocked this goroutine forever: a live session
+		// dispatched exactly two candles and then went permanently deaf,
+		// with the websockets still connected and no error anywhere.
+		// Observed on a live futures session — candles=2 for the whole run
+		// while the venue kept sending.
+		if s.config.Environment == types.EnvBacktest {
+			syncChan <- true
+		}
+		// Idle only once the signal is queued: the tick loop's timer
+		// must never find both an idle pipeline and no signal for a
+		// candle that was just handled.
+		s.handlingSince.Store(0)
+	}
 
-	// Pipeline C: Order Updates dispatch loop
-	go func() {
-		for {
-			select {
-			case order := <-s.orderChan:
-				// Push and poll can both be live during a reconnect, and the
-				// backtest engine replays nothing, so dedup happens here for
-				// every source rather than in each adapter. A transition the
-				// strategy has already been told about is dropped.
-				if !s.reconciler.observe(order) {
-					continue
+	if s.config.Environment == types.EnvBacktest {
+		// Backtest: one goroutine for candles and order updates, so a run is
+		// the same every time. The engine answers each step with its candle
+		// and the fills that happened inside that bar, and the adapter queues
+		// the fills first: they are handed to OnOrderUpdate before the bar
+		// reaches OnCandle, and the engine is stepped only after both. On two
+		// goroutines, which callback ran first was the scheduler's choice: a
+		// stop that filled inside a bar reached the strategy before or after
+		// that bar's close, and a strategy keeping its position in
+		// OnOrderUpdate traded differently from run to run with the same
+		// code and data.
+		go func() {
+			// drainOrders hands over every update already queued. When a
+			// candle has been received, its step's fills are all queued: the
+			// adapter sent them first, from the same goroutine.
+			drainOrders := func() {
+				for {
+					select {
+					case order := <-s.orderChan:
+						s.dispatchOrder(sdkCtx, order)
+					default:
+						return
+					}
 				}
-				// Order updates from the exchange/engine stream carry no
-				// strategy-supplied reason — that lives on the original
-				// PlaceOrder call.
-				if s.publisher != nil {
-					s.publisher.PublishOrder(order, nil, nil)
-				}
-				if s.onOrderUpdate != nil {
-					s.onOrderUpdate(sdkCtx, order)
-				}
-				// After a fill, refresh the current-balance snapshot so the
-				// frontend's wallet delta picks up the change without
-				// reconstructing from order history.
-				if order.Status == types.OrderStatusFilled && s.publisher != nil && s.publisher.Enabled() {
-					go s.publishCurrentBalanceFor(sdkCtx.Ctx, order.Exchange, order.Symbol)
-				}
-			case <-sdkCtx.Ctx.Done():
-				return
 			}
-		}
-	}()
+			for {
+				select {
+				case rawCandle, ok := <-s.rawCandleChan:
+					if !ok {
+						drainOrders()
+						close(syncChan)
+						return
+					}
+					// Busy from here, fills included: the tick loop must not
+					// take a slow OnOrderUpdate for a silent engine.
+					s.handlingSince.Store(time.Now().UnixNano())
+					drainOrders()
+					processCandle(rawCandle)
+				case order := <-s.orderChan:
+					// Fills with no candle (the run's last step).
+					s.handlingSince.Store(time.Now().UnixNano())
+					s.dispatchOrder(sdkCtx, order)
+					s.handlingSince.Store(0)
+				case <-sdkCtx.Ctx.Done():
+					return
+				}
+			}
+		}()
+	} else {
+		// Live: candles and order updates arrive in real time, each on its
+		// own goroutine, so a slow callback on one never holds up the other.
+		go func() {
+			for rawCandle := range s.rawCandleChan {
+				s.handlingSince.Store(time.Now().UnixNano())
+				processCandle(rawCandle)
+			}
+			close(syncChan)
+		}()
+
+		// Pipeline C: Order Updates dispatch loop
+		go func() {
+			for {
+				select {
+				case order := <-s.orderChan:
+					s.dispatchOrder(sdkCtx, order)
+				case <-sdkCtx.Ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 
 	// 4. Perform Handshake: Fetch initial account info for all requested assets
 	// This ensures "Paper Wallet First" synchronization.

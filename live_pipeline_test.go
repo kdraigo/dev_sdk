@@ -91,6 +91,6 @@ func TestBacktestStillPacesThroughSyncChan(t *testing.T) {
 	raw, err := os.ReadFile("client.go")
 	require.NoError(t, err)
 	src := string(raw)
-	assert.Contains(t, src, "if s.config.Environment == types.EnvBacktest {\n\t\t\t\tsyncChan <- true",
+	assert.Contains(t, src, "if s.config.Environment == types.EnvBacktest {\n\t\t\tsyncChan <- true",
 		"the pacing signal must remain, gated to backtest rather than deleted")
 }

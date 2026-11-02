@@ -1119,8 +1119,9 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 			// Skip it — the zero candle would otherwise pollute the SDK
 			// pipeline (advance clock backwards by no-op, fire OnCandle
 			// with empty data, etc.). The done flag itself is enough.
+			var candle *types.Candle
 			if dataStruct.Tick != nil && !dataStruct.Done && !dataStruct.Tick.Candle.Time.IsZero() {
-				candle := &types.Candle{
+				candle = &types.Candle{
 					Symbol:              dataStruct.Tick.Pair,
 					Exchange:            dataStruct.Tick.Exchange,
 					Timeframe:           e.smallestTF,
@@ -1138,14 +1139,19 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 					TakerBuyQuoteVolume: dataStruct.Tick.Candle.TakerBuyQuoteVolume,
 				}
 				e.lastClose.Store(candle.Exchange+"|"+candle.Symbol, candle.Close)
-				candleChan <- candle
 			}
-			// Dispatch any orders filled during this tick to the order channel.
-			// The engine reports only fills here, and fills an order whole.
+			// The orders filled during this tick go first: they filled inside
+			// the bar, before its close, and the SDK hands a step's fills to
+			// the strategy before its candle, which it can do only if they
+			// are queued by the time the candle arrives. The engine reports
+			// only fills here, and fills an order whole.
 			for _, w := range dataStruct.Orders {
 				if order := w.order(); order.ID != "" {
 					orderChan <- order
 				}
+			}
+			if candle != nil {
+				candleChan <- candle
 			}
 			if dataStruct.Done {
 				log.Println("Backtest Engine: Data stream finished.")
