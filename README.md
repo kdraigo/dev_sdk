@@ -43,7 +43,7 @@ func main() {
 		Environment: types.EnvBacktest, // types.EnvRealBinance to trade live
 		Timeframes:  []types.Timeframe{types.Timeframe15m},
 		Credentials: types.Credentials{
-			KeyID:      "your-key-id",      // from kdraigo.com/api-keys
+			KeyID:      "your-key-id",      // from kdraigo.com/account/api-keys
 			PrivateKey: "your-private-key", // hex-encoded Ed25519
 		},
 		Backtest: &types.BacktestOptions{
