@@ -1015,7 +1015,9 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 				accountCh <- &ar
 				close(accountCh)
 			} else if cancelCh != nil {
-				if resp.Status == "error" {
+				if resp.Status == "error" && resp.Code == codeOrderClosed {
+					cancelCh <- fmt.Errorf("%s: %w", resp.Error, types.ErrOrderClosed)
+				} else if resp.Status == "error" {
 					cancelCh <- fmt.Errorf("%s", resp.Error)
 				} else {
 					cancelCh <- nil
@@ -1024,8 +1026,12 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 			}
 		}
 
-		if resp.Status != "ok" {
+		// A cancel of an order that already closed is an answer, not an error
+		// worth a line: after every bracket exit the strategy may ask.
+		if resp.Status != "ok" && resp.Code != codeOrderClosed {
 			log.Printf("Engine WS Error on %s: %s (%s)", resp.Action, resp.Error, resp.Code)
+		}
+		if resp.Status != "ok" {
 			// A rejected tick sequence means the client and the engine no
 			// longer agree on what has been delivered. Carrying on would mean
 			// producing a result with a gap in it that nothing records, so the
@@ -1358,6 +1364,10 @@ func (e *EngineClient) PlaceOrder(ctx context.Context, req *types.OrderRequest) 
 		return nil, fmt.Errorf("timeout waiting for order confirmation")
 	}
 }
+
+// codeOrderClosed is the engine's code for a cancel of an order that already
+// filled or was cancelled (backtester_engine dev.CodeOrderClosed).
+const codeOrderClosed = "order_closed"
 
 func (e *EngineClient) CancelOrder(ctx context.Context, exchange, symbol, orderID string) error {
 	if e.conn() == nil {

@@ -559,7 +559,7 @@ func (b *BinanceFuturesClient) CancelOrder(ctx context.Context, exchange, symbol
 	} else {
 		if _, err := b.client.NewCancelOrderService().
 			Symbol(VenueSymbol(symbol)).OrderID(venueID).Do(ctx); err != nil {
-			return err
+			return closedOnCancel(err)
 		}
 	}
 	b.forgetBracket(id)
@@ -1050,6 +1050,20 @@ func explainPermissionError(err error, action string) error {
 	var apiErr *common.APIError
 	if errors.As(err, &apiErr) && apiErr.Code == binanceCodePermissionDenied {
 		return fmt.Errorf("%w: %s was refused with -2015. Read endpoints succeed because they need only \"Enable Reading\"; writes need \"Enable Futures\" on the API key. Check, in order: the key has Enable Futures ticked, this host's IP is in the key's allow-list, and the key belongs to the account holding the futures wallet", ErrFuturesPermissionDenied, action)
+	}
+	return err
+}
+
+// binanceCodeUnknownOrder is Binance's -2011, "Unknown order sent.": on a
+// cancel, the order is no longer open (it filled or was cancelled already).
+const binanceCodeUnknownOrder = -2011
+
+// closedOnCancel marks a cancel refused because the order is no longer open
+// with types.ErrOrderClosed, so a strategy can tell it from a real failure.
+func closedOnCancel(err error) error {
+	var apiErr *common.APIError
+	if errors.As(err, &apiErr) && apiErr.Code == binanceCodeUnknownOrder {
+		return fmt.Errorf("%w (venue said: %s)", types.ErrOrderClosed, apiErr.Message)
 	}
 	return err
 }

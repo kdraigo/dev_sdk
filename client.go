@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -26,6 +27,9 @@ import (
 type SDK struct {
 	config  *types.Config
 	adapter Adapter
+
+	// reasonWarned holds the order reason keys already warned about as NaN.
+	reasonWarned sync.Map
 
 	// Callbacks
 	onCandleAll      types.OnCandleFunc                     // Fires on every closed candle regardless of timeframe.
@@ -761,6 +765,7 @@ func (s *SDK) PlaceBracket(ctx context.Context, req *types.BracketRequest) ([]*t
 		return nil, ErrUnsupportedByAdapter
 	}
 
+	req.Reason = s.cleanReason(req.Reason)
 	reason, logs := req.Reason, req.Logs
 	if s.config.Environment != types.EnvBacktest {
 		req.Reason, req.Logs = nil, nil
@@ -785,7 +790,21 @@ func (s *SDK) PlaceBracket(ctx context.Context, req *types.BracketRequest) ([]*t
 	return orders, nil
 }
 
+// cleanReason sends NaN and infinite numbers in an order's reason as null
+// (JSON has no NaN, and encoding one refused the whole order), warning once
+// per key so a strategy learns which value was not ready.
+func (s *SDK) cleanReason(reason map[string]any) map[string]any {
+	clean, bad := types.CleanReason(reason)
+	for _, key := range bad {
+		if _, seen := s.reasonWarned.LoadOrStore(key, true); !seen {
+			log.Printf("dev_sdk: order reason %q is NaN or infinite; it is sent as null (warned once per key)", key)
+		}
+	}
+	return clean
+}
+
 func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error) {
+	req.Reason = s.cleanReason(req.Reason)
 	reason, logs := req.Reason, req.Logs
 
 	// Strip telemetry fields for live adapters — exchanges never see Reason/Logs.
