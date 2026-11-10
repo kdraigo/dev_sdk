@@ -160,6 +160,14 @@ type SimulationOptions struct {
 	FuturesMakerFee *float64 `json:"futures_maker_fee,omitempty"`
 	FuturesTakerFee *float64 `json:"futures_taker_fee,omitempty"`
 
+	// SlippageBps worsens every taker fill (a market order, a triggered stop)
+	// by this many basis points against its side. Nil: none, the bar's price.
+	SlippageBps *float64 `json:"slippage_bps,omitempty"`
+
+	// FeeMult scales every fee the engine resolves, defaults included: a
+	// cost stress without restating the schedule. Nil: 1.
+	FeeMult *float64 `json:"fee_mult,omitempty"`
+
 	// DefaultLeverage applies to futures wallets that do not set their own.
 	// Defaults to 1: unleveraged unless explicitly asked for.
 	DefaultLeverage *float64 `json:"default_leverage,omitempty"`

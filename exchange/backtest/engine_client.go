@@ -591,7 +591,7 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	payload := newSessionRequestPayload{
 		Streams:        streams,
 		InitialWallets: wallets,
-		Simulation:     cfg.Backtest.Simulation,
+		Simulation:     withStress(cfg.Backtest.Simulation),
 		Name:           cfg.Backtest.SessionName,
 	}
 	body, _ := json.Marshal(payload)
