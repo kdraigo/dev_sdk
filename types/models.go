@@ -26,6 +26,12 @@ type Candle struct {
 	QuoteVolume         float64 // Quote-asset volume (turnover).
 	TakerBuyBaseVolume  float64 // Taker buy base-asset volume (aggressive-buy pressure).
 	TakerBuyQuoteVolume float64 // Taker buy quote-asset volume.
+
+	// Market data on the bar, when Config.MarketData asks for it (see
+	// types.MarketData). nil when it did not, or when there is none for this
+	// bar: spot markets have no positioning, trade flow starts 2025-03-01.
+	Positioning *Positioning
+	Flow        *Flow
 }
 
 // OrderType dictates whether an order is Market, Limit, etc.

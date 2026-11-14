@@ -60,9 +60,17 @@ type Config struct {
 	// sessions. Default (when 0) is 1500. Raise it only if you request indicator
 	// periods approaching that window.
 	IndicatorHistory int
-	Credentials      Credentials      // API Keys for specific real/testnet exchanges
-	Backtest         *BacktestOptions // Specific settings required when configuring a new backtest engine session.
-	Live             *LiveOptions     // Specific settings required when configuring a real exchange stream.
+
+	// MarketData lists the series attached to every candle beside its prices:
+	// MarketDataPositioning (Candle.Positioning) and MarketDataFlow
+	// (Candle.Flow). Empty means none. In a backtest the engine attaches them;
+	// live, the SDK reads them from the platform's data API (LiveOptions.DataURL)
+	// as each candle closes, so a strategy sees the same numbers in both.
+	MarketData []MarketData
+
+	Credentials Credentials      // API Keys for specific real/testnet exchanges
+	Backtest    *BacktestOptions // Specific settings required when configuring a new backtest engine session.
+	Live        *LiveOptions     // Specific settings required when configuring a real exchange stream.
 }
 
 // Credentials holds sensitive authentication data for exchange APIs and platform access.
@@ -205,7 +213,12 @@ type LiveOptions struct {
 	Assets             []string // Trading pairs requested (e.g., "BTCUSDT", "ETHUSDT"). Note: Binance requires no slashes usually.
 	TelemetryURL       string   // Where live telemetry is posted: "https://api.kdraigo.com/telemetry" on the hosted platform. Empty = disabled.
 	TelemetryAPIKey    string   // X-API-Key for live_trades service authentication.
-	SessionID          string   // Optional fixed telemetry session id. Empty = a new UUID is generated; set to resume/extend an existing session.
+	// DataURL is the platform's data API, where a live run reads funding,
+	// positioning and trade flow (Config.MarketData, SDK.GetFundingRates,
+	// GetPositioning, GetFlow): "https://api.kdraigo.com/data" when empty, or
+	// a local data_provider's "http://localhost:8080/api/v1". Public data: no key.
+	DataURL   string
+	SessionID string // Optional fixed telemetry session id. Empty = a new UUID is generated; set to resume/extend an existing session.
 	// StrategyName is a human-readable label for the run, the live counterpart
 	// of BacktestOptions.SessionName. Published once at Start; without it the
 	// console can only identify a session by its UUID.

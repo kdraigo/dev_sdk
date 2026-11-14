@@ -119,6 +119,41 @@ bot.SetOnCandleFor(types.Timeframe1h, func(ctx *types.Context, c *types.Candle) 
 
 `Kind` picks lines, step lines, histograms, areas, bands (`AddBand`) or markers (`Mark`). The strategy's style is the default; viewers can hide or restyle each plot on the chart. Plotting never fails a run: NaN values are skipped, and a plot that could not be declared is a nil series that ignores every call. Live, values are sent every 2 s in one request and kept through an outage. See `get_sdk_docs` section `plots` in [kdraigo_mcp](https://github.com/kdraigo/kdraigo_mcp) for every option and limit.
 
+### Market data: funding, positioning and trade flow
+
+Beside its prices, a strategy can read three more series (v1.11.0+). Data with a value on every bar rides on the candle; ask for it in `MarketData`:
+
+```go
+cfg.MarketData = []types.MarketData{types.MarketDataPositioning, types.MarketDataFlow}
+
+bot.SetOnCandleFor(types.Timeframe1h, func(ctx *types.Context, c *types.Candle) {
+	if p := c.Positioning; p != nil { // perpetuals only
+		// p.OpenInterest, p.LongShortRatio, p.TopPositionRatio, p.TakerBuySellRatio;
+		// p.Time = the end of the 5-minute period the values are from
+	}
+	if f := c.Flow; f != nil { // what executed in this bar, by taker side
+		// f.BuyVolume, f.SellVolume, f.Delta, f.VWAP, f.LargePrints100k, f.Complete
+	}
+})
+```
+
+Lookbacks, and funding (three settlements a day), are calls:
+
+```go
+week := bot.Now().Add(-7 * 24 * time.Hour)
+rates, _ := bot.GetFundingRates(ctx.Ctx, "binance_futures", "BTC/USDT", week, bot.Now())
+oi, _ := bot.GetPositioning(ctx.Ctx, "binance_futures", "BTC/USDT", types.Timeframe1h, week, bot.Now())
+flow, _ := bot.GetFlow(ctx.Ctx, "binance", "BTC/USDT", types.Timeframe1h, week, bot.Now())
+```
+
+The rule is the one `GetCandles` follows: nothing a live bot could not have known. In a backtest a `to` after `bot.Now()` is an error. A 5-minute positioning period is published 90 s after it ends, so a candle closing at 12:00 carries the period that ended at 11:55, and a bar ending at `to` is not returned yet. A candle's flow is its own bar.
+
+- `nil` means none for that bar: spot has no positioning, and trade flow starts 2025-03-01. Positioning goes back to 2020-09, funding to 2024-01.
+- A value a venue does not publish is `0`. Bybit has no top-trader or taker ratios and no open interest in quote; a real ratio is never 0.
+- Live, the SDK reads the same series from the platform's data API (`LiveOptions.DataURL`, default `https://api.kdraigo.com/data`) as each candle closes, so a strategy sees the same numbers it saw in its backtest. A candle waits a few seconds for its flow bar.
+
+See `examples/market_data` for a run that prints each coin's 7-day funding and its open interest every day.
+
 ## Architecture
 
 The SDK is a pipeline, which keeps state deterministic:

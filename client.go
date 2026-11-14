@@ -82,6 +82,11 @@ type SDK struct {
 	// tick loop reads it so it never steps the engine past a callback that
 	// has not returned.
 	handlingSince atomic.Int64
+
+	// liveDataReader serves market data to a live run from the platform's
+	// data API (marketdata.go). Made on first use.
+	liveDataOnce   sync.Once
+	liveDataReader *liveData
 }
 
 // Backtest tick loop timing; variables so tests can shorten them.
@@ -345,6 +350,9 @@ func (s *SDK) Start(ctx context.Context) error {
 	if len(s.config.Timeframes) == 0 {
 		return fmt.Errorf("config.Timeframes must contain at least one timeframe")
 	}
+	if err := validateMarketData(s.config.MarketData); err != nil {
+		return err
+	}
 
 	if s.config.Backtest != nil {
 		// Round start time up to the next boundary of the largest requested
@@ -501,9 +509,18 @@ func (s *SDK) Start(ctx context.Context) error {
 	} else {
 		// Live: candles and order updates arrive in real time, each on its
 		// own goroutine, so a slow callback on one never holds up the other.
+		// The configured market data is read from the platform's data API
+		// as each candle closes, before the strategy sees the candle.
+		var liveMD *liveData
+		if len(s.config.MarketData) > 0 {
+			liveMD = s.liveMarketData()
+		}
 		go func() {
 			for rawCandle := range s.rawCandleChan {
 				s.handlingSince.Store(time.Now().UnixNano())
+				if liveMD != nil {
+					liveMD.enrich(cctx, rawCandle)
+				}
 				processCandle(rawCandle)
 			}
 			close(syncChan)

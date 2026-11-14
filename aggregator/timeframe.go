@@ -15,6 +15,10 @@ type TimeframeAggregator struct {
 
 	mu      sync.Mutex
 	current *types.Candle
+
+	// flowGap records that a raw candle of the current bar came without trade
+	// flow, so the bar's flow, summed from the others, is short.
+	flowGap bool
 }
 
 // NewTimeframeAggregator builds an aggregator for the given target timeframe.
@@ -57,6 +61,16 @@ func (ta *TimeframeAggregator) Process(raw *types.Candle) *types.Candle {
 	if ta.isBoundaryCrossed(raw) {
 		ta.current.IsComplete = true
 		ta.current.CloseTime = raw.CloseTime
+		if f := ta.current.Flow; f != nil {
+			f.Delta = f.BuyVolume - f.SellVolume
+			f.VWAP = 0
+			if v := f.BuyVolume + f.SellVolume; v > 0 {
+				f.VWAP = (f.BuyQuote + f.SellQuote) / v
+			}
+			if ta.flowGap {
+				f.Complete = false
+			}
+		}
 
 		// Return a copy; reset for the next period.
 		completedCandle := *ta.current
@@ -84,6 +98,8 @@ func (ta *TimeframeAggregator) aggregate(raw *types.Candle) {
 			TakerBuyBaseVolume:  raw.TakerBuyBaseVolume,
 			TakerBuyQuoteVolume: raw.TakerBuyQuoteVolume,
 		}
+		ta.flowGap = false
+		ta.foldMarketData(raw)
 		return
 	}
 
@@ -100,6 +116,44 @@ func (ta *TimeframeAggregator) aggregate(raw *types.Candle) {
 	ta.current.QuoteVolume += raw.QuoteVolume
 	ta.current.TakerBuyBaseVolume += raw.TakerBuyBaseVolume
 	ta.current.TakerBuyQuoteVolume += raw.TakerBuyQuoteVolume
+	ta.foldMarketData(raw)
+}
+
+// foldMarketData folds a raw candle's market data into the current bar.
+// Positioning is a snapshot: the bar keeps the newest. Flow is extensive like
+// volume: it sums, the largest print is the largest of any minute, and the bar
+// is complete only when every raw candle brought whole flow.
+func (ta *TimeframeAggregator) foldMarketData(raw *types.Candle) {
+	if raw.Positioning != nil {
+		p := *raw.Positioning
+		ta.current.Positioning = &p
+	}
+	if raw.Flow == nil {
+		ta.flowGap = true
+		return
+	}
+	if ta.current.Flow == nil {
+		f := *raw.Flow
+		f.OpenTime = ta.current.OpenTime
+		ta.current.Flow = &f
+		return
+	}
+	f, r := ta.current.Flow, raw.Flow
+	f.BuyVolume += r.BuyVolume
+	f.SellVolume += r.SellVolume
+	f.BuyQuote += r.BuyQuote
+	f.SellQuote += r.SellQuote
+	f.BuyTrades += r.BuyTrades
+	f.SellTrades += r.SellTrades
+	if r.MaxPrintQuote > f.MaxPrintQuote {
+		f.MaxPrintQuote = r.MaxPrintQuote
+	}
+	f.LargePrints10k += r.LargePrints10k
+	f.LargeQuote10k += r.LargeQuote10k
+	f.LargePrints100k += r.LargePrints100k
+	f.LargeQuote100k += r.LargeQuote100k
+	f.Minutes += r.Minutes
+	f.Complete = f.Complete && r.Complete
 }
 
 // isBoundaryCrossed reports whether the raw candle completes the current bucket:

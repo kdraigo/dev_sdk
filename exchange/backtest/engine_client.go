@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/kdraigo/dev_sdk/internal/marketdata"
 	"github.com/kdraigo/dev_sdk/plots"
 	"github.com/kdraigo/dev_sdk/signing"
 	"github.com/kdraigo/dev_sdk/types"
@@ -421,7 +422,7 @@ type startSessionRequestWallet struct {
 type newSessionRequestPayload struct {
 	Streams        []startSessionRequestStream `json:"streams"`
 	InitialWallets []startSessionRequestWallet `json:"initial_wallets"`
-	Simulation     *types.SimulationOptions    `json:"simulation,omitempty"`
+	Simulation     *simulationPayload          `json:"simulation,omitempty"`
 	// Name is BacktestOptions.SessionName: the name the session list shows
 	// until someone renames it. An older engine ignores it.
 	Name string `json:"name,omitempty"`
@@ -591,7 +592,7 @@ func (e *EngineClient) PrepareSession(ctx context.Context, cfg *types.Config) er
 	payload := newSessionRequestPayload{
 		Streams:        streams,
 		InitialWallets: wallets,
-		Simulation:     withStress(cfg.Backtest.Simulation),
+		Simulation:     simulationFor(withStress(cfg.Backtest.Simulation), cfg.MarketData),
 		Name:           cfg.Backtest.SessionName,
 	}
 	body, _ := json.Marshal(payload)
@@ -1113,6 +1114,10 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 				Seq    uint64      `json:"seq"`
 				Done   bool        `json:"done"`
 				Orders []orderWire `json:"orders"`
+
+				// The candle's market data, when Config.MarketData asked for it.
+				Positioning *marketdata.PositioningWire `json:"positioning"`
+				Flow        *marketdata.FlowWire        `json:"flow"`
 			}
 			json.Unmarshal(resp.Data, &dataStruct)
 
@@ -1143,6 +1148,12 @@ func (e *EngineClient) readLoop(conn *websocket.Conn, candleChan chan<- *types.C
 					QuoteVolume:         dataStruct.Tick.Candle.QuoteVolume,
 					TakerBuyBaseVolume:  dataStruct.Tick.Candle.TakerBuyBaseVolume,
 					TakerBuyQuoteVolume: dataStruct.Tick.Candle.TakerBuyQuoteVolume,
+				}
+				if p := dataStruct.Positioning; p != nil {
+					candle.Positioning = p.Positioning(time.Time{})
+				}
+				if f := dataStruct.Flow; f != nil {
+					candle.Flow = f.Flow()
 				}
 				e.lastClose.Store(candle.Exchange+"|"+candle.Symbol, candle.Close)
 			}
@@ -1548,6 +1559,12 @@ type rawResponse struct {
 // The shape mirrors PlaceOrder — register a channel, write, wait with the same
 // fail-safe timeout — but without a typed pending map per action.
 func (e *EngineClient) call(ctx context.Context, action string, data map[string]interface{}) (json.RawMessage, error) {
+	return e.callWithin(ctx, action, data, 10*time.Second)
+}
+
+// callWithin is call with its own fail-safe timeout, for reads that may carry
+// a long window.
+func (e *EngineClient) callWithin(ctx context.Context, action string, data map[string]interface{}, timeout time.Duration) (json.RawMessage, error) {
 	if e.conn() == nil {
 		return nil, fmt.Errorf("websocket not connected")
 	}
@@ -1582,7 +1599,7 @@ func (e *EngineClient) call(ctx context.Context, action string, data map[string]
 	case <-ctx.Done():
 		forget()
 		return nil, ctx.Err()
-	case <-time.After(10 * time.Second):
+	case <-time.After(timeout):
 		forget()
 		return nil, fmt.Errorf("timeout waiting for %s response", action)
 	}
