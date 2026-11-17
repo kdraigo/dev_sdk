@@ -7,7 +7,8 @@ Full documentation: **<https://kdraigo.com/docs>**
 ## Core Features
 
 - **Unified interface**: write your logic once with candle and order-update callbacks.
-- **Environment agnostic**: switch between `backtest`, `real_binance`, `real_binance_futures`, `real_bybit` and their testnets without changing strategy code.
+- **Environment agnostic**: switch between `backtest`, `real_binance`, `real_binance_futures`, `real_bybit`, `real_bybit_futures` and their testnets without changing strategy code.
+- **Perpetuals on Binance and Bybit** (`real_binance_futures`, `real_bybit_futures`): isolated margin, one-way positions, USDT-margined, as the backtest engine models them. Both need `LiveOptions.MaxOrderNotional` and `MaxLeverage`, and on mainnet `Armed` plus `KDRAIGO_LIVE_ARMED=1`. On Bybit the account must be a Unified Trading Account set to Isolated Margin (account-wide on Bybit, so the SDK refuses rather than switching it; a sub-account kept for the strategy is the clean way) and the API key an HMAC (system-generated) one with Contract trading permission.
 - **Timeframe aggregation**: the stream is aggregated into each timeframe you request (e.g. 15m and 1h at once).
 - **Indicators**: ~95 TA-Lib indicators through a timeframe-scoped indicator manager.
 - **Multi-exchange backtesting**: synchronized backtests across several exchanges and pairs in one session.

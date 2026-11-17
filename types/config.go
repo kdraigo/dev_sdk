@@ -22,6 +22,12 @@ const (
 	// spot account holding real funds and a futures one.
 	EnvRealBinanceFutures Environment = "real_binance_futures"
 	EnvTestBinanceFutures Environment = "test_binance_futures"
+
+	// Bybit USDT perpetuals (V5 "linear"), for the same reasons as Binance's:
+	// a different API category, a different wallet view and the platform's
+	// "bybit_futures" identifier.
+	EnvRealBybitFutures Environment = "real_bybit_futures"
+	EnvTestBybitFutures Environment = "test_bybit_futures"
 )
 
 // ExchangeBinanceFutures is the platform-wide identifier for Binance
@@ -29,6 +35,10 @@ const (
 // backtester keys contract specs by, so a backtest and a live run name the
 // venue identically.
 const ExchangeBinanceFutures = "binance_futures"
+
+// ExchangeBybitFutures is the platform-wide identifier for Bybit USDT
+// perpetuals, the string data_provider collects under.
+const ExchangeBybitFutures = "bybit_futures"
 
 // Timeframe dictates the period of time each candle covers.
 type Timeframe string

@@ -43,6 +43,7 @@ func MainnetEnvironments() []types.Environment {
 		types.EnvRealBinance,
 		types.EnvRealBybit,
 		types.EnvRealBinanceFutures,
+		types.EnvRealBybitFutures,
 	}
 }
 
@@ -56,9 +57,21 @@ func IsMainnet(env types.Environment) bool {
 	return false
 }
 
-// IsFutures reports whether the environment is a perpetual-futures one.
+// IsFutures reports whether the environment is a perpetual-futures one, on any
+// venue. The caps and the arming gates apply to all of them; an adapter checks
+// its own venue with IsBinanceFutures or IsBybitFutures.
 func IsFutures(env types.Environment) bool {
+	return IsBinanceFutures(env) || IsBybitFutures(env)
+}
+
+// IsBinanceFutures reports whether the environment is Binance USDⓈ-M perpetuals.
+func IsBinanceFutures(env types.Environment) bool {
 	return env == types.EnvRealBinanceFutures || env == types.EnvTestBinanceFutures
+}
+
+// IsBybitFutures reports whether the environment is Bybit USDT perpetuals.
+func IsBybitFutures(env types.Environment) bool {
+	return env == types.EnvRealBybitFutures || env == types.EnvTestBybitFutures
 }
 
 // ErrNotArmed is returned when a gate refuses an order. Callers can test for it

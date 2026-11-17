@@ -129,7 +129,7 @@ func (b *BinanceFuturesClient) PrepareSession(ctx context.Context, cfg *types.Co
 	// futures environments here, but the adapter is exported and a direct
 	// caller must not be able to slip past the gates by naming a value the
 	// guard treats as out of scope.
-	if !IsFutures(cfg.Environment) {
+	if !IsBinanceFutures(cfg.Environment) {
 		return fmt.Errorf("binance futures adapter cannot run environment %q; use %s or %s",
 			cfg.Environment, types.EnvTestBinanceFutures, types.EnvRealBinanceFutures)
 	}

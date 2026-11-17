@@ -125,6 +125,9 @@ func New(cfg *types.Config) (*SDK, error) {
 	case types.EnvRealBinanceFutures, types.EnvTestBinanceFutures:
 		adapter = live.NewBinanceFuturesClient(cfg)
 		clock = wallClock{}
+	case types.EnvRealBybitFutures, types.EnvTestBybitFutures:
+		adapter = live.NewBybitFuturesClient(cfg)
+		clock = wallClock{}
 	default:
 		return nil, fmt.Errorf("unsupported environment: %s", cfg.Environment)
 	}
