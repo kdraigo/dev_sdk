@@ -155,6 +155,14 @@ The rule is the one `GetCandles` follows: nothing a live bot could not have know
 
 See `examples/market_data` for a run that prints each coin's 7-day funding and its open interest every day.
 
+### Checking and placing one order (orderplan, orderexec)
+
+For code that places a single order outside a strategy, such as kdraigo-mcp's executor for orders from the user's AI:
+
+- `orderplan.Build(plan, market, account, limits)` sizes a plan (entry, stop, target, at market or with a limit) from the user's own limits and checks it: shape, entry gap, the stop before the estimated isolated liquidation, margin, open positions, daily loss. `Hash` binds a confirmation to the exact order; `Recheck` runs again at placing.
+- `orderexec.Snapshot(ctx, venue, exchange, symbol, now)` reads what the checker takes: the contract's rules and mark price (`Contract` on both futures adapters, for any symbol), the free margin, open positions and today's realized P&L.
+- `orderexec.Open(ctx, venue, ticket, opts)` places a passed ticket. At market: the leverage, the entry, a wait for the fill, then the stop and target for what filled. If they cannot be placed, the position is closed at market; if that fails too, the error carries `ErrUnprotected`. With a limit: Bybit only, with the stop and target attached to the order (`PlaceProtectedLimit`), so they exist at the fill even if the process is gone. The venue must be prepared (`PrepareSession`) with the symbol among its assets and caps that cover the order.
+
 ## Architecture
 
 The SDK is a pipeline, which keeps state deterministic:

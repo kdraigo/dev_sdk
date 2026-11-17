@@ -298,6 +298,12 @@ func (b *BybitFuturesClient) PlaceOrder(ctx context.Context, req *types.OrderReq
 // place is the single path every order takes, bracket legs included, so the
 // rounding and the gates cannot be bypassed by adding another entry point.
 func (b *BybitFuturesClient) place(ctx context.Context, req *types.OrderRequest, intent *OrderIntent, groupID string) (*types.Order, error) {
+	return b.placeWith(ctx, req, intent, groupID, nil)
+}
+
+// placeWith is place with extra V5 fields added to the create body after it
+// was rounded and checked (attached stop and target).
+func (b *BybitFuturesClient) placeWith(ctx context.Context, req *types.OrderRequest, intent *OrderIntent, groupID string, extra func(body map[string]any, f InstrumentFilter)) (*types.Order, error) {
 	sym := intent.Symbol
 	filter, known := b.filters[sym]
 	if !known {
@@ -321,6 +327,9 @@ func (b *BybitFuturesClient) place(ctx context.Context, req *types.OrderRequest,
 	body, linkID, err := bybitCreateBody(intent, filter, time.Now())
 	if err != nil {
 		return nil, err
+	}
+	if extra != nil {
+		extra(body, filter)
 	}
 
 	if b.guard.DryRun() {
