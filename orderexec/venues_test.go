@@ -1,11 +1,15 @@
 package orderexec
 
-import "github.com/kdraigo/dev_sdk/exchange/live"
+import (
+	"github.com/kdraigo/dev_sdk/exchange/live"
+	"github.com/kdraigo/dev_sdk/exchange/paper"
+)
 
-// Both futures adapters can place a ticket.
+// Both futures adapters can place a ticket, and so can paper.
 var (
 	_ Venue = (*live.BinanceFuturesClient)(nil)
 	_ Venue = (*live.BybitFuturesClient)(nil)
+	_ Venue = (*paper.Client)(nil)
 )
 
 // Bybit holds a limit entry's stop and target before the fill; Binance does

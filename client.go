@@ -17,6 +17,7 @@ import (
 	"github.com/kdraigo/dev_sdk/aggregator"
 	"github.com/kdraigo/dev_sdk/exchange/backtest"
 	"github.com/kdraigo/dev_sdk/exchange/live"
+	"github.com/kdraigo/dev_sdk/exchange/paper"
 	"github.com/kdraigo/dev_sdk/indicators"
 	"github.com/kdraigo/dev_sdk/plots"
 	"github.com/kdraigo/dev_sdk/telemetry"
@@ -128,12 +129,20 @@ func New(cfg *types.Config) (*SDK, error) {
 	case types.EnvRealBybitFutures, types.EnvTestBybitFutures:
 		adapter = live.NewBybitFuturesClient(cfg)
 		clock = wallClock{}
+	case types.EnvPaperBinance, types.EnvPaperBinanceFutures:
+		adapter = paper.NewClient(cfg)
+		clock = wallClock{}
 	default:
 		return nil, fmt.Errorf("unsupported environment: %s", cfg.Environment)
 	}
 
 	var pub telemetry.Publisher
-	if cfg.Live != nil && cfg.Live.TelemetryURL != "" {
+	if live.IsPaper(cfg.Environment) && cfg.Live != nil && cfg.Live.TelemetryURL != "" {
+		// The paper exchange records the run itself: telemetry from the bot
+		// would be a second, partial copy.
+		log.Printf("SDK: Live.TelemetryURL is not used on paper; the paper exchange records the run")
+	}
+	if cfg.Live != nil && cfg.Live.TelemetryURL != "" && !live.IsPaper(cfg.Environment) {
 		// Reuse a caller-supplied session id when set (resume/extend an existing
 		// session); otherwise mint a fresh one.
 		sessionID := cfg.Live.SessionID
@@ -566,6 +575,25 @@ func (s *SDK) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to connect stream: %w", err)
 	}
 
+	// An adapter whose account can end under it (the paper exchange: the
+	// account stopped from the website) ends the run with the reason, which
+	// Start returns.
+	if e, ok := s.adapter.(interface{ Ended() <-chan struct{} }); ok {
+		go func() {
+			select {
+			case <-e.Ended():
+				err := s.streamErr()
+				if err == nil {
+					err = errors.New("the stream ended")
+				}
+				log.Printf("DevSDK: %v", err)
+				s.finishWithError(err)
+				cancel()
+			case <-cctx.Done():
+			}
+		}()
+	}
+
 	// When the venue cannot push, the SDK reconstructs the same transitions by
 	// asking. The strategy sees one contract either way; only the latency
 	// declared above differs.
@@ -787,7 +815,7 @@ func (s *SDK) PlaceBracket(ctx context.Context, req *types.BracketRequest) ([]*t
 
 	req.Reason = s.cleanReason(req.Reason)
 	reason, logs := req.Reason, req.Logs
-	if s.config.Environment != types.EnvBacktest {
+	if !s.keepsAnnotations() {
 		req.Reason, req.Logs = nil, nil
 	}
 
@@ -810,6 +838,12 @@ func (s *SDK) PlaceBracket(ctx context.Context, req *types.BracketRequest) ([]*t
 	return orders, nil
 }
 
+// keepsAnnotations reports whether the adapter takes an order's Reason and
+// Logs: the backtest engine and the paper exchange do, an exchange never.
+func (s *SDK) keepsAnnotations() bool {
+	return s.config.Environment == types.EnvBacktest || live.IsPaper(s.config.Environment)
+}
+
 // cleanReason sends NaN and infinite numbers in an order's reason as null
 // (JSON has no NaN, and encoding one refused the whole order), warning once
 // per key so a strategy learns which value was not ready.
@@ -828,8 +862,9 @@ func (s *SDK) PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.O
 	reason, logs := req.Reason, req.Logs
 
 	// Strip telemetry fields for live adapters — exchanges never see Reason/Logs.
-	// In backtest mode the fields are forwarded to the engine so it can persist them.
-	if s.config.Environment != types.EnvBacktest {
+	// In backtest mode the fields are forwarded to the engine so it can persist
+	// them, and on paper to the paper exchange, which records the run.
+	if !s.keepsAnnotations() {
 		req.Reason, req.Logs = nil, nil
 	}
 

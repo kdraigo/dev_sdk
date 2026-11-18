@@ -190,6 +190,25 @@ func TestIsMainnetAndIsFutures(t *testing.T) {
 	assert.True(t, IsFutures(types.EnvRealBinanceFutures))
 	assert.True(t, IsFutures(types.EnvTestBinanceFutures))
 	assert.False(t, IsFutures(types.EnvRealBinance))
+
+	// Paper futures take the caps, never the arming gates.
+	assert.True(t, IsFutures(types.EnvPaperBinanceFutures))
+	assert.False(t, IsFutures(types.EnvPaperBinance))
+	assert.False(t, IsMainnet(types.EnvPaperBinanceFutures))
+	assert.True(t, IsPaper(types.EnvPaperBinance))
+	assert.True(t, IsPaper(types.EnvPaperBinanceFutures))
+	assert.False(t, IsPaper(types.EnvTestBinanceFutures))
+}
+
+func TestGuard_PaperFutures(t *testing.T) {
+	g := Guard{Env: types.EnvPaperBinanceFutures, Opts: &types.LiveOptions{MaxOrderNotional: 1000, MaxLeverage: 5},
+		Getenv: func(string) string { return "" }}
+	assert.NoError(t, g.CheckSession(), "not armed, no environment gate: paper holds no real funds")
+	err := g.CheckOrder(&OrderIntent{Type: IntentLimit, Symbol: "BTCUSDT", Quantity: 1, Price: 2000}, 0)
+	var na *ErrNotArmed
+	assert.ErrorAs(t, err, &na)
+	assert.Equal(t, "cap", na.Gate)
+	assert.Error(t, Guard{Env: types.EnvPaperBinanceFutures, Opts: &types.LiveOptions{MaxLeverage: 5}}.CheckSession(), "the caps are required")
 }
 
 func TestGuard_DryRun(t *testing.T) {

@@ -101,6 +101,39 @@ Live: &types.LiveOptions{
 },
 ```
 
+### Paper trading
+
+kdraigo's paper exchange fills orders against Binance's real order books and trades, with no exchange account and no real funds. A paper run is a live run: the wall clock, closed 1m bars as they happen, and the same `Live` options. A config moves from paper to testnet or mainnet by changing `Environment` alone (plus arming, for mainnet).
+
+```go
+cfg := &types.Config{
+	Environment: types.EnvPaperBinanceFutures, // or types.EnvPaperBinance (spot)
+	Timeframes:  []types.Timeframe{types.Timeframe15m},
+	Credentials: types.Credentials{KeyID: keyID, PrivateKey: privateKeyHex}, // a kdraigo API key
+	Live: &types.LiveOptions{
+		Assets:           []string{"BTCUSDT"},
+		StrategyName:     "my-strategy",
+		Leverage:         map[string]float64{"BTCUSDT": 3},
+		MaxLeverage:      5,     // the futures caps apply on paper too
+		MaxOrderNotional: 2_000, // the arming gates do not
+	},
+	Paper: &types.PaperOptions{
+		AccountID: os.Getenv("KDRAIGO_PAPER_ACCOUNT"), // empty: open a new account
+		Balances:  map[string]float64{"USDT": 10_000},
+	},
+}
+```
+
+- **The account lives on the platform.** The first run opens it and logs its id; set `Paper.AccountID` to carry on with it after a restart. Its markets, balances and fill model are fixed when it opens. Resting orders, and the take-profit and stop of a bracket, keep working while the bot is away. Stopping the account on kdraigo.com ends the run: `Start` returns the reason.
+- **Fills.** A market order walks the real book. A resting limit fills by default in turn behind the quantity ahead of it at its price (`FillModel: "queue"`); `"trade_through"` waits for the market to trade past the price, `"touch"` fills when it reaches it. `LatencyMs` delays each order on its way to the book.
+- **The venue's rules.** Orders are checked as Binance checks them, with its error codes and words (`*paper.Rejected`). Futures are isolated margin, one-way, liquidated on the mark price, and pay funding. Stops trigger on the mark price, as the exchange adapter sends them.
+- **Order updates are pushed.** After a reconnect, the bars and order changes missed while away are delivered once each, and `SetOnResume` fires (`ColdStart` is true when the run attached to an existing account at start).
+- **History** comes from the platform's data API (`Live.DataURL`), the venue's own bars.
+- `Reason` and `Logs` go with each order to the paper exchange. `Live.TelemetryURL` is not used: the paper exchange records the run itself.
+- `Paper.Endpoint` points at a local engine (`http://localhost:4004`). The paper adapter also implements `orderexec.Venue`, so code that places one order can place it on paper.
+
+See `examples/paper_basic`.
+
 ### Plotting your indicators
 
 A strategy can draw its own values on its chart, in backtests (v1.4.0+) and live (v1.5.0+, with `TelemetryURL` set). Declare each plot once, then add a value per bar:

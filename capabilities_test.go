@@ -8,6 +8,7 @@ import (
 
 	"github.com/kdraigo/dev_sdk/exchange/backtest"
 	"github.com/kdraigo/dev_sdk/exchange/live"
+	"github.com/kdraigo/dev_sdk/exchange/paper"
 	"github.com/kdraigo/dev_sdk/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,6 +31,50 @@ func TestEngineClientSatisfiesFuturesCapabilities(t *testing.T) {
 
 	_, isBracket := adapter.(BracketPlacer)
 	assert.True(t, isBracket, "and must keep implementing BracketPlacer")
+}
+
+// The paper adapter has every capability the SDK asks of an adapter by
+// assertion, so none silently degrades to ErrUnsupportedByAdapter.
+func TestPaperClientCapabilities(t *testing.T) {
+	var adapter interface{} = &paper.Client{}
+	_, ok := adapter.(Adapter)
+	assert.True(t, ok, "Adapter")
+	_, ok = adapter.(LeverageSetter)
+	assert.True(t, ok, "LeverageSetter")
+	_, ok = adapter.(PositionReader)
+	assert.True(t, ok, "PositionReader")
+	_, ok = adapter.(BracketPlacer)
+	assert.True(t, ok, "BracketPlacer")
+	_, ok = adapter.(OrderStateReader)
+	assert.True(t, ok, "OrderStateReader")
+	_, ok = adapter.(OrderFeedDescriber)
+	assert.True(t, ok, "OrderFeedDescriber")
+	_, ok = adapter.(interface {
+		SetOnResume(func(*types.SessionState))
+	})
+	assert.True(t, ok, "resumable")
+	feed := resolveOrderFeed(&paper.Client{})
+	assert.True(t, feed.Push, "the engine pushes")
+	assert.Zero(t, feed.PollEvery, "no poll beside the push: a reconnect resyncs")
+}
+
+// A paper environment gets the paper adapter on the wall clock, keeps an
+// order's Reason and Logs for the paper exchange, and sends no telemetry.
+func TestNewPaper(t *testing.T) {
+	for _, env := range []types.Environment{types.EnvPaperBinance, types.EnvPaperBinanceFutures} {
+		sdk, err := New(&types.Config{Environment: env, Timeframes: []types.Timeframe{types.Timeframe1m},
+			Live: &types.LiveOptions{Assets: []string{"BTCUSDT"}, TelemetryURL: "https://example.invalid/telemetry"}})
+		require.NoError(t, err)
+		_, isPaper := sdk.adapter.(*paper.Client)
+		assert.True(t, isPaper, env)
+		_, wall := sdk.clock.(wallClock)
+		assert.True(t, wall, env)
+		assert.False(t, sdk.publisher.Enabled(), "no telemetry on paper")
+		assert.True(t, sdk.keepsAnnotations(), env)
+	}
+	sdk, err := New(&types.Config{Environment: types.EnvTestBinanceFutures, Timeframes: []types.Timeframe{types.Timeframe1m}, Live: &types.LiveOptions{}})
+	require.NoError(t, err)
+	assert.False(t, sdk.keepsAnnotations(), "an exchange never sees them")
 }
 
 // spotOnlyAdapter implements Adapter and nothing else — the shape every live

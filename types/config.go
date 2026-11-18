@@ -28,6 +28,14 @@ const (
 	// "bybit_futures" identifier.
 	EnvRealBybitFutures Environment = "real_bybit_futures"
 	EnvTestBybitFutures Environment = "test_bybit_futures"
+
+	// kdraigo's paper exchange: real Binance order books and trades, fills
+	// simulated by the platform, no exchange account and no real funds. A
+	// paper run is a live run in every other way (wall clock, closed 1m bars
+	// as they happen), so a strategy moves from paper to testnet or mainnet by
+	// changing the environment alone. Config.Paper says which paper account.
+	EnvPaperBinance        Environment = "paper_binance"
+	EnvPaperBinanceFutures Environment = "paper_binance_futures"
 )
 
 // ExchangeBinanceFutures is the platform-wide identifier for Binance
@@ -81,6 +89,41 @@ type Config struct {
 	Credentials Credentials      // API Keys for specific real/testnet exchanges
 	Backtest    *BacktestOptions // Specific settings required when configuring a new backtest engine session.
 	Live        *LiveOptions     // Specific settings required when configuring a real exchange stream.
+
+	// Paper picks the paper account for the paper_* environments. A paper run
+	// also reads Live: its assets, exchanges, leverage and the futures caps,
+	// so the same config runs on paper and on an exchange.
+	Paper *PaperOptions
+}
+
+// PaperOptions are a paper run's account on kdraigo's paper exchange. The run
+// signs with Credentials.KeyID and PrivateKey (a kdraigo API key).
+type PaperOptions struct {
+	// Endpoint is the paper exchange: "https://api.kdraigo.com" when empty,
+	// or a local engine's "http://localhost:4004".
+	Endpoint string
+
+	// AccountID resumes an existing paper account, with its balances,
+	// positions and resting orders. Empty opens a new account: its id is
+	// logged at start, and setting it here is how a restarted bot carries on.
+	// The account keeps trading while the bot is away: resting orders and the
+	// stops attached to them fill on the platform.
+	AccountID string
+
+	// The fields below apply only when a new account is opened.
+
+	// Name labels the account; empty names it after its symbols.
+	Name string
+	// Balances are the starting funds per asset, fixed for the account's
+	// life. Empty: 10,000 USDT.
+	Balances map[string]float64
+	// FillModel is how resting limit orders fill: "queue" (the default: in
+	// turn behind the book's quantity at the price), "trade_through" (only
+	// when the market trades past the price) or "touch" (when it reaches it,
+	// the most optimistic).
+	FillModel string
+	// LatencyMs delays each order on its way to the book (0 to 5000).
+	LatencyMs int
 }
 
 // Credentials holds sensitive authentication data for exchange APIs and platform access.

@@ -60,8 +60,17 @@ func IsMainnet(env types.Environment) bool {
 // IsFutures reports whether the environment is a perpetual-futures one, on any
 // venue. The caps and the arming gates apply to all of them; an adapter checks
 // its own venue with IsBinanceFutures or IsBybitFutures.
+//
+// Paper futures count: the caps apply there too, so a config that runs on
+// paper runs on mainnet unchanged. The arming gates do not, since paper holds
+// no real funds (IsMainnet is false).
 func IsFutures(env types.Environment) bool {
-	return IsBinanceFutures(env) || IsBybitFutures(env)
+	return IsBinanceFutures(env) || IsBybitFutures(env) || env == types.EnvPaperBinanceFutures
+}
+
+// IsPaper reports whether the environment is kdraigo's paper exchange.
+func IsPaper(env types.Environment) bool {
+	return env == types.EnvPaperBinance || env == types.EnvPaperBinanceFutures
 }
 
 // IsBinanceFutures reports whether the environment is Binance USDⓈ-M perpetuals.
