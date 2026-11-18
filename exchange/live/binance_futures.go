@@ -697,6 +697,8 @@ func (b *BinanceFuturesClient) GetPositions(ctx context.Context, exchange string
 			IsolatedMargin: parseFloat(r.IsolatedMargin),
 			MarkPrice:      parseFloat(r.MarkPrice),
 			UnrealizedPnL:  parseFloat(r.UnRealizedProfit),
+			// The venue's estimate, read for an order checker; 0 when absent.
+			LiquidationPrice: parseFloat(r.LiquidationPrice),
 			// RealizedPnL and FundingPaid are not carried by positionRisk.
 			// They are per-position accumulations the venue does not track,
 			// and inventing them from income history would attribute payments

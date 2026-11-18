@@ -297,6 +297,9 @@ type bybitPositionRecord struct {
 	CumRealisedPnl string `json:"cumRealisedPnl"`
 	PositionIdx    int    `json:"positionIdx"`
 	PositionStatus string `json:"positionStatus"`
+	// StopLoss is the position's own stop (tpslMode Full), "" or "0" when
+	// none: a limit entry's attached stop becomes this at the fill.
+	StopLoss string `json:"stopLoss"`
 }
 
 type bybitList[T any] struct {

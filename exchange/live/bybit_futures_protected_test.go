@@ -60,3 +60,34 @@ func TestBybitProtectedLimit(t *testing.T) {
 	}
 	assert.Len(t, f.callsTo("/v5/order/create"), 1, "nothing more reached Bybit")
 }
+
+// The stop Bybit holds on a position: read from the position, moved with
+// trading-stop (Full mode, on the mark, at market), on the grid.
+func TestBybitPositionStop(t *testing.T) {
+	f := newFakeBybit(t)
+	f.routes["/v5/position/list"] = func(c fakeCall) fakeAnswer {
+		return ok(map[string]any{"list": []any{map[string]any{"symbol": "BTCUSDT", "side": "Buy", "size": "0.01", "avgPrice": "64000",
+			"liqPrice": "43000.5", "stopLoss": "63000", "positionIdx": 0}}})
+	}
+	f.routes["/v5/position/trading-stop"] = func(fakeCall) fakeAnswer { return ok(map[string]any{}) }
+	b := preparedBybit(t, f, bybitTestConfig(f))
+	ctx := context.Background()
+
+	stop, err := b.PositionStop(ctx, "BTC/USDT")
+	require.NoError(t, err)
+	assert.Equal(t, 63000.0, stop)
+	ps, err := b.GetPositions(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, ps, 1)
+	assert.Equal(t, 43000.5, ps[0].LiquidationPrice)
+
+	require.NoError(t, b.SetPositionStop(ctx, "BTC/USDT", 64000.04))
+	calls := f.callsTo("/v5/position/trading-stop")
+	require.Len(t, calls, 1)
+	assert.Equal(t, "64000.0", calls[0].Body["stopLoss"])
+	assert.Equal(t, "Full", calls[0].Body["tpslMode"])
+	assert.Equal(t, "MarkPrice", calls[0].Body["slTriggerBy"])
+	assert.Equal(t, "Market", calls[0].Body["slOrderType"])
+
+	assert.Error(t, b.SetPositionStop(ctx, "ETHUSDT", 3000), "not prepared")
+}

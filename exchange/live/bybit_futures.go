@@ -656,15 +656,16 @@ func mapBybitPosition(p bybitPositionRecord) *types.Position {
 		entry = parseFloat(p.EntryPrice)
 	}
 	return &types.Position{
-		Symbol:         p.Symbol,
-		Exchange:       types.ExchangeBybitFutures,
-		Side:           side,
-		Size:           size,
-		EntryPrice:     entry,
-		Leverage:       parseFloat(p.Leverage),
-		IsolatedMargin: parseFloat(p.PositionIM),
-		MarkPrice:      parseFloat(p.MarkPrice),
-		UnrealizedPnL:  parseFloat(p.UnrealisedPnl),
+		Symbol:           p.Symbol,
+		Exchange:         types.ExchangeBybitFutures,
+		Side:             side,
+		Size:             size,
+		EntryPrice:       entry,
+		Leverage:         parseFloat(p.Leverage),
+		IsolatedMargin:   parseFloat(p.PositionIM),
+		MarkPrice:        parseFloat(p.MarkPrice),
+		UnrealizedPnL:    parseFloat(p.UnrealisedPnl),
+		LiquidationPrice: parseFloat(p.LiqPrice),
 		// RealizedPnL and FundingPaid are left at zero, as on Binance: the
 		// venue's cumRealisedPnl spans the symbol's whole history, not this
 		// position's lifetime.

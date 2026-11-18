@@ -11,3 +11,6 @@ var (
 // Bybit holds a limit entry's stop and target before the fill; Binance does
 // not yet (it needs a testnet answer first).
 var _ ProtectedLimitPlacer = (*live.BybitFuturesClient)(nil)
+
+// Bybit holds a stop on the position itself; both have every read an action needs.
+var _ PositionStopper = (*live.BybitFuturesClient)(nil)

@@ -29,6 +29,7 @@ type Venue interface {
 	PlaceOrder(ctx context.Context, req *types.OrderRequest) (*types.Order, error)
 	CancelOrder(ctx context.Context, exchange, symbol, id string) error
 	GetOrder(ctx context.Context, exchange, symbol, id string) (*types.Order, error)
+	ListOpenOrders(ctx context.Context, exchange, symbol string) ([]*types.Order, error)
 	GetAccount(ctx context.Context, exchange, asset string) (*types.Account, error)
 	GetPositions(ctx context.Context, exchange string) ([]*types.Position, error)
 	SetLeverage(ctx context.Context, exchange, pair string, leverage float64) error
@@ -104,6 +105,12 @@ type Options struct {
 	Reason map[string]any
 }
 
+// The defaults of Options.
+const (
+	defaultFillWait = 10 * time.Second
+	defaultPoll     = 250 * time.Millisecond
+)
+
 // Result is what was done on the venue, whatever the outcome.
 type Result struct {
 	EntryID  string  `json:"entry_id,omitempty"`
@@ -158,10 +165,10 @@ func Open(ctx context.Context, v Venue, t orderplan.Ticket, o Options) (*Result,
 		return nil, errors.New("the ticket is incomplete: nothing placed")
 	}
 	if o.FillWait <= 0 {
-		o.FillWait = 10 * time.Second
+		o.FillWait = defaultFillWait
 	}
 	if o.Poll <= 0 {
-		o.Poll = 250 * time.Millisecond
+		o.Poll = defaultPoll
 	}
 	open, exit := types.OrderSideBuy, types.OrderSideSell
 	if t.Side == orderplan.Short {
@@ -220,6 +227,16 @@ func Open(ctx context.Context, v Venue, t orderplan.Ticket, o Options) (*Result,
 // waitFill reads the entry until it fills or FillWait passes; then the rest
 // is cancelled. It returns what filled.
 func waitFill(ctx context.Context, v Venue, t orderplan.Ticket, entry *types.Order, o Options) (float64, float64, error) {
+	return waitOrder(ctx, v, t.Venue, t.Symbol, t.Qty, "entry", entry, o)
+}
+
+// waitOrder reads a market order until it fills or FillWait passes; then the
+// rest is cancelled. It returns what filled; what names the order in errors.
+func waitOrder(ctx context.Context, v Venue, venue, symbol string, qty float64, what string, entry *types.Order, o Options) (float64, float64, error) {
+	t := struct {
+		Venue, Symbol string
+		Qty           float64
+	}{venue, symbol, qty}
 	cur := entry
 	deadline := time.Now().Add(o.FillWait)
 	for {
@@ -232,9 +249,9 @@ func waitFill(ctx context.Context, v Venue, t orderplan.Ticket, entry *types.Ord
 			return q, cur.AveragePrice, nil
 		case types.OrderStatusCanceled, types.OrderStatusRejected:
 			if cur.FilledQty > 0 {
-				return cur.FilledQty, cur.AveragePrice, fmt.Errorf("the entry was %s after %g of %g filled", strings.ToLower(string(cur.Status)), cur.FilledQty, t.Qty)
+				return cur.FilledQty, cur.AveragePrice, fmt.Errorf("the "+what+" was %s after %g of %g filled", strings.ToLower(string(cur.Status)), cur.FilledQty, t.Qty)
 			}
-			return 0, 0, fmt.Errorf("the entry was %s: nothing filled, no position opened", strings.ToLower(string(cur.Status)))
+			return 0, 0, fmt.Errorf("the "+what+" was %s: nothing filled"+noneOpened(what), strings.ToLower(string(cur.Status)))
 		}
 		if time.Now().After(deadline) {
 			_ = v.CancelOrder(ctx, t.Venue, t.Symbol, entry.ID)
@@ -246,15 +263,15 @@ func waitFill(ctx context.Context, v Venue, t orderplan.Ticket, entry *types.Ord
 				if q == 0 {
 					q = cur.Quantity
 				}
-				return q, cur.AveragePrice, fmt.Errorf("the entry filled %g of %g in %s; the rest was cancelled", q, t.Qty, o.FillWait)
+				return q, cur.AveragePrice, fmt.Errorf("the "+what+" filled %g of %g in %s; the rest was cancelled", q, t.Qty, o.FillWait)
 			}
-			return 0, 0, fmt.Errorf("the entry did not fill in %s and was cancelled: no position opened", o.FillWait)
+			return 0, 0, fmt.Errorf("the "+what+" did not fill in %s and was cancelled"+noneOpened(what), o.FillWait)
 		}
 		select {
 		case <-ctx.Done():
 			// Going away mid-fill: what filled must still be protected.
 			if last, err := v.GetOrder(context.WithoutCancel(ctx), t.Venue, t.Symbol, entry.ID); err == nil && last != nil && last.FilledQty > 0 {
-				return last.FilledQty, last.AveragePrice, fmt.Errorf("interrupted while the entry filled: %w", ctx.Err())
+				return last.FilledQty, last.AveragePrice, fmt.Errorf("interrupted while the "+what+" filled: %w", ctx.Err())
 			}
 			return 0, 0, ctx.Err()
 		case <-time.After(o.Poll):
@@ -322,4 +339,11 @@ func positionOn(ctx context.Context, v Venue, exchange, symbol string) (float64,
 func sameSymbol(a, b string) bool {
 	norm := func(s string) string { return strings.ToUpper(strings.ReplaceAll(s, "/", "")) }
 	return norm(a) == norm(b)
+}
+
+func noneOpened(what string) string {
+	if what == "entry" {
+		return ", no position opened"
+	}
+	return ""
 }

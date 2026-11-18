@@ -3,6 +3,7 @@ package live
 import (
 	"context"
 	"fmt"
+	"net/url"
 
 	"github.com/kdraigo/dev_sdk/types"
 )
@@ -42,4 +43,49 @@ func (b *BybitFuturesClient) PlaceProtectedLimit(ctx context.Context, req *types
 		body["tpOrderType"] = "Market"
 		body["slOrderType"] = "Market"
 	})
+}
+
+// PositionStop is the stop Bybit holds on the position itself (tpslMode
+// Full), as a limit entry's attached stop becomes at the fill; 0 when there
+// is none or no position.
+func (b *BybitFuturesClient) PositionStop(ctx context.Context, symbol string) (float64, error) {
+	b.ensureAPI()
+	sym := VenueSymbol(symbol)
+	var r bybitList[bybitPositionRecord]
+	if err := b.api.get(ctx, "/v5/position/list", url.Values{"category": {"linear"}, "symbol": {sym}}, true, &r); err != nil {
+		return 0, err
+	}
+	for _, p := range r.List {
+		if p.Symbol == sym && parseFloat(p.Size) > 0 {
+			return parseFloat(p.StopLoss), nil
+		}
+	}
+	return 0, nil
+}
+
+// SetPositionStop moves the position's own stop (tpslMode Full, on the mark,
+// closed at market). The stop is on the contract's grid and checked by the
+// caller; Bybit refuses one on the wrong side of the price.
+func (b *BybitFuturesClient) SetPositionStop(ctx context.Context, symbol string, stop float64) error {
+	b.ensureAPI()
+	sym := VenueSymbol(symbol)
+	f, ok := b.filters[sym]
+	if !ok {
+		return fmt.Errorf("bybit futures: %s was not prepared — add it to LiveOptions.Assets", sym)
+	}
+	if stop <= 0 {
+		return fmt.Errorf("bybit futures: a stop above 0 is needed")
+	}
+	if b.guard.DryRun() {
+		return nil
+	}
+	body := map[string]any{
+		"category": "linear", "symbol": sym, "positionIdx": 0, "tpslMode": "Full",
+		"stopLoss": f.FormatPrice(stop), "slTriggerBy": "MarkPrice", "slOrderType": "Market",
+	}
+	var res struct{}
+	if err := b.api.post(ctx, "/v5/position/trading-stop", body, &res); err != nil {
+		return fmt.Errorf("bybit futures %s trading-stop: %w", sym, explainBybitKeyError(err))
+	}
+	return nil
 }

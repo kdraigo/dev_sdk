@@ -219,6 +219,9 @@ type Position struct {
 
 	MarkPrice     float64
 	UnrealizedPnL float64
+
+	// LiquidationPrice is the venue's own estimate; 0 when it gives none.
+	LiquidationPrice float64
 }
 
 // Margin is a futures wallet's collateral in one asset and what its open

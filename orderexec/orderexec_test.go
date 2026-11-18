@@ -34,6 +34,19 @@ type venue struct {
 	entry types.Order
 	reads []types.Order
 	n     int
+
+	// open is what rests on the contract; a filled reduce-only market order
+	// flattens the position when flatOnClose is set.
+	open        []*types.Order
+	flatOnClose bool
+	cancelErr   map[string]error
+	stopErr     error
+}
+
+func (v *venue) ListOpenOrders(context.Context, string, string) ([]*types.Order, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]*types.Order(nil), v.open...), nil
 }
 
 func (v *venue) log(format string, a ...any) {
@@ -43,12 +56,24 @@ func (v *venue) log(format string, a ...any) {
 }
 
 func (v *venue) PlaceOrder(_ context.Context, r *types.OrderRequest) (*types.Order, error) {
+	if r.ReduceOnly && r.Type == types.OrderTypeStopLoss {
+		v.log("stop %s %g @ %g", r.Side, r.Quantity, r.StopPrice)
+		if v.stopErr != nil {
+			return nil, v.stopErr
+		}
+		return &types.Order{ID: "sl-new", Type: types.OrderTypeStopLoss, StopPrice: r.StopPrice, ReduceOnly: true}, nil
+	}
 	if r.ReduceOnly {
 		v.log("close %s %s %g reduce-only", r.Side, r.Type, r.Quantity)
 		if v.closeErr != nil {
 			return nil, v.closeErr
 		}
-		return &types.Order{ID: "close-1", Status: types.OrderStatusFilled}, nil
+		if v.flatOnClose {
+			v.mu.Lock()
+			v.positions = nil
+			v.mu.Unlock()
+		}
+		return &types.Order{ID: "close-1", Status: types.OrderStatusFilled, Quantity: r.Quantity, FilledQty: r.Quantity, AveragePrice: 65500}, nil
 	}
 	v.log("entry %s %s %g %s", r.Side, r.Type, r.Quantity, r.Symbol)
 	if v.entryErr != nil {
@@ -60,6 +85,9 @@ func (v *venue) PlaceOrder(_ context.Context, r *types.OrderRequest) (*types.Ord
 
 func (v *venue) CancelOrder(_ context.Context, _, _, id string) error {
 	v.log("cancel %s", id)
+	if err := v.cancelErr[id]; err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -80,6 +108,8 @@ func (v *venue) GetAccount(_ context.Context, exchange, asset string) (*types.Ac
 }
 
 func (v *venue) GetPositions(context.Context, string) ([]*types.Position, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	return v.positions, nil
 }
 
@@ -183,7 +213,7 @@ func TestOpen_NothingFilled(t *testing.T) {
 
 	v = &venue{entry: types.Order{ID: "e-1", Status: types.OrderStatusNew, Quantity: 0.01}}
 	_, err = Open(context.Background(), v, ticket(orderplan.Long), fast())
-	assert.ErrorContains(t, err, "did not fill in 30ms and was cancelled: no position opened")
+	assert.ErrorContains(t, err, "did not fill in 30ms and was cancelled, no position opened")
 	assert.Equal(t, []string{"leverage BTCUSDT 3", "entry BUY MARKET 0.01 BTCUSDT", "cancel e-1"}, v.calls)
 }
 
