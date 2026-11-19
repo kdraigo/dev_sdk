@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/kdraigo/dev_sdk/exchange/live"
+	"github.com/kdraigo/dev_sdk/plots"
+	"github.com/kdraigo/dev_sdk/telemetry"
 	"github.com/kdraigo/dev_sdk/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -480,4 +482,47 @@ func copyRow(r map[string]any) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+// Plots go over the account's connection; the paper exchange records them in
+// the account's live session. A refusal stops them, anything else is retried.
+func TestPlotsOverTheConnection(t *testing.T) {
+	m := newMockEngine(t, types.ExchangeBinanceFutures)
+	s := start(t, m, m.config(types.EnvPaperBinanceFutures))
+	ctx := context.Background()
+	b := &plots.Batch{Defs: []plots.Def{{Key: "avg", Title: "20-bar average"}},
+		Points: []plots.Point{{Key: "avg", Exchange: "binance_futures", Pair: "BTC/USDT", Time: 1000, Value: 60_000}}}
+
+	w, err := s.c.PublishPlots(ctx, b)
+	require.NoError(t, err)
+	assert.Empty(t, w)
+	m.mu.Lock()
+	last := m.requests[len(m.requests)-1]
+	m.mu.Unlock()
+	assert.Equal(t, "plots", last["action"])
+	assert.NotEmpty(t, last["data"].(map[string]any)["points"])
+
+	w, err = s.c.PublishPlots(ctx, &plots.Batch{})
+	require.NoError(t, err, "an empty batch is not sent")
+	assert.Empty(t, w)
+
+	m.mu.Lock()
+	m.plots = map[string]any{"status": "ok", "data": map[string]any{"warning": "1 value over the limit"}}
+	m.mu.Unlock()
+	w, err = s.c.PublishPlots(ctx, b)
+	require.NoError(t, err)
+	assert.Equal(t, "1 value over the limit", w)
+
+	m.mu.Lock()
+	m.plots = map[string]any{"status": "error", "code": "plots_rejected", "error": "plots_not_recorded"}
+	m.mu.Unlock()
+	_, err = s.c.PublishPlots(ctx, b)
+	assert.ErrorIs(t, err, telemetry.ErrPlotsRejected)
+
+	m.mu.Lock()
+	m.plots = map[string]any{"status": "error", "code": "plots_unavailable", "error": "live_trades answered 502"}
+	m.mu.Unlock()
+	_, err = s.c.PublishPlots(ctx, b)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, telemetry.ErrPlotsRejected, "worth a retry")
 }

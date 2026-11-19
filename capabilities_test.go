@@ -70,6 +70,7 @@ func TestNewPaper(t *testing.T) {
 		_, wall := sdk.clock.(wallClock)
 		assert.True(t, wall, env)
 		assert.False(t, sdk.publisher.Enabled(), "no telemetry on paper")
+		assert.True(t, sdk.plots.Active(), "plots go over the account's connection")
 		assert.True(t, sdk.keepsAnnotations(), env)
 	}
 	sdk, err := New(&types.Config{Environment: types.EnvTestBinanceFutures, Timeframes: []types.Timeframe{types.Timeframe1m}, Live: &types.LiveOptions{}})

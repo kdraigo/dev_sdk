@@ -138,8 +138,10 @@ func New(cfg *types.Config) (*SDK, error) {
 
 	var pub telemetry.Publisher
 	if live.IsPaper(cfg.Environment) && cfg.Live != nil && cfg.Live.TelemetryURL != "" {
-		// The paper exchange records the run itself: telemetry from the bot
-		// would be a second, partial copy.
+		// The paper exchange records the run itself (it is the account's live
+		// session): telemetry from the bot would be a second, partial copy.
+		// Plots, which only the strategy knows, go over the account's own
+		// connection instead.
 		log.Printf("SDK: Live.TelemetryURL is not used on paper; the paper exchange records the run")
 	}
 	if cfg.Live != nil && cfg.Live.TelemetryURL != "" && !live.IsPaper(cfg.Environment) {
@@ -183,6 +185,9 @@ func New(cfg *types.Config) (*SDK, error) {
 		pc.CarryPlots(s.plots)
 	} else if _, ok := pub.(telemetry.PlotPublisher); ok && pub.Enabled() {
 		// Live with telemetry: Start runs the loop that posts them.
+		s.plots.Activate()
+	} else if _, ok := adapter.(telemetry.PlotPublisher); ok && live.IsPaper(cfg.Environment) {
+		// Paper: over the account's connection, into its live session.
 		s.plots.Activate()
 	}
 	// Built here rather than in Start, so IndicatorManagerFor works on a fresh
@@ -654,6 +659,17 @@ func (s *SDK) Start(ctx context.Context) error {
 			}()
 			defer func() { <-plotsDone }()
 		}
+	}
+	// Paper: the plots are the only telemetry the bot sends; the paper
+	// exchange records the rest. The last few seconds of values can miss the
+	// connection's close at shutdown.
+	if pp, ok := s.adapter.(telemetry.PlotPublisher); ok && live.IsPaper(s.config.Environment) && s.plots.Active() {
+		plotsDone := make(chan struct{})
+		go func() {
+			defer close(plotsDone)
+			s.sendPlotsLoop(sdkCtx.Ctx, pp, defaultLivePlotTiming)
+		}()
+		defer func() { <-plotsDone }()
 	}
 
 	// 6. Start the deterministic ticking loop for backtesting

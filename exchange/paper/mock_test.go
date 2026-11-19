@@ -45,6 +45,7 @@ type mockEngine struct {
 	dropOn    string // drop the connection, unanswered, on the first request of this action
 	candles   []map[string]any
 	connected chan struct{}
+	plots     map[string]any // the answer to a plots action (default: stored)
 }
 
 func newMockEngine(t *testing.T, venue string) *mockEngine {
@@ -302,6 +303,11 @@ func (m *mockEngine) answerLocked(action string, d map[string]any) map[string]an
 		return ok(map[string]any{})
 	case "close":
 		return ok(map[string]any{"detached": true})
+	case "plots":
+		if m.plots != nil {
+			return m.plots
+		}
+		return ok(map[string]any{"warning": ""})
 	}
 	return map[string]any{"status": "error", "code": "unknown_action", "error": "unknown action " + action}
 }

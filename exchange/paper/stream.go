@@ -138,6 +138,9 @@ func (c *Client) dial(ctx context.Context) (*websocket.Conn, error) {
 				Error string `json:"error"`
 			}
 			_ = json.Unmarshal(body, &e)
+			if e.Error == "" {
+				e.Error = http.StatusText(resp.StatusCode) // the gateway's answer while the engine restarts
+			}
 			msg := fmt.Errorf("paper: the paper exchange refused the connection: %s (status %d)", e.Error, resp.StatusCode)
 			switch resp.StatusCode {
 			case http.StatusNotFound, http.StatusForbidden, http.StatusConflict:
@@ -287,8 +290,10 @@ func (c *Client) run(ctx context.Context, conn *websocket.Conn, candleChan chan<
 			var st struct {
 				State string `json:"state"`
 			}
-			if json.Unmarshal(e.Data, &st) == nil && st.State != "" && st.State != "LIVE" {
-				log.Printf("Paper: %s market feed is %s", e.Market, st.State)
+			// The engine names states as the feed's protobuf does
+			// (STATE_LIVE, STATE_GAP, STATE_RECONNECTING).
+			if json.Unmarshal(e.Data, &st) == nil && st.State != "" && st.State != "LIVE" && st.State != "STATE_LIVE" {
+				log.Printf("Paper: %s market feed is %s", e.Market, strings.ToLower(strings.TrimPrefix(st.State, "STATE_")))
 			}
 		}
 	}
