@@ -41,6 +41,7 @@ type venue struct {
 	flatOnClose bool
 	cancelErr   map[string]error
 	stopErr     error
+	targetErr   error
 }
 
 func (v *venue) ListOpenOrders(context.Context, string, string) ([]*types.Order, error) {
@@ -62,6 +63,13 @@ func (v *venue) PlaceOrder(_ context.Context, r *types.OrderRequest) (*types.Ord
 			return nil, v.stopErr
 		}
 		return &types.Order{ID: "sl-new", Type: types.OrderTypeStopLoss, StopPrice: r.StopPrice, ReduceOnly: true}, nil
+	}
+	if r.ReduceOnly && r.Type == types.OrderTypeTakeProfitLimit {
+		v.log("target %s %g @ %g", r.Side, r.Quantity, r.Price)
+		if v.targetErr != nil {
+			return nil, v.targetErr
+		}
+		return &types.Order{ID: "tp-new", Type: types.OrderTypeTakeProfitLimit, Price: r.Price, ReduceOnly: true}, nil
 	}
 	if r.ReduceOnly {
 		v.log("close %s %s %g reduce-only", r.Side, r.Type, r.Quantity)

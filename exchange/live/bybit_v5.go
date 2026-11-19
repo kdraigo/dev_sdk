@@ -300,6 +300,8 @@ type bybitPositionRecord struct {
 	// StopLoss is the position's own stop (tpslMode Full), "" or "0" when
 	// none: a limit entry's attached stop becomes this at the fill.
 	StopLoss string `json:"stopLoss"`
+	// TakeProfit is the position's own target, the same way.
+	TakeProfit string `json:"takeProfit"`
 }
 
 type bybitList[T any] struct {

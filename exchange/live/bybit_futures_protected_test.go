@@ -91,3 +91,33 @@ func TestBybitPositionStop(t *testing.T) {
 
 	assert.Error(t, b.SetPositionStop(ctx, "ETHUSDT", 3000), "not prepared")
 }
+
+// The target Bybit holds on a position: read from the position, moved with
+// trading-stop (Full mode, on the mark, at market), on the grid, the stop
+// left as it is.
+func TestBybitPositionTarget(t *testing.T) {
+	f := newFakeBybit(t)
+	f.routes["/v5/position/list"] = func(c fakeCall) fakeAnswer {
+		return ok(map[string]any{"list": []any{map[string]any{"symbol": "BTCUSDT", "side": "Buy", "size": "0.01", "avgPrice": "64000",
+			"liqPrice": "43000.5", "stopLoss": "63000", "takeProfit": "67000", "positionIdx": 0}}})
+	}
+	f.routes["/v5/position/trading-stop"] = func(fakeCall) fakeAnswer { return ok(map[string]any{}) }
+	b := preparedBybit(t, f, bybitTestConfig(f))
+	ctx := context.Background()
+
+	target, err := b.PositionTarget(ctx, "BTC/USDT")
+	require.NoError(t, err)
+	assert.Equal(t, 67000.0, target)
+
+	require.NoError(t, b.SetPositionTarget(ctx, "BTC/USDT", 66500.04))
+	calls := f.callsTo("/v5/position/trading-stop")
+	require.Len(t, calls, 1)
+	assert.Equal(t, "66500.0", calls[0].Body["takeProfit"])
+	assert.Equal(t, "Full", calls[0].Body["tpslMode"])
+	assert.Equal(t, "MarkPrice", calls[0].Body["tpTriggerBy"])
+	assert.Equal(t, "Market", calls[0].Body["tpOrderType"])
+	assert.NotContains(t, calls[0].Body, "stopLoss", "the stop is left as it is")
+
+	assert.Error(t, b.SetPositionTarget(ctx, "ETHUSDT", 3000), "not prepared")
+	assert.Error(t, b.SetPositionTarget(ctx, "BTCUSDT", 0))
+}

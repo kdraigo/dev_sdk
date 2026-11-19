@@ -89,3 +89,49 @@ func (b *BybitFuturesClient) SetPositionStop(ctx context.Context, symbol string,
 	}
 	return nil
 }
+
+// PositionTarget is the target Bybit holds on the position itself (tpslMode
+// Full), as a limit entry's attached target becomes at the fill; 0 when there
+// is none or no position.
+func (b *BybitFuturesClient) PositionTarget(ctx context.Context, symbol string) (float64, error) {
+	b.ensureAPI()
+	sym := VenueSymbol(symbol)
+	var r bybitList[bybitPositionRecord]
+	if err := b.api.get(ctx, "/v5/position/list", url.Values{"category": {"linear"}, "symbol": {sym}}, true, &r); err != nil {
+		return 0, err
+	}
+	for _, p := range r.List {
+		if p.Symbol == sym && parseFloat(p.Size) > 0 {
+			return parseFloat(p.TakeProfit), nil
+		}
+	}
+	return 0, nil
+}
+
+// SetPositionTarget moves the position's own target (tpslMode Full, on the
+// mark, closed at market); its stop is left as it is. The target is on the
+// contract's grid and checked by the caller; Bybit refuses one on the wrong
+// side of the price.
+func (b *BybitFuturesClient) SetPositionTarget(ctx context.Context, symbol string, target float64) error {
+	b.ensureAPI()
+	sym := VenueSymbol(symbol)
+	f, ok := b.filters[sym]
+	if !ok {
+		return fmt.Errorf("bybit futures: %s was not prepared — add it to LiveOptions.Assets", sym)
+	}
+	if target <= 0 {
+		return fmt.Errorf("bybit futures: a target above 0 is needed")
+	}
+	if b.guard.DryRun() {
+		return nil
+	}
+	body := map[string]any{
+		"category": "linear", "symbol": sym, "positionIdx": 0, "tpslMode": "Full",
+		"takeProfit": f.FormatPrice(target), "tpTriggerBy": "MarkPrice", "tpOrderType": "Market",
+	}
+	var res struct{}
+	if err := b.api.post(ctx, "/v5/position/trading-stop", body, &res); err != nil {
+		return fmt.Errorf("bybit futures %s trading-stop: %w", sym, explainBybitKeyError(err))
+	}
+	return nil
+}

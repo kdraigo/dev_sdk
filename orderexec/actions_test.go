@@ -28,7 +28,7 @@ func TestHoldings(t *testing.T) {
 	v := holding()
 	h, resting, exits, err := Holdings(context.Background(), v, "bybit_futures", "BTC/USDT")
 	require.NoError(t, err)
-	assert.Equal(t, &orderplan.Held{Side: orderplan.Long, Qty: 0.01, Entry: 64000, Stop: 63000, Liquidation: 43000}, h)
+	assert.Equal(t, &orderplan.Held{Side: orderplan.Long, Qty: 0.01, Entry: 64000, Stop: 63000, Target: 67000, Liquidation: 43000}, h)
 	assert.Equal(t, []orderplan.Resting{{ID: "e-2", Side: orderplan.Long, Qty: 0.015, Price: 62000}}, resting)
 	assert.Len(t, exits, 2)
 
@@ -146,5 +146,73 @@ type stopperVenue struct {
 func (s stopperVenue) PositionStop(context.Context, string) (float64, error) { return s.stop, nil }
 func (s stopperVenue) SetPositionStop(_ context.Context, symbol string, stop float64) error {
 	s.log("set position stop %s %g", symbol, stop)
+	return nil
+}
+
+func targetAction(h orderplan.Held, target float64) orderplan.Action {
+	return orderplan.BuildMoveTarget("bybit_futures", "BTCUSDT", h, target, actMarket, orderplan.Limits{MinStopGap: 0.002})
+}
+
+// The new target is placed before the old one goes: a failure leaves the old.
+func TestAct_MoveTarget(t *testing.T) {
+	held := orderplan.Held{Side: orderplan.Long, Qty: 0.01, Entry: 64000, Stop: 63000, Target: 67000}
+	v := holding()
+	res, err := Act(context.Background(), v, targetAction(held, 66000), fast())
+	require.NoError(t, err)
+	assert.Equal(t, "tp-new", res.OrderID)
+	assert.Equal(t, []string{"tp-1"}, res.Cancelled)
+	assert.Equal(t, []string{"target SELL 0.01 @ 66000", "cancel tp-1"}, v.calls, "new first, then the old")
+
+	v = holding()
+	v.targetErr = errors.New("price out of range")
+	_, err = Act(context.Background(), v, targetAction(held, 66000), fast())
+	assert.ErrorContains(t, err, "the new target could not be placed (price out of range): the old target stays")
+	assert.Equal(t, []string{"target SELL 0.01 @ 66000"}, v.calls)
+
+	v = holding()
+	v.cancelErr = map[string]error{"tp-1": errors.New("timeout")}
+	res, err = Act(context.Background(), v, targetAction(held, 66000), fast())
+	require.NoError(t, err)
+	assert.Contains(t, res.Notes[0], "two targets rest, and the nearer fills first")
+
+	// No target at all: one is placed for the whole position.
+	v = holding()
+	v.open = v.open[1:] // the stop and the resting entry only
+	res, err = Act(context.Background(), v, targetAction(orderplan.Held{Side: orderplan.Long, Qty: 0.01, Entry: 64000, Stop: 63000}, 66000), fast())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"target SELL 0.01 @ 66000"}, v.calls)
+	assert.Contains(t, res.Notes, "the position had no target: one was placed")
+
+	// A target held on the position (Bybit Full mode) is moved in place.
+	v = holding()
+	v.open = nil
+	tv := targeterVenue{venue: v, target: 67000}
+	res, err = Act(context.Background(), tv, targetAction(held, 66000), fast())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"set position target BTCUSDT 66000"}, v.calls)
+	assert.Contains(t, res.Notes[0], "moved the target the exchange holds on the position")
+
+	// A short's target goes below; flat, nothing is done.
+	v = holding()
+	v.positions = []*types.Position{{Symbol: "BTCUSDT", Side: "SHORT", Size: 0.02, EntryPrice: 66000}}
+	v.open = nil
+	_, err = Act(context.Background(), v, targetAction(orderplan.Held{Side: orderplan.Short, Qty: 0.02, Entry: 66000}, 63000), fast())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"target BUY 0.02 @ 63000"}, v.calls)
+	v = holding()
+	v.positions = nil
+	_, err = Act(context.Background(), v, targetAction(held, 66000), fast())
+	assert.ErrorContains(t, err, "no position is open on BTCUSDT any more: no target set")
+}
+
+// targeterVenue holds a target on the position (Bybit Full mode).
+type targeterVenue struct {
+	*venue
+	target float64
+}
+
+func (s targeterVenue) PositionTarget(context.Context, string) (float64, error) { return s.target, nil }
+func (s targeterVenue) SetPositionTarget(_ context.Context, symbol string, target float64) error {
+	s.log("set position target %s %g", symbol, target)
 	return nil
 }

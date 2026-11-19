@@ -9,9 +9,10 @@ import (
 )
 
 // Actions on what is already open: close a position, cancel a resting entry,
-// move a stop (the user's D5, for orders from their AI). Like a ticket, an
-// action is built from the venue's numbers now, checked, hashed, confirmed by
-// the user, and checked again before it is carried out.
+// move a stop, or set or move a target (the user's D5 for orders from their
+// AI; the target since 2026-11-19). Like a ticket, an action is built from
+// the venue's numbers now, checked, hashed, confirmed by the user, and checked
+// again before it is carried out.
 
 // ActionKind is what an action does.
 type ActionKind string
@@ -24,6 +25,8 @@ const (
 	ActCancel ActionKind = "cancel"
 	// ActMoveStop moves an open position's stop.
 	ActMoveStop ActionKind = "move_stop"
+	// ActMoveTarget sets an open position's target, or moves the one it has.
+	ActMoveTarget ActionKind = "move_target"
 )
 
 // Held is an open position on a contract, as the venue reports it.
@@ -33,6 +36,8 @@ type Held struct {
 	Entry float64
 	// Stop is the resting stop's trigger now; 0 when none was found.
 	Stop float64
+	// Target is the resting target's price now; 0 when none was found.
+	Target float64
 	// Liquidation is the venue's estimate; 0 when unknown.
 	Liquidation float64
 }
@@ -61,7 +66,11 @@ type Action struct {
 	OldStop float64 `json:"old_stop,omitempty"`
 	// Stop is a move's new stop.
 	Stop float64 `json:"stop,omitempty"`
-	Mark float64 `json:"mark"`
+	// Target and OldTarget: a target move's new price, and the one the
+	// position has now (0 when it has none).
+	Target    float64 `json:"target,omitempty"`
+	OldTarget float64 `json:"old_target,omitempty"`
+	Mark      float64 `json:"mark"`
 	// PnL is, for a close, the position's P&L at the price now (before fees);
 	// for a move, what the position makes if the new stop fills.
 	PnL      float64 `json:"pnl"`
@@ -109,6 +118,39 @@ func BuildMoveStop(venue, symbol string, h Held, stop float64, m Market, l Limit
 	stopChecks(c, a, h, m, l)
 	a.PnL = pnl(h.Side, h.Entry, a.Stop, h.Qty)
 	return a.finish(c)
+}
+
+// BuildMoveTarget sets the position's target, or moves the one it has, to a
+// price on the contract's grid on the profit side of the price now, at least
+// the user's minimum gap from it (a target at the price is a close).
+func BuildMoveTarget(venue, symbol string, h Held, target float64, m Market, l Limits) Action {
+	a := newAction(ActMoveTarget, venue, symbol, m)
+	a.Side, a.Qty, a.Entry, a.OldStop, a.OldTarget = h.Side, h.Qty, h.Entry, h.Stop, h.Target
+	c := &checks{}
+	if !held(c, h, symbol) || !marketKnown(c, m) {
+		return a.finish(c)
+	}
+	a.Target = nearest(target, m.TickSize)
+	targetChecks(c, a, h, m, l)
+	if h.Target == 0 {
+		c.add("changed", true, fmt.Sprintf("the position has no target yet: one is set at %s", px(a.Target, m)))
+	} else {
+		c.add("changed", math.Abs(a.Target-h.Target) >= m.TickSize/2, fmt.Sprintf("the target moves (from %s to %s)", px(h.Target, m), px(a.Target, m)))
+	}
+	a.PnL = pnl(h.Side, h.Entry, a.Target, h.Qty)
+	return a.finish(c)
+}
+
+// targetChecks: a target on the wrong side of the price, or at it, takes no
+// profit: it fills at once.
+func targetChecks(c *checks, a Action, h Held, m Market, l Limits) {
+	if h.Side == Long {
+		c.add("side", a.Target > m.Mark, fmt.Sprintf("the target %s is above the price now, %s", px(a.Target, m), px(m.Mark, m)))
+	} else {
+		c.add("side", a.Target > 0 && a.Target < m.Mark, fmt.Sprintf("the target %s is below the price now, %s", px(a.Target, m), px(m.Mark, m)))
+	}
+	gap := math.Abs(a.Target-m.Mark) / m.Mark
+	c.add("gap", gap >= l.MinStopGap && gap > 0, fmt.Sprintf("the target is %.2f%% from the price now (at least %.2f%%)", 100*gap, 100*l.MinStopGap))
 }
 
 func newAction(kind ActionKind, venue, symbol string, m Market) Action {
@@ -164,10 +206,16 @@ func (a Action) finish(c *checks) Action {
 
 // ActionHash binds a confirmation to the exact action.
 func ActionHash(a Action) string {
-	s := strings.Join([]string{
+	parts := []string{
 		"a1", string(a.Kind), a.Venue, a.Symbol, string(a.Side), fmtStep(a.Qty, a.StepSize), a.OrderID,
 		fmtStep(a.Price, a.TickSize), fmtStep(a.Stop, a.TickSize), fmtStep(a.Mark, a.TickSize),
-	}, "|")
+	}
+	// A target move's price joins the hash; the other kinds hash as they
+	// always did, so an executor on an older SDK still matches.
+	if a.Kind == ActMoveTarget {
+		parts = append(parts, fmtStep(a.Target, a.TickSize))
+	}
+	s := strings.Join(parts, "|")
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
@@ -177,13 +225,15 @@ func ActionHash(a Action) string {
 func VerifyAction(a Action) []Check {
 	c := &checks{}
 	c.add("unchanged", a.Hash != "" && ActionHash(a) == a.Hash, "the hash matches the action")
-	c.add("action", (a.Kind == ActClose || a.Kind == ActCancel || a.Kind == ActMoveStop) && (a.Side == Long || a.Side == Short) && a.Qty > 0 &&
+	c.add("action", (a.Kind == ActClose || a.Kind == ActCancel || a.Kind == ActMoveStop || a.Kind == ActMoveTarget) && (a.Side == Long || a.Side == Short) && a.Qty > 0 &&
 		a.Venue != "" && a.Symbol != "" && a.Mark > 0, "a known action on a position or an order, with its side, size and the price now")
 	switch a.Kind {
 	case ActCancel:
 		c.add("order", a.OrderID != "" && a.Price > 0, "the order to cancel is named")
 	case ActMoveStop:
 		c.add("stop", a.Stop > 0 && (a.Side == Long && a.Stop < a.Mark || a.Side == Short && a.Stop > a.Mark), "the new stop is on the protective side of the price")
+	case ActMoveTarget:
+		c.add("target", a.Target > 0 && (a.Side == Long && a.Target > a.Mark || a.Side == Short && a.Target < a.Mark), "the target is on the profit side of the price")
 	}
 	c.add("checks", Passed(a.Checks), "every check passed when the action was built")
 	return c.list
@@ -214,6 +264,14 @@ func RecheckAction(a Action, h *Held, r *Resting, m Market, l Limits) []Check {
 		now := *h
 		now.Stop = 0 // the move is the one confirmed, whatever the stop is now
 		stopChecks(c, a, now, m, l)
+	case ActMoveTarget:
+		if !c.add("position", h != nil && h.Side == a.Side && h.Qty > 0, fmt.Sprintf("the %s position on %s is still open", a.Side, a.Symbol)) {
+			return c.list
+		}
+		if !marketKnown(c, m) {
+			return c.list
+		}
+		targetChecks(c, a, *h, m, l) // the move is the one confirmed, whatever the target is now
 	default:
 		c.add("action", false, "a known action")
 	}
