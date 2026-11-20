@@ -120,8 +120,11 @@ type Result struct {
 	TargetID string  `json:"target_id,omitempty"`
 	// Protected: the stop and target rest on the venue for the filled size.
 	Protected bool `json:"protected"`
-	// Flattened: protection failed and the position was closed at market.
+	// Flattened: protection failed and the position was closed at market,
+	// by order CloseID (a caller that reports orders reports it too: without
+	// it a live console keeps a position the venue no longer holds, bug #69).
 	Flattened bool     `json:"flattened"`
+	CloseID   string   `json:"close_id,omitempty"`
 	Notes     []string `json:"notes,omitempty"`
 }
 
@@ -318,6 +321,7 @@ func protect(ctx context.Context, v Venue, t orderplan.Ticket, exit types.OrderS
 			ErrUnprotected, res.Filled, t.Symbol, t.Venue, err, cerr)
 	}
 	res.Flattened = true
+	res.CloseID = closing.ID
 	res.Notes = append(res.Notes, "closed at market by order "+closing.ID)
 	return res, fmt.Errorf("the stop and target could not be placed (%v), so the position was closed at market", err)
 }

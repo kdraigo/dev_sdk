@@ -154,6 +154,13 @@ func (g Guard) CheckSession() error {
 // refPrice values a market order. A market order with no reference price is
 // refused rather than waved through: an order whose size cannot be checked is
 // exactly the one the cap exists for.
+//
+// A reduce-only order is not capped: it can only shrink a position (the venue
+// cuts it to the position's size), never add exposure, which is what the cap
+// limits. Capped, it refused a position's own exits: a long's take-profit or
+// a short's stop is valued above the entry, past a cap sized to the position
+// (wiki bug #69: the executor opened, could not place the take-profit, and
+// had to close at market). A close is never blocked for want of a price.
 func (g Guard) CheckOrder(intent *OrderIntent, refPrice float64) error {
 	if err := g.CheckSession(); err != nil {
 		return err
@@ -163,6 +170,9 @@ func (g Guard) CheckOrder(intent *OrderIntent, refPrice float64) error {
 	}
 	if intent == nil {
 		return fmt.Errorf("intent must not be nil")
+	}
+	if intent.ReduceOnly {
+		return nil
 	}
 
 	price := intent.Price

@@ -170,6 +170,27 @@ func TestGuard_TriggerPriceValuesAStop(t *testing.T) {
 	assert.Error(t, g.CheckOrder(intent, 0), "and it is still subject to the cap")
 }
 
+// TestGuard_ReduceOnlyIsNotCapped: a position's exits are reduce-only and can
+// only shrink it, so the notional cap does not apply to them. A long's
+// take-profit valued at its trigger above the entry used to fail a cap sized
+// to the position (bug #69). The session gates still apply, and an order that
+// can open a position is still capped.
+func TestGuard_ReduceOnlyIsNotCapped(t *testing.T) {
+	g := Guard{Env: types.EnvRealBinanceFutures, Opts: &types.LiveOptions{Assets: []string{"ADAUSDT"}, Armed: true, MaxOrderNotional: 30.39, MaxLeverage: 3}, Getenv: armedEnv}
+
+	tp := &OrderIntent{Type: IntentTakeProfitLimit, Symbol: "ADAUSDT", Side: types.OrderSideSell, Quantity: 210, Price: 0.1472, ReduceOnly: true}
+	assert.NoError(t, g.CheckOrder(tp, 0.1425), "210 at 0.1472 is 30.91, over the cap, but it only closes")
+
+	closeAll := &OrderIntent{Type: IntentMarket, Symbol: "ADAUSDT", Side: types.OrderSideSell, Quantity: 210, ReduceOnly: true}
+	assert.NoError(t, g.CheckOrder(closeAll, 0), "a close is not blocked for want of a price")
+
+	open := &OrderIntent{Type: IntentStopMarket, Symbol: "ADAUSDT", Side: types.OrderSideBuy, Quantity: 210, StopPrice: 0.1472}
+	assert.ErrorContains(t, g.CheckOrder(open, 0.1425), "exceeds MaxOrderNotional", "the same order able to open a position is capped")
+
+	unarmed := Guard{Env: types.EnvRealBinanceFutures, Opts: g.Opts, Getenv: emptyEnv}
+	assert.Error(t, unarmed.CheckOrder(tp, 0.1425), "an unarmed machine refuses even a reduce-only order")
+}
+
 // TestGuard_SpotIsUntouched: this work fixes the spot order mapping, it does
 // not add arming to spot. Requiring caps there would break every live spot
 // strategy running today.

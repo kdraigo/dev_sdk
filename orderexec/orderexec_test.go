@@ -232,6 +232,7 @@ func TestOpen_ProtectionFails(t *testing.T) {
 	assert.ErrorContains(t, err, "the stop and target could not be placed (stop leg: price would trigger immediately), so the position was closed at market")
 	assert.False(t, errors.Is(err, ErrUnprotected))
 	assert.True(t, res.Flattened)
+	assert.Equal(t, "close-1", res.CloseID, "the closing order, for a caller that reports orders")
 	assert.False(t, res.Protected)
 	assert.Equal(t, "close SELL MARKET 0.01 reduce-only", v.calls[len(v.calls)-1])
 
