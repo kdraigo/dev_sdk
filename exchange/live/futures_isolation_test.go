@@ -1,7 +1,10 @@
 package live
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -279,6 +282,43 @@ func TestFuturesPlaceOrderRefusesUnmappableRequests(t *testing.T) {
 			assert.True(t, strings.HasPrefix(err.Error(), "binance futures:"), err.Error())
 		})
 	}
+}
+
+// A market order with no mark stream running (the AI-orders executor follows
+// no market data) is valued at the mark read over REST, so the notional cap
+// holds and the order goes through it. It used to be refused at the cap gate
+// whenever the stream had given nothing (wiki bug #68).
+func TestFuturesMarketOrderValuedAtTheRESTMark(t *testing.T) {
+	var marks int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/fapi/v1/premiumIndex" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		marks++
+		_ = json.NewEncoder(w).Encode(map[string]any{"symbol": r.URL.Query().Get("symbol"), "markPrice": "0.141"})
+	}))
+	t.Cleanup(srv.Close)
+	client := func(maxNotional float64) *BinanceFuturesClient {
+		cfg := &types.Config{
+			Environment: types.EnvTestBinanceFutures,
+			Live:        &types.LiveOptions{Assets: []string{"ADAUSDT"}, MaxOrderNotional: maxNotional, MaxLeverage: 3, DryRun: true},
+		}
+		c := NewBinanceFuturesClient(cfg)
+		c.client = newFuturesClient(types.Credentials{APIKey: "k", APISecret: "s"})
+		c.client.BaseURL = srv.URL
+		return c
+	}
+	buy := &types.OrderRequest{Symbol: "ADAUSDT", Side: types.OrderSideBuy, Quantity: 212, Type: types.OrderTypeMarket}
+
+	o, err := client(31).PlaceOrder(t.Context(), buy)
+	require.NoError(t, err, "212 at the mark 0.141 is 29.89, under the 31 cap")
+	require.NotNil(t, o)
+	assert.Equal(t, 1, marks, "the mark read once over REST")
+
+	_, err = client(20).PlaceOrder(t.Context(), buy)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "order notional 29.89 exceeds MaxOrderNotional 20.00", "the cap is still enforced, at the REST mark")
 }
 
 // TestFuturesMarketOrderWithoutAMarkIsRefused: a market order is the one type

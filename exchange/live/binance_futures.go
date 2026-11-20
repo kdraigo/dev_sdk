@@ -335,10 +335,11 @@ func (b *BinanceFuturesClient) PlaceOrder(ctx context.Context, req *types.OrderR
 func (b *BinanceFuturesClient) place(ctx context.Context, req *types.OrderRequest, intent *OrderIntent, groupID string) (*types.Order, error) {
 	sym := intent.Symbol
 	filter := b.filters[sym]
-	if err := filter.Apply(intent, b.markFor(sym)); err != nil {
+	mark := b.refMark(ctx, sym)
+	if err := filter.Apply(intent, mark); err != nil {
 		return nil, fmt.Errorf("binance futures %s: %w", sym, err)
 	}
-	if err := b.guard.CheckOrder(intent, b.markFor(sym)); err != nil {
+	if err := b.guard.CheckOrder(intent, mark); err != nil {
 		return nil, err
 	}
 
@@ -1001,6 +1002,26 @@ func (b *BinanceFuturesClient) markFor(symbol string) float64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.marks[symbol]
+}
+
+// refMark is the mark the gates value an order at: the mark stream's, or,
+// when nothing follows the stream (the AI-orders executor places orders with
+// no market data running), the mark read over REST, as the Bybit adapter
+// does. It used to be the stream's alone, so the executor's first market
+// entry on Binance was refused at the cap gate: "cannot value a MARKET
+// order" (wiki bug #68). No answer leaves 0, and the gate refuses.
+func (b *BinanceFuturesClient) refMark(ctx context.Context, symbol string) float64 {
+	if m := b.markFor(symbol); m > 0 {
+		return m
+	}
+	if b.client == nil {
+		return 0
+	}
+	idx, err := b.client.NewPremiumIndexService().Symbol(symbol).Do(ctx)
+	if err != nil || len(idx) == 0 {
+		return 0
+	}
+	return parseFloat(idx[0].MarkPrice)
 }
 
 func (b *BinanceFuturesClient) setMark(symbol string, price float64) {
